@@ -1,0 +1,80 @@
+apiVersion: install.weaviate.io/v1alpha1
+kind: Weaviate
+metadata:
+  name: nexus-weaviate
+  namespace: nexus
+spec:
+  image: semitechnologies/weaviate:1.22.0
+  replicas: 3
+  environment:
+    ENABLE_MODULES: "text2vec-openai,ref2vec-centroid"
+    OPENAI_APIKEY: "$(OPENAI_API_KEY)"
+    AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "false"
+    AUTOSCHEMA_ENABLED: "true"
+    DEFAULT_VECTORIZER_MODULE: "text2vec-openai"
+    BACKUP_S3_BUCKET: "nexus-weaviate-backup"
+    BACKUP_S3_ENDPOINT: "s3.amazonaws.com"
+    BACKUP_S3_USE_SSL: "true"
+  resources:
+    requests:
+      memory: "16Gi"
+      cpu: "4"
+    limits:
+      memory: "32Gi"
+      cpu: "8"
+  persistence:
+    enabled: true
+    size: "500Gi"
+    storageClass: "fast-ssd"
+  backup:
+    enabled: true
+    schedule: "0 2 * * *"  # Daily backup at 2 AM
+    s3:
+      bucket: "nexus-weaviate-backup"
+      endpoint: "s3.amazonaws.com"
+      useSSL: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: weaviate-schema
+  namespace: nexus
+data:
+  schema.json: |
+    {
+      "classes": [
+        {
+          "class": "NexusExperience",
+          "description": "Una experiencia o recuerdo del sistema NEXUS",
+          "vectorizer": "text2vec-openai",
+          "moduleConfig": {
+            "text2vec-openai": {
+              "model": "text-embedding-3-large",
+              "type": "text"
+            }
+          },
+          "properties": [
+            {
+              "name": "content",
+              "dataType": ["text"],
+              "description": "Contenido principal de la experiencia"
+            },
+            {
+              "name": "metadata",
+              "dataType": ["NexusMetadata"],
+              "description": "Metadatos de la experiencia"
+            }
+          ],
+          "vectorIndexType": "hnsw",
+          "vectorIndexConfig": {
+            "distance": "cosine",
+            "efConstruction": 128,
+            "maxConnections": 64
+          },
+          "shardingConfig": {
+            "desiredCount": 3,
+            "desiredVirtualCount": 12
+          }
+        }
+      ]
+    }

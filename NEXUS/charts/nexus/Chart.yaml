@@ -1,0 +1,19 @@
+apiVersion: v2
+name: nexus
+description: A Helm chart for Kubernetes deployment of NEXUS AI System
+version: 1.0.0
+appVersion: "1.0.0"
+
+dependencies:
+  - name: postgresql
+    version: 12.2.0
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+  - name: redis
+    version: 17.0.0
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled
+  - name: weaviate
+    version: 1.22.0
+    repository: https://semitechnologies.github.io/weaviate-helm
+    condition: weaviate.enabled

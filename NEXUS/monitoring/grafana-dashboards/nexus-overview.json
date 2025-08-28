@@ -1,0 +1,100 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "NEXUS Production Overview",
+    "tags": ["nexus", "production", "monitoring"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "API Request Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(nexus_http_requests_total[5m])",
+            "legendFormat": "{{method}} {{path}}",
+            "refId": "A"
+          }
+        ],
+        "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8}
+      },
+      {
+        "id": 2,
+        "title": "Error Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(nexus_http_requests_total{status=~'5..'}[5m]) / rate(nexus_http_requests_total[5m])",
+            "legendFormat": "error rate",
+            "refId": "A"
+          }
+        ],
+        "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8}
+      },
+      {
+        "id": 3,
+        "title": "Response Time (95th percentile)",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(nexus_http_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "95th percentile",
+            "refId": "A"
+          }
+        ],
+        "gridPos": {"x": 0, "y": 8, "w": 8, "h": 6}
+      },
+      {
+        "id": 4,
+        "title": "Memory Usage",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "container_memory_usage_bytes{pod=~'nexus-core-.*'}",
+            "legendFormat": "{{pod}}",
+            "refId": "A"
+          }
+        ],
+        "gridPos": {"x": 8, "y": 8, "w": 8, "h": 6}
+      },
+      {
+        "id": 5,
+        "title": "CPU Usage",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(container_cpu_usage_seconds_total{pod=~'nexus-core-.*'}[5m])",
+            "legendFormat": "{{pod}}",
+            "refId": "A"
+          }
+        ],
+        "gridPos": {"x": 16, "y": 8, "w": 8, "h": 6}
+      },
+      {
+        "id": 6,
+        "title": "Blockchain Node Status",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "up{job='nexus-blockchain'}",
+            "refId": "A"
+          }
+        ],
+        "gridPos": {"x": 0, "y": 14, "w": 6, "h": 4}
+      },
+      {
+        "id": 7,
+        "title": "Database Connections",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "pg_stat_database_numbackends{datname='nexus_production'}",
+            "refId": "A"
+          }
+        ],
+        "gridPos": {"x": 6, "y": 14, "w": 6, "h": 4}
+      }
+    ],
+    "refresh": "30s"
+  }
+}

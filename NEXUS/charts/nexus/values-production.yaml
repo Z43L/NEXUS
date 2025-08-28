@@ -1,0 +1,112 @@
+# Configuración para entorno de producción
+global:
+  environment: production
+  domain: nexus.ai
+  tls:
+    enabled: true
+    issuer: letsencrypt-prod
+
+# Configuración de la aplicación principal
+nexusCore:
+  replicaCount: 5
+  image:
+    repository: ghcr.io/nexus-ai/nexus-core
+    tag: latest
+    pullPolicy: Always
+  resources:
+    requests:
+      memory: "8Gi"
+      cpu: "2"
+    limits:
+      memory: "16Gi"
+      cpu: "4"
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 15
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+
+# Configuración de la blockchain
+blockchain:
+  enabled: true
+  nodeCount: 7
+  validatorCount: 5
+  resources:
+    requests:
+      memory: "4Gi"
+      cpu: "2"
+    limits:
+      memory: "8Gi"
+      cpu: "4"
+
+# Configuración de la base de datos
+database:
+  postgresql:
+    enabled: true
+    auth:
+      username: "nexus"
+      password: "$POSTGRES_PASSWORD"
+      database: "nexus_production"
+    persistence:
+      size: "500Gi"
+      storageClass: "fast-ssd"
+    resources:
+      requests:
+        memory: "16Gi"
+        cpu: "4"
+      limits:
+        memory: "32Gi"
+        cpu: "8"
+
+# Configuración de Weaviate
+weaviate:
+  enabled: true
+  replicas: 5
+  persistence:
+    enabled: true
+    size: "1Ti"
+    storageClass: "fast-ssd"
+  resources:
+    requests:
+      memory: "16Gi"
+      cpu: "4"
+    limits:
+      memory: "32Gi"
+      cpu: "8"
+
+# Configuración de Redis
+redis:
+  enabled: true
+  architecture: "standalone"
+  auth:
+    password: "$REDIS_PASSWORD"
+  persistence:
+    size: "100Gi"
+
+# Configuración de monitorización
+monitoring:
+  enabled: true
+  prometheus:
+    enabled: true
+  grafana:
+    enabled: true
+  loki:
+    enabled: true
+
+# Configuración de ingress
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+  hosts:
+    - host: "api.nexus.ai"
+      paths:
+        - path: "/"
+          pathType: Prefix
+    - host: "dashboard.nexus.ai"
+      paths:
+        - path: "/"
+          pathType: Prefix

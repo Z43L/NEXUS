@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: 'nexus-production'
+    cluster: 'nexus-main'
+
+scrape_configs:
+  - job_name: 'nexus-core'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: ['nexus']
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: nexus-core
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true

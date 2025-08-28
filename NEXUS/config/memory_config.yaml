@@ -1,0 +1,34 @@
+# Configuración del sistema de memoria de NEXUS
+cluster:
+  nodes:
+    - name: "weaviate-local"
+      url: "http://weaviate:8080"
+      role: "primary"
+      region: "local"
+  
+  auth:
+    api_key: "${MEMORY_API_KEY}"
+    openai_key: "${OPENAI_API_KEY}"
+
+sharding:
+  total_shards: 12
+  replicas_per_shard: 2
+  embedding_dimension: 1536  # Dimensión de text-embedding-3-large
+  recluster_interval: 3600
+  min_shard_size: 10000
+
+consistency:
+  default_level: "eventual"
+  quorum_size: 2
+  timeout_ms: 1000
+  repair_interval: 300
+
+performance:
+  cache_size: 10000
+  max_connections: 100
+  timeout: 30.0
+
+monitoring:
+  enabled: true
+  prometheus_port: 9090
+  health_check_interval: 30

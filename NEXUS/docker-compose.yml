@@ -1,0 +1,48 @@
+# docker-compose.yml
+version: '3.8'
+services:
+  postgres-age:
+    build: ./docker/postgres-age
+    container_name: nexus_db
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=nexus
+      - POSTGRES_PASSWORD=nexus
+      - POSTGRES_DB=nexus
+      - NEXUS_DB_PASSWORD=nexus
+    volumes:
+      - nexus_db_data:/var/lib/postgresql/data
+
+  weaviate:
+    image: semitechnologies/weaviate:1.24.1
+    container_name: nexus_weaviate
+    ports:
+      - "8080:8080"
+    environment:
+      - QUERY_DEFAULTS_LIMIT=25
+      - AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true
+      - PERSISTENCE_DATA_PATH=/var/lib/weaviate
+      - DEFAULT_VECTORIZER_MODULE=none
+      - CLUSTER_HOSTNAME=weaviate
+    volumes:
+      - nexus_weaviate_data:/var/lib/weaviate
+
+  nexus-core:
+    build: . # Asume un Dockerfile en la raíz para la app principal
+    container_name: nexus_core_app
+    ports:
+      - "8000:8000" # Puerto de la API
+      - "9090:9090" # Puerto de métricas Prometheus
+    depends_on:
+      - postgres-age
+      - weaviate
+    environment:
+      - DB_HOST=postgres-age
+      - WEAVIATE_URL=http://weaviate:8080
+      - OPENAI_API_KEY=tu_api_key_de_openai # Necesario para el vectorizador
+      - MEMORY_API_KEY=una_clave_secreta
+
+volumes:
+  nexus_db_data:
+  nexus_weaviate_data:

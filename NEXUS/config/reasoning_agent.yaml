@@ -1,0 +1,70 @@
+# Configuración del Agente Razonador de NEXUS
+agent:
+  name: "nexus-reasoning-agent"
+  version: "1.0.0"
+  environment: "production"
+
+  # Configuración de módulos
+  modules:
+    analysis:
+      enabled: true
+      max_complexity_threshold: 0.9
+      min_decomposition_size: 2
+
+    planning:
+      enabled: true
+      max_concurrent_subtasks: 5
+      dependency_resolution: "strict"
+
+    validation:
+      enabled: true
+      validation_threshold: 0.7
+      learning_extraction: true
+
+    execution:
+      enabled: true
+      max_retries: 3
+      retry_delay: 1000  # ms
+
+# --- CORRECCIÓN: Mover 'llm' al nivel principal ---
+# Configuración de LLM
+llm:
+  # Parámetros para OpenRouter
+  provider: "openrouter" # Indicamos el nuevo proveedor
+  model: "deepseek/deepseek-chat-v3.1" # Modelo de ejemplo de OpenRouter
+  api_key: "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" # <-- PON TU CLAVE AQUÍ
+
+  # Parámetros de LangChain
+  temperature: 0.1
+  max_tokens: 2048
+  timeout: 30
+
+# Configuración de herramientas
+tools:
+  http_request:
+    timeout: 30
+    max_retries: 3
+
+  database_query:
+    timeout: 15
+    connection_pool_size: 10
+
+  file_operations:
+    max_file_size: 10485760  # 10MB
+
+# Configuración de monitorización
+monitoring:
+  enabled: true
+  prometheus_port: 9090
+  metrics_interval: 30
+  alerting:
+    enabled: true
+    success_rate_threshold: 0.8
+    response_time_threshold: 5.0
+
+# Configuración de rendimiento
+performance:
+  max_concurrent_tasks: 10
+  task_timeout: 300  # segundos
+  memory_limit: "4GB"
+  cpu_limit: 4

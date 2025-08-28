@@ -1,0 +1,68 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nexus-backup
+  namespace: nexus
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: backup-service-account
+          containers:
+          - name: backup
+            image: postgres:15-alpine
+            env:
+            - name: DB_HOST
+              value: "nexus-postgres"
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-secrets
+                  key: database-username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-secrets
+                  key: database-password
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: secret-access-key
+            - name: S3_BUCKET
+              value: "nexus-backups"
+            command:
+            - /bin/sh
+            - -c
+            - |
+              # Backup database
+              pg_dump -h $DB_HOST -U $DB_USER nexus_production > /backup/nexus-db-$(date +%Y%m%d).sql
+              
+              # Backup Weaviate data
+              curl -X POST http://nexus-weaviate:8080/v1/backups/s3 \
+                -H 'Content-Type: application/json' \
+                -d '{
+                  "id": "nexus-weaviate-$(date +%Y%m%d)",
+                  "include": ["NexusExperience"]
+                }'
+              
+              # Upload to S3
+              aws s3 sync /backup/ s3://$S3_BUCKET/$(date +%Y)/$(date +%m)/$(date +%d)/
+              
+              # Cleanup old backups (keep 30 days)
+              find /backup/ -type f -mtime +30 -delete
+            volumeMounts:
+            - name: backup-volume
+              mountPath: /backup
+          volumes:
+          - name: backup-volume
+            emptyDir: {}
+          restartPolicy: OnFailure

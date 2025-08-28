@@ -1,0 +1,40 @@
+# requirements.txt
+
+# --- Core Frameworks ---
+fastapi
+uvicorn[standard]
+pydantic
+
+# --- Bases de Datos y Conectores ---
+weaviate-client
+psycopg2-binary
+networkx
+py2neo
+
+# --- IA y Machine Learning ---
+transformers
+torch
+peft
+datasets
+scikit-learn
+langchain
+langchain_openai
+langchain_community
+
+# --- Red y Comunicación ---
+aiohttp
+web3
+libp2p # (Nota: puede requerir dependencias adicionales)
+
+# --- Monitorización y Utilidades ---
+prometheus-client
+loguru
+redis
+pandas
+plotly
+streamlit
+
+# --- Seguridad ---
+cryptography
+python-jose[cryptography]
+passlib[bcrypt]

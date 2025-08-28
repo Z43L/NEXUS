@@ -1,0 +1,154 @@
+name: NEXUS CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, release/* ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  KUBE_NAMESPACE: nexus
+  ENVIRONMENT: ${{ contains(github.ref, 'release/') && 'staging' || 'production' }}
+
+jobs:
+  # Job de testing y calidad de código
+  test-and-quality:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.9, 3.10]
+        node-version: [18, 20]
+    
+    steps:
+    - name: Checkout código
+      uses: actions/checkout@v4
+    
+    - name: Setup Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Setup Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+    
+    - name: Instalar dependencias Python
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+    
+    - name: Instalar dependencias Node.js
+      run: npm ci
+    
+    - name: Ejecutar tests Python
+      run: |
+        pytest tests/ -v --cov=nexus --cov-report=xml
+        python -m flake8 nexus/ --max-line-length=120
+        python -m black --check nexus/
+        python -m isort --check-only nexus/
+    
+    - name: Ejecutar tests Node.js
+      run: npm test
+    
+    - name: Subir cobertura de tests
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+    
+    - name: Análisis de seguridad
+      uses: anchore/scan-action@v3
+      with:
+        image: "nexus-scan"
+        severity-cutoff: "high"
+
+  # Job de construcción de imágenes Docker
+  build-and-push:
+    needs: test-and-quality
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout código
+      uses: actions/checkout@v4
+    
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login al registro
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Construir y push imágenes
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        cache-from: type=ghcr
+        cache-to: type=ghcr,mode=max
+        platforms: linux/amd64,linux/arm64
+
+  # Job de despliegue en Kubernetes
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: ${{ env.ENVIRONMENT }}
+    
+    steps:
+    - name: Checkout código
+      uses: actions/checkout@v4
+    
+    - name: Setup Kubernetes工具
+      uses: azure/setup-kubectl@v3
+      with:
+        version: '1.27'
+    
+    - name: Configurar acceso Kubernetes
+      run: |
+        echo "${{ secrets.KUBE_CONFIG }}" > ~/.kube/config
+        kubectl config set-context --current --namespace=${{ env.KUBE_NAMESPACE }}
+    
+    - name: Deploy con Helm
+      run: |
+        helm upgrade --install nexus ./charts/nexus \
+          --namespace ${{ env.KUBE_NAMESPACE }} \
+          --set image.tag=${{ github.sha }} \
+          --set environment=${{ env.ENVIRONMENT }} \
+          --values ./charts/nexus/values-${{ env.ENVIRONMENT }}.yaml \
+          --atomic \
+          --timeout 10m
+    
+    - name: Esperar por servicios
+      run: |
+        kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=nexus --timeout=300s
+    
+    - name: Ejecutar tests de smoke
+      run: |
+        ./scripts/smoke-test.sh
+
+  # Job de notificaciones
+  notify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Notificar resultado
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_TITLE: "Despliegue NEXUS ${{ job.status }}"
+        SLACK_MESSAGE: "Despliegue completado para ${{ github.sha }} en ${{ env.ENVIRONMENT }}"
+        SLACK_COLOR: ${{ job.status == 'success' && 'good' || 'danger' }}

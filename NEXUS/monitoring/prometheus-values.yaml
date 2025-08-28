@@ -1,0 +1,113 @@
+# Configuración de Prometheus para NEXUS
+alertmanager:
+  enabled: true
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ['environment', 'severity']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: 'slack-notifications'
+      routes:
+        - match:
+            severity: critical
+          receiver: 'pagerduty'
+    receivers:
+      - name: 'slack-notifications'
+        slack_configs:
+          - api_url: '$SLACK_WEBHOOK'
+            channel: '#nexus-alerts'
+            send_resolved: true
+      - name: 'pagerduty'
+        pagerduty_configs:
+          - service_key: '$PAGERDUTY_KEY'
+
+server:
+  persistentVolume:
+    size: 50Gi
+  resources:
+    requests:
+      memory: 4Gi
+      cpu: 1
+    limits:
+      memory: 8Gi
+      cpu: 2
+
+# Configuración de scraping para NEXUS
+extraScrapeConfigs: |
+  - job_name: 'nexus-core'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: '/metrics'
+    scheme: 'http'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: ['nexus']
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        action: keep
+        regex: nexus-core
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_ip]
+        action: replace
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: (.+)
+        target_label: __metrics_path__
+        replacement: /$1/metrics
+
+  - job_name: 'nexus-blockchain'
+    scrape_interval: 30s
+    scrape_timeout: 25s
+    metrics_path: '/metrics'
+    scheme: 'http'
+    static_configs:
+      - targets: ['nexus-blockchain-node-0:9610', 'nexus-blockchain-node-1:9610']
+
+# Alertas personalizadas para NEXUS
+alertingRules:
+  groups:
+    - name: nexus.rules
+      rules:
+        - alert: NexusCoreDown
+          expr: up{job="nexus-core"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            environment: production
+          annotations:
+            summary: "NEXUS Core service down"
+            description: "NEXUS Core service has been down for more than 5 minutes"
+        
+        - alert: HighErrorRate
+          expr: rate(nexus_http_requests_total{status=~"5.."}[5m]) / rate(nexus_http_requests_total[5m]) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High error rate on NEXUS API"
+            description: "Error rate is above 5% for more than 10 minutes"
+        
+        - alert: BlockchainNodeDown
+          expr: up{job="nexus-blockchain"} == 0
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Blockchain node down"
+            description: "A blockchain node has been down for more than 15 minutes"
+        
+        - alert: HighResponseTime
+          expr: histogram_quantile(0.95, rate(nexus_http_request_duration_seconds_bucket[5m])) > 2
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High response time"
+            description: "95th percentile response time is above 2 seconds"
