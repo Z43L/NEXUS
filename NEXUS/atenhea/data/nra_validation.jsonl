@@ -1,0 +1,4 @@
+{"prompt":"In NRA-M, ROLLBACK is responsible for","completion":" restoring the last validated stable version."}
+{"prompt":"In NRA-M, HALT is responsible for","completion":" ending the neural program after it produces an output."}
+{"prompt":"In NRA-M, the version journal is responsible for","completion":" recording accepted mutations and their evaluation results."}
+{"prompt":"In NRA-M, persistent memory is responsible for","completion":" retaining verified information between separate sessions."}

@@ -1,0 +1,194 @@
+--- a/metal/src/engine/stream.h
++++ b/metal/src/engine/stream.h
+@@ -72,6 +72,12 @@
+     void reset_stats();
+ 
+ private:
++    FILE* route_trace_ = nullptr;
++    bool demand_cache_ = false;
++    bool frequency_cache_ = false;
++    std::vector<uint16_t> demand_frequency_;
++    uint64_t policy_windows_ = 0;
++    void trace_event(const char* kind, int layer, int tokens, const int* experts, int count);
+     uint64_t shrink_to_ = 0;
+     struct Lay { uint64_t g, gs, u, us, d, ds; int cls; };
+     struct Slot { int16_t layer = -1; int16_t e = -1; int prev = -1, next = -1; bool pre = false; int left = 0; uint64_t pin = 0; std::atomic<int> state{0}; };  // 0 idle, 1 queued, 2 reading
+--- a/metal/src/engine/stream.cpp
++++ b/metal/src/engine/stream.cpp
+@@ -55,6 +55,7 @@
+     cv_.notify_all();
+     for (auto& t : io_) t.join();
+     if (fd_ >= 0) ::close(fd_);
++    if (route_trace_) std::fclose(route_trace_);
+ }
+ 
+ bool ExpertStream::open(const gguf::File& f, std::string& err) {
+@@ -147,6 +148,16 @@
+             lay_[(size_t) l].cls = best;
+         }
+     }
++    const char* policy = std::getenv("STRATA_METAL_CACHE_POLICY");
++    frequency_cache_ = policy && std::string(policy) == "frequency";
++    demand_cache_ = frequency_cache_ || (policy && std::string(policy) == "demand");
++    if (frequency_cache_) demand_frequency_.assign((size_t) NL * NE, 0);
++    const char* trace_path = std::getenv("STRATA_METAL_ROUTE_TRACE");
++    if (trace_path && *trace_path) {
++        route_trace_ = std::fopen(trace_path, "w");
++        if (!route_trace_) { err = "cannot open expert route trace"; return false; }
++        std::setvbuf(route_trace_, nullptr, _IOFBF, 1024 * 1024);
++    }
+     nio_ = std::max(1, env_int("STRATA_METAL_IO_THREADS", 6));
+     split_ = std::max(1, std::min(8, env_int("STRATA_METAL_READ_SPLIT", 1)));
+     // The read-ahead's depth and where its experts wait in the LRU, measured on the M4 (notes-mac-ssd.md, 3 interleaved
+@@ -253,18 +264,26 @@
+ 
+ int ExpertStream::victim(int ci) {
+     Cls& k = cls_[(size_t) ci];
+-    for (int s = k.tail; s >= 0; s = slots_[(size_t) s].prev)
+-        if (slots_[(size_t) s].state.load() == 0 && slots_[(size_t) s].pin != stamp_) {
+-            Slot& x = slots_[(size_t) s];
+-            if (x.layer >= 0) {
+-                const int key = x.layer * NE + x.e;
+-                where_[(size_t) key] = -1;
+-                smap_.as<uint32_t>()[key] = 0xFFFFFFFFu;
+-            }
+-            x.layer = x.e = -1;
+-            return s;
+-        }
+-    return -1;
++    int choice = -1, candidates = 0;
++    uint32_t score = 65536;
++    for (int s = k.tail; s >= 0; s = slots_[(size_t) s].prev) {
++        const Slot& x = slots_[(size_t) s];
++        if (x.state.load() != 0 || x.pin == stamp_) continue;
++        if (!frequency_cache_) { choice = s; break; }
++        const uint32_t frequency = x.layer >= 0 ? demand_frequency_[(size_t) (x.layer * NE + x.e)] : 0;
++        if (frequency < score) { choice = s; score = frequency; }
++        // Keep eviction overhead bounded. Equal scores retain LRU tie-breaking.
++        if (score == 0 || ++candidates == 64) break;
++    }
++    if (choice < 0) return -1;
++    Slot& x = slots_[(size_t) choice];
++    if (x.layer >= 0) {
++        const int key = x.layer * NE + x.e;
++        where_[(size_t) key] = -1;
++        smap_.as<uint32_t>()[key] = 0xFFFFFFFFu;
++    }
++    x.layer = x.e = -1;
++    return choice;
+ }
+ 
+ // One piece of an expert: slice part / split_ (gate, up, down), piece part % split_ of it.  The pieces of one expert
+@@ -640,8 +659,37 @@
+                          failed ? "; SOME CHUNKS COULD NOT BE WIRED" : "");
+         }
+     }
++    if (route_trace_) {
++        std::fprintf(route_trace_, "{\"kind\":\"header\",\"layers\":%d,\"experts_per_layer\":%d,\"class_slots\":[", NL, NE);
++        for (size_t c = 0; c < cls_.size(); ++c) {
++            int live = 0;
++            for (int i = cls_[c].base; i < cls_[c].base + cls_[c].n; ++i) if (!retired_[(size_t) i]) ++live;
++            std::fprintf(route_trace_, "%s%d", c ? "," : "", live);
++        }
++        std::fprintf(route_trace_, "],\"layer_class\":[");
++        for (int l = 0; l < NL; ++l) std::fprintf(route_trace_, "%s%d", l ? "," : "", lay_[(size_t) l].cls);
++        std::fprintf(route_trace_, "],\"expert_bytes\":[");
++        for (int l = 0; l < NL; ++l) { const auto& x = lay_[(size_t) l]; std::fprintf(route_trace_, "%s%llu", l ? "," : "", (unsigned long long)(x.gs + x.us + x.ds)); }
++        std::fprintf(route_trace_, "],\"warm\":[");
++        bool comma = false;
++        // Record LRU order (front first) so replay starts from the same cache state.
++        for (const auto& c : cls_) for (int i = c.head; i >= 0; i = slots_[(size_t) i].next) {
++            const auto& slot = slots_[(size_t) i];
++            if (slot.layer < 0) continue;
++            std::fprintf(route_trace_, "%s%d", comma ? "," : "", slot.layer * NE + slot.e); comma = true;
++        }
++        std::fprintf(route_trace_, "]}\n"); std::fflush(route_trace_);
++    }
+     (void) err;
+     return true;
++}
++
++void ExpertStream::trace_event(const char* kind, int layer, int tokens, const int* experts, int count) {
++    if (!route_trace_) return;
++    std::fprintf(route_trace_, "{\"kind\":\"%s\",\"layer\":%d,\"tokens\":%d,\"ids\":[", kind, layer, tokens);
++    for (int i = 0; i < count; ++i) std::fprintf(route_trace_, "%s%d", i ? "," : "", experts[i]);
++    std::fprintf(route_trace_, "]}\n");
++    if (kind[0] == 'r' && layer == NL - 1) std::fflush(route_trace_);
+ }
+ 
+ // the experts a predicted routing names, most likely first (by the best logit over the window's tokens)
+@@ -667,18 +715,23 @@
+         }
+     }
+     std::sort(pw, pw + np, [](const auto& a, const auto& b) { return a.first > b.first; });
++    if (route_trace_) {
++        int predicted[8 * 32];
++        for (int j = 0; j < np; ++j) predicted[j] = pw[j].second;
++        trace_event("prefetch", ln, T, predicted, np);
++    }
+     bool any = false;
+     {
+         std::lock_guard<std::mutex> g(mu_);
+         for (int j = 0; j < np; ++j) {
+             const int key = ln * NE + pw[j].second;
+             const int s0 = where_[(size_t) key];
+-            if (s0 >= 0) { lru_front(s0); continue; }
++            if (s0 >= 0) { if (!demand_cache_) lru_front(s0); continue; }
+             const int s = victim(lay_[(size_t) ln].cls);
+             if (s < 0) break;
+             submit(s, ln, pw[j].second, false);
+             slots_[(size_t) s].pin = stamp_;
+-            if (pre_mru_) lru_front(s);
++            if (pre_mru_ && !demand_cache_) lru_front(s);
+             else lru_back(s);
+             ++pre_issued_;
+             any = true;
+@@ -689,6 +742,17 @@
+ 
+ void ExpertStream::at_layer(int l, int T, int topk, const int32_t* ids, const float* pred, const float* pred2) {
+     const double t0 = now_ms();
++    const auto h0 = hits_, p0 = pre_hits_, m0 = misses_, l0 = late_;
++    const double w0 = wait_ms_;
++    const auto b0 = bytes_read_.load();
++    auto trace_done = [&] {
++        if (!route_trace_) return;
++        std::fprintf(route_trace_, "{\"kind\":\"timing\",\"layer\":%d,\"tokens\":%d,\"host_ms\":%.4f,\"wait_ms\":%.4f,\"hits\":%llu,\"prefetch_hits\":%llu,\"misses\":%llu,\"late\":%llu,\"bytes_completed\":%llu}\n",
++                     l, T, now_ms() - t0, wait_ms_ - w0, (unsigned long long)(hits_ - h0),
++                     (unsigned long long)(pre_hits_ - p0), (unsigned long long)(misses_ - m0),
++                     (unsigned long long)(late_ - l0), (unsigned long long)(bytes_read_.load() - b0));
++        if (l == NL - 1) std::fflush(route_trace_);
++    };
+     const bool prompt = T > 8;   // a prompt chunk (the GEMM path): nearly every expert of the layer is used
+     if (l == 0) { if (prompt) ++p_chunks_; else ++windows_; }
+     ++stamp_;                    // the slots this layer uses are pinned until the next handshake
+@@ -701,6 +765,15 @@
+         used[e] = true;
+         want[nw++] = e;
+     }
++    if (frequency_cache_) {
++        if (l == 0 && ++policy_windows_ % 64 == 0)
++            for (auto& count : demand_frequency_) count >>= 1;
++        for (int i = 0; i < nw; ++i) {
++            auto& count = demand_frequency_[(size_t) (l * NE + want[i])];
++            if (count < 65535) ++count;
++        }
++    }
++    trace_event("route", l, T, want, nw);
+     if (fake_) {
+         for (int j = 0; j < nw; ++j)
+             if (where_[(size_t) (l * NE + want[j])] < 0) smap_.as<uint32_t>()[l * NE + want[j]] = code_[0];
+@@ -787,12 +860,14 @@
+             if (any) cv_.notify_all();
+         }
+         (prompt ? p_host_ms_ : host_ms_) += now_ms() - t0;
++        trace_done();
+         return;
+     }
+     // read-ahead: layer l + 1 (each token's top pre_k_ of the predicted router logits), then layer l + 2 (top pre_k2_)
+     if (prefetch_ && pred && l + 1 < NL) ahead(l + 1, T, pred, pre_k_);
+     if (pre_k2_ > 0 && pred2 && l + 2 < NL) ahead(l + 2, T, pred2, pre_k2_);
+     host_ms_ += now_ms() - t0;
++    trace_done();
+ }
+ 
+ // A region of `bytes` at the end of one arena buffer, for a prompt's scratch buffers: its slots are emptied and held

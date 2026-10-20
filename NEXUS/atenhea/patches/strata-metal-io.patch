@@ -1,0 +1,238 @@
+--- a/metal/src/mtl_rt.h
++++ b/metal/src/mtl_rt.h
+@@ -69,6 +69,8 @@
+     require_fit(*d.p, d.tg[0] * d.tg[1] * d.tg[2], where);
+ }
+ 
++struct IORead { const Buffer* buffer; uint64_t destination, source, bytes; };
++
+ class Context {
+ public:
+     Context();
+@@ -86,6 +88,10 @@
+     // Safe math unless STRATA_METAL_MATH=fast (the argument is ignored; kept for callers).
+     int compile(const std::vector<std::string>& files, const std::string& prelude = "", bool fast_math = false);
+     Pipeline pipeline(int lib, const std::string& fn, const Constants& c = {});
++
++    // Optional SSD reads directly into shared buffers; caller owns synchronization.
++    bool open_io_file(const std::string& path, std::string& error);
++    bool read_io(const std::vector<IORead>& reads, std::string& error);
+ 
+     Buffer alloc(size_t bytes);                  // shared storage, zeroed
+     Buffer wrap(void* page_aligned, size_t bytes);  // no-copy wrap (page-aligned, size multiple of page)
+--- a/metal/src/mtl_rt.mm
++++ b/metal/src/mtl_rt.mm
+@@ -30,6 +30,8 @@
+ struct Context::Impl {
+     id<MTLDevice> dev;
+     id<MTLCommandQueue> q;
++    id<MTLIOCommandQueue> io = nil;
++    id<MTLIOFileHandle> io_file = nil;
+     std::vector<id<MTLLibrary>> libs;
+     id<MTLSharedEvent> ev = nil;   // run_graph_seg's handshake timeline
+     uint64_t ev_v = 0;
+@@ -166,6 +168,37 @@
+                  p.name.empty() ? "?" : p.name.c_str(), p.max_threads, g_device_name.c_str(), where, threads);
+     std::fflush(stderr);
+     std::exit(6);
++}
++
++bool Context::open_io_file(const std::string& path, std::string& error) {
++    @autoreleasepool {
++        NSError* e = nil;
++        MTLIOCommandQueueDescriptor* desc = [MTLIOCommandQueueDescriptor new];
++        desc.type = MTLIOCommandQueueTypeConcurrent;
++        desc.priority = MTLIOPriorityNormal;
++        impl_->io = [impl_->dev newIOCommandQueueWithDescriptor:desc error:&e];
++        if (!impl_->io) { error = e ? e.description.UTF8String : "Metal IO queue unavailable"; return false; }
++        impl_->io_file = [impl_->dev newIOFileHandleWithURL:[NSURL fileURLWithPath:@(path.c_str())] error:&e];
++        if (!impl_->io_file) { error = e ? e.description.UTF8String : "Metal IO file unavailable"; return false; }
++        return true;
++    }
++}
++
++bool Context::read_io(const std::vector<IORead>& reads, std::string& error) {
++    @autoreleasepool {
++        if (!impl_->io || !impl_->io_file) { error = "Metal IO not initialized"; return false; }
++        id<MTLIOCommandBuffer> cb = [impl_->io commandBuffer];
++        for (const IORead& read : reads) {
++            if (!read.buffer || read.destination > read.buffer->bytes || read.bytes > read.buffer->bytes - read.destination) {
++                error = "Metal IO destination out of bounds"; return false;
++            }
++            [cb loadBuffer:B(*read.buffer) offset:read.destination size:read.bytes sourceHandle:impl_->io_file sourceHandleOffset:read.source];
++        }
++        [cb commit];
++        [cb waitUntilCompleted];
++        if (cb.status != MTLIOStatusComplete) { error = cb.error ? cb.error.description.UTF8String : "Metal IO failed"; return false; }
++        return true;
++    }
+ }
+ 
+ Buffer Context::alloc(size_t bytes) {
+--- a/metal/src/engine/stream.h
++++ b/metal/src/engine/stream.h
+@@ -86,10 +86,18 @@
+     void cancel_slot(int s);
+     void promote_slot(int s);
+     void io_main();
++    void io_main_metal();
++    void read_metal_jobs(const std::vector<Job>& jobs);
+     void ahead(int ln, int T, const float* pred, int K);
+     void submit(int slot, int l, int e, bool urgent);
+     void wait_slot(int s);
+ 
++    // Opt-in urgent-read batching. Prefetch continues on the existing I/O workers.
++    mtl::Context* metal_io_ = nullptr;
++    bool metal_io_checked_ = false;
++    bool metal_batching_ = false;
++    std::string metal_io_path_;
++    std::vector<Job> metal_urgent_;
+     int fd_ = -1;
+     // <gguf>.experts (metal/tools/stream_experts.py): each expert's gate, up and down rows together, read with one
+     // request (cfd_ >= 0); else the GGUF's three slices.  STRATA_METAL_CONTIG=0: the GGUF always.
+--- a/metal/src/engine/stream.cpp
++++ b/metal/src/engine/stream.cpp
+@@ -111,6 +111,7 @@
+             fcntl(cfd, F_NOCACHE, 1);
+             fcntl(cfd, F_RDAHEAD, 0);
+             cfd_ = cfd;
++            metal_io_path_ = cp;
+             coff_ = off;
+             std::fprintf(stderr, "strata metal stream: experts read from %s (one request per expert)\n", cp.c_str());
+         } else if (cfd >= 0) {
+@@ -302,6 +303,7 @@
+ }
+ 
+ void ExpertStream::io_main() {
++    if (metal_io_) { io_main_metal(); return; }
+     for (;;) {
+         Job j;
+         {
+@@ -329,6 +331,53 @@
+     }
+ }
+ 
++void ExpertStream::read_metal_jobs(const std::vector<Job>& jobs) {
++    std::vector<mtl::IORead> reads;
++    uint64_t total_bytes = 0;
++    for (const Job& job : jobs) {
++        const Lay& layer = lay_[(size_t) job.layer];
++        const uint64_t bytes = layer.gs + layer.us + layer.ds;
++        const uint32_t code = code_[(size_t) job.slot];
++        reads.push_back({&chunks_[code >> 28], (uint64_t)(code & 0x0FFFFFFFu) * PAGE,
++                         coff_[(size_t) job.layer] + (uint64_t) job.e * bytes, bytes});
++        total_bytes += bytes;
++    }
++    std::string error;
++    if (!metal_io_->read_io(reads, error)) {
++        std::fprintf(stderr, "strata metal stream: Metal IO batch failed: %s\n", error.c_str());
++        std::exit(6);
++    }
++    {
++        std::lock_guard<std::mutex> g(mu_);
++        for (const Job& job : jobs) {
++            smap_.as<uint32_t>()[job.layer * NE + job.e] = code_[(size_t) job.slot];
++            slots_[(size_t) job.slot].left = 0;
++            slots_[(size_t) job.slot].state = 0;
++            --outstanding_;
++            ++reads_;
++        }
++    }
++    bytes_read_ += total_bytes;
++    done_cv_.notify_all();
++}
++
++void ExpertStream::io_main_metal() {
++    for (;;) {
++        std::vector<Job> jobs;
++        {
++            std::unique_lock<std::mutex> g(mu_);
++            cv_.wait(g, [&] { return stop_ || !urgent_q_.empty() || !pre_q_.empty(); });
++            if (stop_) return;
++            auto& queue = urgent_q_.empty() ? pre_q_ : urgent_q_;
++            while (!queue.empty() && jobs.size() < 16) {
++                jobs.push_back(queue.front()); queue.pop_front();
++                slots_[(size_t) jobs.back().slot].state = 2;
++            }
++        }
++        read_metal_jobs(jobs);
++    }
++}
++
+ void ExpertStream::submit(int s, int l, int e, bool urgent) {
+     Slot& x = slots_[(size_t) s];
+     x.layer = (int16_t) l;
+@@ -339,7 +388,13 @@
+     x.left = parts;
+     ++outstanding_;
+     where_[(size_t) (l * NE + e)] = s;
+-    for (int p = 0; p < parts; ++p) (urgent ? urgent_q_ : pre_q_).push_back({s, l, e, p});
++    if (urgent && metal_io_ && metal_batching_) {
++        x.state = 2;
++        x.left = 1;
++        metal_urgent_.push_back({s, l, e, 0});
++    } else {
++        for (int p = 0; p < parts; ++p) (urgent ? urgent_q_ : pre_q_).push_back({s, l, e, p});
++    }
+ }
+ 
+ // a queued read-ahead nobody wants: its pieces dropped, the slot freed (only before any piece has started)
+@@ -358,6 +413,14 @@
+ 
+ // a read-ahead that is wanted now: its queued pieces go first
+ void ExpertStream::promote_slot(int s) {
++    Slot& slot = slots_[(size_t) s];
++    if (metal_io_ && metal_batching_ && slot.state.load() == 1) {
++        for (auto it = pre_q_.begin(); it != pre_q_.end();) it = it->slot == s ? pre_q_.erase(it) : it + 1;
++        slot.state = 2;
++        slot.left = 1;
++        metal_urgent_.push_back({s, slot.layer, slot.e, 0});
++        return;
++    }
+     std::vector<Job> mine;
+     for (auto it = pre_q_.begin(); it != pre_q_.end();)
+         if (it->slot == s) { mine.push_back(*it); it = pre_q_.erase(it); }
+@@ -368,6 +431,19 @@
+ bool ExpertStream::make_arena(mtl::Context& cx, uint64_t budget, const std::string& profile, int min_slots, std::string& err,
+                               const std::function<uint64_t()>& recheck, const std::function<bool(uint64_t)>& grow) {
+     const double t0 = now_ms();
++    if (!metal_io_checked_) {
++        metal_io_checked_ = true;
++        const char* mode = std::getenv("STRATA_METAL_IO");
++        if (mode && std::string(mode) == "metal") {
++            std::string why;
++            if (cfd_ >= 0 && split_ == 1 && cx.open_io_file(metal_io_path_, why)) {
++                metal_io_ = &cx;
++                std::fprintf(stderr, "strata metal stream: urgent expert batches use Metal IO (STRATA_METAL_IO=metal)\n");
++            } else {
++                std::fprintf(stderr, "strata metal stream: Metal IO unavailable; using pread (%s)\n", cfd_ < 0 ? "expert-contiguous file required" : (split_ != 1 ? "READ_SPLIT must be 1" : why.c_str()));
++            }
++        }
++    }
+     shrink_to_ = 0;
+     for (auto& k : cls_) k.n = 0;   // a second try (after a shrink) lays the arena out again
+     // the ranking: the profile's pairs, then every pair it misses, layer-interleaved
+@@ -632,6 +708,7 @@
+         return;
+     }
+     std::vector<int> wait;
++    metal_batching_ = true;
+     {
+         std::lock_guard<std::mutex> g(mu_);
+         // read-aheads of this layer (or older) that were not started and are not wanted: dropped (the slot goes free)
+@@ -674,8 +751,15 @@
+             wait.push_back(s);
+         }
+     }
++    metal_batching_ = false;
+     if (!wait.empty()) {
+         cv_.notify_all();
++        if (!metal_urgent_.empty()) {
++            const double io_start = now_ms();
++            read_metal_jobs(metal_urgent_);
++            metal_urgent_.clear();
++            (prompt ? p_wait_ms_ : wait_ms_) += now_ms() - io_start;
++        }
+         const double tw = now_ms();
+         std::unique_lock<std::mutex> g(mu_);
+         done_cv_.wait(g, [&] {

@@ -1,0 +1,11 @@
+--- a/metal/src/engine/window.cpp
++++ b/metal/src/engine/window.cpp
+@@ -1197,7 +1197,7 @@
+     for (int tries = 0;; ++tries) {
+         const double planned = budget;
+         std::function<uint64_t()> recheck = [&]() -> uint64_t { return (uint64_t) arena_shrink(am, planned, avail_now()); };
+-        if (st_->make_arena(*cx_, (uint64_t) budget, prof, pg_on ? 576 : 64, err, minimal ? std::function<uint64_t()>() : recheck,
++        if (st_->make_arena(*cx_, (uint64_t) budget, prof, pg_on ? 576 : MAXT * TOPK, err, minimal ? std::function<uint64_t()>() : recheck,
+                             [&](uint64_t step) { return arena_grow(am, avail_now(), (double) step); }))
+             break;
+         if (st_->shrink_to() == 0 || tries == 4) return false;

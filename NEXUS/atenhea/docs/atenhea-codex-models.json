@@ -1,0 +1,42 @@
+{
+  "models": [
+    {
+      "slug": "athenea-e2b:latest",
+      "display_name": "Atenhea E2B nativo",
+      "description": "Local E2B weights with NRAM adapters and CHL episodic memory.",
+      "default_reasoning_level": "none",
+      "supported_reasoning_levels": [
+        {
+          "effort": "none",
+          "description": "Native generation"
+        }
+      ],
+      "shell_type": "unified_exec",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 0,
+      "upgrade": null,
+      "default_reasoning_summary": "none",
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "context_window": 131072,
+      "max_context_window": 131072,
+      "effective_context_window_percent": 95,
+      "experimental_supported_tools": [],
+      "input_modalities": [
+        "text"
+      ],
+      "supports_search_tool": false,
+      "include_skills_usage_instructions": true,
+      "include_plugin_usage_instructions": true,
+      "include_apps_usage_instructions": false,
+      "base_instructions": "You are Atenhea, a local coding assistant. Follow the user request, use the provided tools when needed, and report what you actually verified. Follow tool schemas exactly."
+    }
+  ]
+}

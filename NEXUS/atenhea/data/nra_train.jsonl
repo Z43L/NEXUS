@@ -1,0 +1,8 @@
+{"prompt":"In NRA-M, ENCODE is responsible for","completion":" turning the incoming text into token representations."}
+{"prompt":"In NRA-M, READ is responsible for","completion":" retrieving relevant records from persistent memory."}
+{"prompt":"In NRA-M, TRANSFORM is responsible for","completion":" applying a selected neural operator to the current state."}
+{"prompt":"In NRA-M, REFINE is responsible for","completion":" repeating an operator to improve a candidate state."}
+{"prompt":"In NRA-M, BRANCH is responsible for","completion":" exploring an alternate sequence of neural operators."}
+{"prompt":"In NRA-M, MERGE is responsible for","completion":" combining compatible candidate states into one state."}
+{"prompt":"In NRA-M, EVALUATE is responsible for","completion":" measuring a candidate against held-out examples."}
+{"prompt":"In NRA-M, COMMIT is responsible for","completion":" saving an accepted change as a new model version."}

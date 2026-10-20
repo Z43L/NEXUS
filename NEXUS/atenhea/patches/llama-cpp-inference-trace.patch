@@ -1,0 +1,184 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 60c563345..dfd14530d 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -12,6 +12,8 @@
+ #include "common.h"
+ #include "fit.h"
+ #include "llama.h"
++#include "ggml-backend.h"
++#include "ggml.h"
+ #include "log.h"
+ #include "sampling.h"
+ #include "speculative.h"
+@@ -27,6 +29,14 @@
+ #include <random>
+ #include <utility>
+ #include <fstream>
++#include <atomic>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <iomanip>
++#include <mutex>
++#include <numeric>
++#include <vector>
+ 
+ // fix problem with std::min and std::max
+ #if defined(_WIN32)
+@@ -39,6 +49,138 @@
+ 
+ constexpr int HTTP_POLLING_SECONDS = 1;
+ 
++struct onram_trace_sink {
++    std::mutex mutex;
++    std::ofstream stream;
++    std::string path;
++    std::atomic<uint64_t> sequence{0};
++};
++
++static onram_trace_sink & onram_trace_state() {
++    static onram_trace_sink sink;
++    return sink;
++}
++
++// Onram's private, opt-in trace for the final residual stream at each decoder
++// layer. The callback is deliberately limited to l_out-N tensors: the generic
++// llama.cpp debug callback can copy every graph node and overwhelm inference.
++static bool onram_trace_layer_output(ggml_tensor * tensor, bool ask, void *) {
++    if (tensor == nullptr) {
++        return false;
++    }
++    const char * trace_path = std::getenv("ONRAM_INFERENCE_TRACE_FILE");
++    if (trace_path == nullptr || trace_path[0] == '\0') {
++        return false;
++    }
++
++    constexpr char prefix[] = "l_out-";
++    const std::string name = ggml_get_name(tensor);
++    if (name.rfind(prefix, 0) != 0 || name.size() <= sizeof(prefix) - 1) {
++        return false;
++    }
++    int layer = -1;
++    try {
++        size_t parsed = 0;
++        layer = std::stoi(name.substr(sizeof(prefix) - 1), &parsed);
++        if (parsed != name.size() - (sizeof(prefix) - 1)) {
++            return false;
++        }
++    } catch (...) {
++        return false;
++    }
++    if (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16 &&
++            tensor->type != GGML_TYPE_BF16) {
++        return false;
++    }
++    if (ask) {
++        return true;
++    }
++    if (tensor->buffer == nullptr || tensor->ne[0] <= 0) {
++        return true;
++    }
++
++    const size_t bytes = ggml_nbytes(tensor);
++    std::vector<uint8_t> copy;
++    const uint8_t * data = static_cast<const uint8_t *>(tensor->data);
++    if (!ggml_backend_buffer_is_host(tensor->buffer)) {
++        copy.resize(bytes);
++        ggml_backend_tensor_get(tensor, copy.data(), 0, bytes);
++        data = copy.data();
++    }
++    if (data == nullptr) {
++        return true;
++    }
++
++    const int64_t hidden = tensor->ne[0];
++    const int64_t positions = tensor->ne[1] * tensor->ne[2] * tensor->ne[3];
++    if (positions <= 0) {
++        return true;
++    }
++    std::vector<double> channel_abs((size_t) hidden, 0.0);
++    double sum_sq = 0.0;
++    auto read_value = [&](int64_t i0, int64_t i1, int64_t i2, int64_t i3) -> float {
++        const size_t offset = (size_t) i0 * tensor->nb[0] + (size_t) i1 * tensor->nb[1] +
++                              (size_t) i2 * tensor->nb[2] + (size_t) i3 * tensor->nb[3];
++        if (tensor->type == GGML_TYPE_F32) {
++            float value;
++            std::memcpy(&value, data + offset, sizeof(value));
++            return value;
++        }
++        if (tensor->type == GGML_TYPE_F16) {
++            ggml_fp16_t value;
++            std::memcpy(&value, data + offset, sizeof(value));
++            return ggml_fp16_to_fp32(value);
++        }
++        ggml_bf16_t value;
++        std::memcpy(&value, data + offset, sizeof(value));
++        return ggml_bf16_to_fp32(value);
++    };
++    for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
++        for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
++            for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
++                for (int64_t i0 = 0; i0 < hidden; ++i0) {
++                    const double value = read_value(i0, i1, i2, i3);
++                    sum_sq += value * value;
++                    channel_abs[(size_t) i0] += std::abs(value);
++                }
++            }
++        }
++    }
++    for (double & value : channel_abs) {
++        value /= (double) positions;
++    }
++    std::vector<int64_t> order((size_t) hidden);
++    std::iota(order.begin(), order.end(), 0);
++    const size_t top_count = std::min<size_t>(8, order.size());
++    std::partial_sort(order.begin(), order.begin() + top_count, order.end(),
++        [&](int64_t left, int64_t right) { return channel_abs[(size_t) left] > channel_abs[(size_t) right]; });
++
++    auto & sink = onram_trace_state();
++    std::lock_guard<std::mutex> lock(sink.mutex);
++    if (!sink.stream.is_open() || sink.path != trace_path) {
++        sink.stream.close();
++        sink.path = trace_path;
++        sink.stream.open(sink.path, std::ios::out | std::ios::app);
++    }
++    if (!sink.stream) {
++        return true;
++    }
++    sink.stream << std::setprecision(9)
++           << "{\"seq\":" << sink.sequence.fetch_add(1, std::memory_order_relaxed)
++           << ",\"layer\":" << layer << ",\"positions\":" << positions
++           << ",\"hidden_size\":" << hidden
++           << ",\"output_rms\":" << std::sqrt(sum_sq / ((double) positions * (double) hidden))
++           << ",\"top_channels\":[";
++    for (size_t i = 0; i < top_count; ++i) {
++        if (i != 0) sink.stream << ',';
++        const size_t channel = (size_t) order[i];
++        sink.stream << "{\"channel\":" << channel << ",\"mean_abs\":" << channel_abs[channel] << '}';
++    }
++    sink.stream << "]}\n";
++    sink.stream.flush();
++    return true;
++}
++
+ static common_speculative_output_limits server_output_limits(const common_params & params) {
+     if (params.embedding ||
+             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
+@@ -1213,6 +1355,16 @@ private:
+             params_base.load_progress_callback_user_data = &load_progress_text;
+         }
+ 
++        // Keep the custom activation probe opt-in. The eval callback is an
++        // experimental llama.cpp surface and synchronizes selected layer
++        // outputs back to the host for summary statistics.
++        const char * onram_trace_path = std::getenv("ONRAM_INFERENCE_TRACE_FILE");
++        if (onram_trace_path != nullptr && onram_trace_path[0] != '\0') {
++            params_base.cb_eval = onram_trace_layer_output;
++            params_base.cb_eval_user_data = nullptr;
++            SRV_WRN("Onram per-layer inference tracing enabled: %s\n", onram_trace_path);
++        }
++
+         llama_init = common_init_from_params(params_base);
+ 
+         model_tgt = llama_init->model();

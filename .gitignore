@@ -1,0 +1,11 @@
+
+# NEXUS x Atenhea H0 runtime artifacts
+NEXUS/nexus/h0/nexus_h0.db
+NEXUS/nexus/h0/nexus_h0.db.bak-*
+NEXUS/nexus/h0/h0_report.json
+NEXUS/nexus/h0/h0_report.json.bak-*
+NEXUS/nexus/h0/router_secret.txt
+NEXUS/nexus/h0/node/
+NEXUS/nexus/h0/*.log
+NEXUS/nexus/h0/.venv/
+__pycache__/

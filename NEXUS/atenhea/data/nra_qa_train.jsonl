@@ -1,0 +1,12 @@
+{"prompt":"Question: What does ENCODE do in NRA-M?\nAnswer:","completion":" It converts input text into token IDs."}
+{"prompt":"Question: What does READ do in NRA-M?\nAnswer:","completion":" It retrieves relevant information from persistent memory."}
+{"prompt":"Question: What does TRANSFORM do in NRA-M?\nAnswer:","completion":" It applies a selected neural operator to the current state."}
+{"prompt":"Question: What does REFINE do in NRA-M?\nAnswer:","completion":" It repeats an operator to improve a candidate state."}
+{"prompt":"Question: What does BRANCH do in NRA-M?\nAnswer:","completion":" It explores an alternate sequence of neural operators."}
+{"prompt":"Question: What does MERGE do in NRA-M?\nAnswer:","completion":" It combines compatible candidate states."}
+{"prompt":"Question: What does EVALUATE do in NRA-M?\nAnswer:","completion":" It measures a candidate against held-out examples."}
+{"prompt":"Question: What does COMMIT do in NRA-M?\nAnswer:","completion":" It saves an accepted change as a new model version."}
+{"prompt":"Question: What does ROLLBACK do in NRA-M?\nAnswer:","completion":" It restores the last validated model version."}
+{"prompt":"Question: What does HALT do in NRA-M?\nAnswer:","completion":" It ends the neural program after it produces an output."}
+{"prompt":"Question: What is the version journal for in NRA-M?\nAnswer:","completion":" It records accepted mutations and their evaluation results."}
+{"prompt":"Question: What is persistent memory for in NRA-M?\nAnswer:","completion":" It retains verified information between separate sessions."}

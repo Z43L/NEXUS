@@ -33,3 +33,11 @@ NEXUS is a hybrid infrastructure project focused on the automation, deployment, 
 *This project demonstrates the ability to architect complex, multi-language pipelines where security and reproducibility are the primary constraints.*
  ⁠
 
+
+## Fusión con Atenhea (2026-10-20)
+
+NEXUS incorpora el motor de inferencia **Atenhea** dentro de este mismo
+repositorio: Atenhea es el motor de cada nodo y NEXUS el plano de control
+(red, medición, pagos NEX, reputación). Diseño en
+`docs/spec-fusion-nexus-atenea.md`, mapa del proyecto unificado en
+`FUSION.md`, integración H0 en `NEXUS/nexus/h0/`.

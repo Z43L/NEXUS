@@ -1,0 +1,6 @@
+{"prompt":"Explain the ENCODE operation in NRA-M.\nAnswer:","completion":" It converts input text into token IDs."}
+{"prompt":"What is the purpose of READ in the NRA-M graph?\nAnswer:","completion":" It retrieves relevant information from persistent memory."}
+{"prompt":"In NRA-M, how does COMMIT work?\nAnswer:","completion":" It saves an accepted change as a new model version."}
+{"prompt":"What does ROLLBACK restore in NRA-M?\nAnswer:","completion":" It restores the last validated model version."}
+{"prompt":"Describe the version journal in NRA-M.\nAnswer:","completion":" It records accepted mutations and their evaluation results."}
+{"prompt":"What is the role of persistent memory?\nAnswer:","completion":" It retains verified information between separate sessions."}
