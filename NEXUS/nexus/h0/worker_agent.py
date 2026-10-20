@@ -38,6 +38,7 @@ class Worker:
         self.atenea = atenea.rstrip("/")
         self.priv, self.pub_pem, self.node_id = nc.load_or_create_node_key(node_dir)
         self.model_id = None
+        self.scaffolding_tokens = 0
 
     # -- Atenhea -------------------------------------------------------------
     def atenea_models(self) -> list[str]:
@@ -77,6 +78,29 @@ class Worker:
         return http_json(self.atenea + "/v1/chat/completions", payload, timeout=1200)
 
     # -- Router ----------------------------------------------------------------
+    def calibrate_scaffolding(self) -> int:
+        """Measure the engine's fixed per-request prompt overhead, in tokens.
+
+        Atenhea's engine renders extra scaffolding into every generation
+        (agent system instruction + its training-tool schema) that the token
+        counting endpoint does not include. Measured on David's Mac
+        2026-10-20: a constant ~428 tokens/request, which made raw ledger vs
+        usage totals diverge by up to 59.7% on small jobs. The worker
+        calibrates it once at startup with a 1-token probe generation; the
+        Router subtracts it before comparing counts, and clients are never
+        billed for it (spec metering amendment, FUSION.md).
+        """
+        probe = [{"role": "user", "content": "nexus calibration ping"}]
+        counted = self.count_input_tokens(probe)
+        if counted is None:
+            return 0
+        resp = http_json(self.atenea + "/v1/chat/completions", {
+            "model": self.model_id, "messages": probe,
+            "temperature": 0.0, "max_tokens": 1, "stream": False,
+        }, timeout=1200)
+        eng_prompt = int((resp.get("usage") or {}).get("prompt_tokens", counted))
+        return max(0, eng_prompt - counted)
+
     def register(self, models: list[str], nram: list[str]) -> None:
         http_json(self.router + "/nodes/register", {
             "node_id": self.node_id, "pubkey_pem": self.pub_pem,
@@ -131,6 +155,7 @@ class Worker:
             "output_tokens": eng_out,
             "engine_prompt_tokens": eng_in,
             "engine_completion_tokens": eng_out,
+            "scaffolding_tokens": self.scaffolding_tokens,
             "meter_source": meter_source,
             "nram_used": job.get("nram", []),
             "started_at": started_iso,
@@ -153,8 +178,10 @@ class Worker:
         if not models:
             raise SystemExit("Atenhea engine returned no models at " + self.atenea)
         self.model_id = models[0]
+        self.scaffolding_tokens = self.calibrate_scaffolding()
         self.register(models, [])
-        print(f"worker {self.node_id} model={self.model_id} atenea={self.atenea}", flush=True)
+        print(f"worker {self.node_id} model={self.model_id} atenea={self.atenea} "
+              f"scaffolding_tokens={self.scaffolding_tokens}", flush=True)
         idle = 0
         while True:
             try:

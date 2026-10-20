@@ -194,9 +194,15 @@ class Handler(BaseHTTPRequestHandler):
                 # Metering cross-check (spec 7.1): engine-reported counts vs receipt.
                 eng_in = receipt.get("engine_prompt_tokens", receipt["input_tokens"])
                 eng_out = receipt.get("engine_completion_tokens", receipt["output_tokens"])
-                base = max(eng_in + eng_out, 1)
+                # Metering amendment: the engine renders fixed per-request
+                # scaffolding (agent instruction + training-tool schema) into
+                # its prompt count. The worker calibrates it at startup and
+                # reports it per receipt; it is node overhead, never billed,
+                # and is subtracted before comparing like with like.
+                eng_in_adj = eng_in - int(receipt.get("scaffolding_tokens", 0))
+                base = max(eng_in_adj + eng_out, 1)
                 disc = abs((receipt["input_tokens"] + receipt["output_tokens"])
-                           - (eng_in + eng_out)) / base * 100.0
+                           - (eng_in_adj + eng_out)) / base * 100.0
                 conn.execute(
                     "INSERT OR REPLACE INTO receipts VALUES(?,?,?,?,?,?,?,?,?)",
                     (job_id, job["node_id"], json.dumps(receipt), signature,

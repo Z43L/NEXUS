@@ -46,3 +46,23 @@ python3 test_h0.py        # E2E contra el mock, sin motor real
 ```
 
 El informe de la puerta queda en `h0_report.json` (`gate_passed`).
+
+## Enmienda de medición H0 (2026-10-20)
+
+La primera corrida real contra el motor (Mac del autor) completó 100/100
+trabajos con 100 recibos verificados a 14,6 tok/s de salida, pero la
+comparación bruta de tokens divergía hasta un 59,7 %. Causa medida, no
+supuesta: el motor de Atenhea renderiza en cada generación un andamiaje fijo
+de agente (instrucción de sistema + esquema de su herramienta de
+entrenamiento, ≈428 tokens constantes por petición) que su endpoint de
+conteo no incluye. Es sobrecarga del nodo, no trabajo del cliente:
+
+- El cliente paga los tokens de su carga útil (conteo del tokenizer) + los de
+  salida, nunca el andamiaje.
+- El worker calibra el andamiaje al arrancar (una generación sonda de
+  1 token) y lo declara en cada recibo (`scaffolding_tokens`); el Router lo
+  resta antes de comparar, y la discrepancia vuelve a medir lo que debe:
+  carga útil contra carga útil.
+- Pendiente para H1: modo worker en el motor que no inyecte la herramienta
+  de entrenamiento en trabajos remotos (ahorra el cómputo del andamiaje y
+  evita que el modelo la vea).

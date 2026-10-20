@@ -64,14 +64,17 @@ class Handler(BaseHTTPRequestHandler):
             max_tokens = int(body.get("max_tokens", 220))
             n_out = min(max_tokens, 60)
             text = " ".join(f"tok{seed}-{i}" for i in range(n_out))
+            # Like the real engine, usage.prompt_tokens includes fixed
+            # per-request scaffolding the counting endpoint does not see.
+            scaffold = int(os.environ.get("MOCK_SCAFFOLD", "25"))
             return self._json({
                 "id": "chatcmpl-mock", "object": "chat.completion",
                 "model": body.get("model", "athenea-e2b"),
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
                              "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": count_tokens(prompt),
+                "usage": {"prompt_tokens": count_tokens(prompt) + scaffold,
                           "completion_tokens": count_tokens(text),
-                          "total_tokens": count_tokens(prompt) + count_tokens(text)},
+                          "total_tokens": count_tokens(prompt) + scaffold + count_tokens(text)},
             })
         return self._json({"error": "not found"}, 404)
 
