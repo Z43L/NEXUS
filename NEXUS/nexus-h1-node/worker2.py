@@ -1,0 +1,279 @@
+"""NEXUS H1 worker: H0 sidecar + JWT verification + heartbeat + wallet.
+
+Differences vs H0 worker:
+- Registers with an EVM wallet address (settlement identity) and receives the
+  Router's public key; every dispatched job must carry a valid EdDSA JWT
+  binding this node + job, verified BEFORE any execution (spec 6.1).
+- Heartbeat thread (5 s) so the Router can detect death and fail over.
+- Chat payloads carry "nexus_worker": true - engines built from this repo
+  honor it by NOT injecting their agent training tool into remote jobs
+  (H1 engine patch); other engines ignore the unknown field.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import ipaddress
+import json
+import ssl
+import threading
+import time
+import urllib.request
+import urllib.error
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import nexus_common as nc
+import jwt_auth
+
+BASE = Path(__file__).resolve().parent
+
+
+def http_json(url: str, payload: dict | None = None, timeout=600) -> dict:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="GET" if payload is None else "POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+class Worker:
+    def __init__(self, router: str, atenea: str, node_dir: Path, wallet: str,
+                 router_ca: str | None = None, enrollment_token_file: str | None = None):
+        self.router = router.rstrip("/")
+        self.atenea = atenea.rstrip("/")
+        self.wallet = wallet
+        parsed_router = urlsplit(self.router)
+        if (not parsed_router.hostname or parsed_router.username or parsed_router.password
+                or parsed_router.path not in ("", "/") or parsed_router.query or parsed_router.fragment):
+            raise ValueError("Router URL must contain only scheme, host and optional port")
+        self.router_ssl_context = None
+        self.enrollment_token = ""
+        if parsed_router.scheme == "https":
+            if not router_ca or not enrollment_token_file:
+                raise ValueError("HTTPS Router requires a CA file and enrollment-token file")
+            self.router_ssl_context = ssl.create_default_context(cafile=router_ca)
+            self.enrollment_token = self._read_enrollment_token(enrollment_token_file)
+        elif parsed_router.scheme == "http":
+            try:
+                is_loopback = ipaddress.ip_address(parsed_router.hostname or "").is_loopback
+            except ValueError:
+                is_loopback = (parsed_router.hostname or "").lower() == "localhost"
+            if not is_loopback or router_ca or enrollment_token_file:
+                raise ValueError("HTTP Router is allowed only on loopback without remote security options")
+        else:
+            raise ValueError("Router URL must use HTTPS remotely or HTTP on loopback locally")
+        self.priv, self.pub_pem, self.node_id = nc.load_or_create_node_key(node_dir)
+        self.model_id = None
+        self.models: list[str] = []
+        self.scaffolding_tokens = 0
+        self.router_pub_pem = ""
+
+    @staticmethod
+    def _read_enrollment_token(path: str) -> str:
+        token_path = Path(path)
+        try:
+            if token_path.stat().st_mode & 0o077:
+                raise ValueError("enrollment-token file permissions must be 0600")
+            token = token_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ValueError("cannot read enrollment-token file") from exc
+        if len(token) < 32:
+            raise ValueError("enrollment token must contain at least 32 characters")
+        return token
+
+    def router_json(self, path: str, payload: dict | None = None, timeout=30) -> dict:
+        method = "GET" if payload is None else "POST"
+        body = payload or {}
+        headers = {"Content-Type": "application/json"}
+        headers.update(nc.sign_node_request(self.priv, method, path, body))
+        headers["X-Nexus-Node-ID"] = self.node_id
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(self.router + path, data=data, method=method, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout,
+                                    context=self.router_ssl_context) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def atenea_models(self) -> list[str]:
+        out = http_json(self.atenea + "/v1/models", timeout=15)
+        return [m.get("id", "") for m in out.get("data", []) if m.get("id")]
+
+    def count_input_tokens(self, messages: list[dict]) -> int | None:
+        for path in ("/v1/chat/completions/input_tokens", "/v1/messages/count_tokens"):
+            try:
+                out = http_json(self.atenea + path,
+                                {"model": self.model_id, "messages": messages}, timeout=120)
+                return int(out["input_tokens"])
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise
+        return None
+
+    def calibrate_scaffolding(self) -> int:
+        probe = [{"role": "user", "content": "nexus calibration ping"}]
+        counted = self.count_input_tokens(probe)
+        if counted is None:
+            return 0
+        resp = http_json(self.atenea + "/v1/chat/completions", {
+            "model": self.model_id, "messages": probe,
+            "temperature": 0.0, "max_tokens": 1, "stream": False,
+        }, timeout=1200)
+        eng_prompt = int((resp.get("usage") or {}).get("prompt_tokens", counted))
+        return max(0, eng_prompt - counted)
+
+    def run_inference(self, job: dict, model_id: str) -> dict:
+        params = job.get("params") or {}
+        payload = {
+            "model": model_id,
+            "messages": job["messages"],
+            "temperature": params.get("temperature", 0.3),
+            "max_tokens": min(int(params.get("max_tokens", 220)), 4096),
+            "stream": False,
+            "nexus_worker": True,
+        }
+        return http_json(self.atenea + "/v1/chat/completions", payload, timeout=1200)
+
+    def register(self, models: list[str], nram: list[str]) -> None:
+        out = self.router_json("/nodes/register", {
+            "node_id": self.node_id, "pubkey_pem": self.pub_pem,
+            "models": models, "nram": nram, "region": "local",
+            "wallet": self.wallet,
+            **({"enrollment_token": self.enrollment_token}
+               if self.enrollment_token else {}),
+        }, timeout=15)
+        self.router_pub_pem = out.get("router_pubkey_pem", "")
+
+    def heartbeat_loop(self) -> None:
+        while True:
+            try:
+                self.router_json("/nodes/heartbeat", {"node_id": self.node_id}, timeout=10)
+            except Exception:
+                pass
+            time.sleep(5)
+
+    def next_job(self) -> dict | None:
+        out = self.router_json(f"/jobs/next?node_id={self.node_id}", timeout=15)
+        return out.get("job")
+
+    def post_result(self, job_id: str, payload: dict) -> dict:
+        return self.router_json(f"/jobs/{job_id}/result", payload, timeout=30)
+
+    def process(self, job: dict) -> None:
+        job_id = job["job_id"]
+        # JWT gate: nothing executes without a Router signature binding
+        # this node to this job.
+        try:
+            jwt_auth.verify_job_jwt(self.router_pub_pem, job.get("dispatch_jwt", ""),
+                                    self.node_id, job_id)
+        except ValueError as exc:
+            print(f"[{job_id}] refused: invalid dispatch jwt ({exc})", flush=True)
+            return
+        if job.get("tools"):
+            self.post_result(job_id, {"status": "rejected",
+                                      "error": "tools_not_allowed_in_remote_jobs",
+                                      "dispatch_jwt": job.get("dispatch_jwt", "")})
+            print(f"[{job_id}] rejected: tools requested", flush=True)
+            return
+        started = time.time()
+        started_iso = nc.utc_now_iso()
+        model_id = nc.resolve_model(job.get("model", ""), self.models)
+        counted_in = self.count_input_tokens(job["messages"])
+        resp = self.run_inference(job, model_id)
+        finished = time.time()
+        choice = (resp.get("choices") or [{}])[0]
+        output_text = ((choice.get("message") or {}).get("content")
+                       or choice.get("text") or "")
+        usage = resp.get("usage") or {}
+        eng_in = int(usage.get("prompt_tokens", counted_in or 0))
+        eng_out = int(usage.get("completion_tokens", 0))
+        if counted_in is None:
+            counted_in = eng_in
+            meter_source = "engine_usage_fallback"
+        else:
+            meter_source = "engine_tokenizer_endpoint"
+        nram_used = bool(job.get("nram"))
+        price = nc.price_micro_usd(counted_in, eng_out)
+        receipt = {
+            "job_id": job_id,
+            "node_id": self.node_id,
+            "model": model_id,
+            "input_tokens": counted_in,
+            "output_tokens": eng_out,
+            "engine_prompt_tokens": eng_in,
+            "engine_completion_tokens": eng_out,
+            "scaffolding_tokens": self.scaffolding_tokens,
+            "meter_source": meter_source,
+            "nram_used": job.get("nram", []),
+            "started_at": started_iso,
+            "finished_at": nc.utc_now_iso(),
+            "elapsed_s": round(finished - started, 3),
+            "output_sha256": hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
+            "price_micro_usd": price,
+            "shares": nc.split_payment(price, nram_used),
+        }
+        signature = nc.sign_receipt(self.priv, receipt)
+        self.post_result(job_id, {"status": "done", "receipt": receipt,
+                                  "signature": signature,
+                                  "dispatch_jwt": job.get("dispatch_jwt", ""),
+                                  "output_text": output_text})
+        print(f"[{job_id}] done in={counted_in} out={eng_out} "
+              f"{receipt['elapsed_s']}s price={price}µ$", flush=True)
+
+    def serve_forever(self) -> None:
+        models = self.atenea_models()
+        if not models:
+            raise SystemExit("engine returned no models at " + self.atenea)
+        self.model_id = models[0]
+        self.models = models
+        self.scaffolding_tokens = self.calibrate_scaffolding()
+        self.register(models, [])
+        threading.Thread(target=self.heartbeat_loop, daemon=True).start()
+        print(f"worker {self.node_id} model={self.model_id} wallet={self.wallet} "
+              f"scaffolding_tokens={self.scaffolding_tokens}", flush=True)
+        while True:
+            try:
+                job = self.next_job()
+            except Exception as exc:
+                print(f"router unreachable: {exc}", flush=True)
+                time.sleep(3)
+                continue
+            if job is None:
+                time.sleep(1)
+                continue
+            try:
+                self.process(job)
+            except Exception as exc:
+                transient = nc.is_transient_transport_error(exc)
+                status = "retry" if transient else "rejected"
+                error = (f"transient {type(exc).__name__}" if transient
+                         else f"worker_error: {exc}")
+                print(f"job {job.get('job_id')} {status}: {error}", flush=True)
+                try:
+                    self.post_result(job["job_id"], {"status": status,
+                                                      "error": error,
+                                                      "dispatch_jwt": job.get("dispatch_jwt", "")})
+                except Exception:
+                    pass
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--router", default="http://127.0.0.1:18090")
+    ap.add_argument("--atenea", default="http://127.0.0.1:11436")
+    ap.add_argument("--node-dir", default=str(BASE / "node"))
+    ap.add_argument("--wallet", default="")
+    ap.add_argument("--router-ca", help="CA PEM used to verify an HTTPS Router")
+    ap.add_argument("--enrollment-token-file",
+                    help="0600 file containing the one-time node enrollment token")
+    args = ap.parse_args()
+    try:
+        worker = Worker(args.router, args.atenea, Path(args.node_dir), args.wallet,
+                        router_ca=args.router_ca,
+                        enrollment_token_file=args.enrollment_token_file)
+    except (ValueError, OSError, ssl.SSLError) as exc:
+        ap.error(f"invalid Router security configuration: {exc}")
+    worker.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

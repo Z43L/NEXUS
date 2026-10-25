@@ -1,5 +1,7 @@
 # NEXUS × Atenhea — proyecto unificado
 
+> **Estado de ejecución actualizado a 2026-10-25:** este documento conserva la propuesta y las notas originales de integración. Las frases de estado y «pendiente» en el cuerpo son históricas. Para el estado verificado actual, límites y puertas restantes, consulta [EXECUTIVE_BRIEF.md](EXECUTIVE_BRIEF.md) y [PROJECT_DELIVERY.md](PROJECT_DELIVERY.md).
+
 Desde el 2026-10-20 todo vive en este único repositorio: NEXUS deja de ser solo
 el plano económico/red y Atenhea deja de ser un repo separado. Un proyecto,
 dos capas:

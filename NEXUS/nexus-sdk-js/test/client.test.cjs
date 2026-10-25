@@ -1,0 +1,57 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const axios = require('axios');
+
+let lastCall;
+let nextError;
+axios.create = (config) => ({
+  defaults: { timeout: config.timeout },
+  post: async (...args) => {
+    lastCall = args;
+    if (nextError) {
+      const error = nextError;
+      nextError = undefined;
+      throw error;
+    }
+    return { data: { choices: [] } };
+  },
+});
+
+const { NexusAPIError, NexusClient } = require('../dist/index.js');
+
+test('per-request HTTP deadline exceeds Router job deadline', async () => {
+  const client = new NexusClient({ timeout: 30_000 });
+  await client.chat('slow job', { timeoutSeconds: 1800 });
+  assert.equal(lastCall[1].timeout_s, 1800);
+  assert.equal(lastCall[2].timeout, 1_810_000);
+});
+
+test('constructor timeout can extend the per-request HTTP deadline', async () => {
+  const client = new NexusClient({ timeout: 2_000_000 });
+  await client.chat('slow job', { timeoutSeconds: 1800 });
+  assert.equal(lastCall[2].timeout, 2_000_000);
+});
+
+test('FastAPI wrapped Router errors preserve useful message and job ID', async () => {
+  const client = new NexusClient();
+  nextError = {
+    response: {
+      status: 504,
+      data: { detail: { error: {
+        type: 'job_timeout', job_id: 'job_123', message: 'still pending',
+      } } },
+    },
+  };
+  await assert.rejects(client.chat('slow job'), (error) => {
+    assert.ok(error instanceof NexusAPIError);
+    assert.equal(error.statusCode, 504);
+    assert.equal(error.message, 'still pending');
+    assert.equal(error.payload.detail.error.job_id, 'job_123');
+    return true;
+  });
+});
+
+test('rejects Router deadlines outside supported range', async () => {
+  const client = new NexusClient();
+  await assert.rejects(client.chat('bad timeout', { timeoutSeconds: 1801 }), RangeError);
+});

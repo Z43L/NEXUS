@@ -1,0 +1,52 @@
+{
+  "validation_type": "real_engine_h0_batch",
+  "validated_at": "2026-10-25T11:47:38Z",
+  "repository_base_commit": "ed1a9f5",
+  "engine_endpoint": "http://127.0.0.1:11436",
+  "engine_reported_model": "athenea-e2b:latest",
+  "inference_max_tokens_per_job": 24,
+  "scope_note": "100-job functional gate with capped output; not the full-length performance benchmark and not an on-chain settlement test.",
+  "report": {
+    "when": "2026-10-25T11:47:38Z",
+    "jobs_submitted": 100,
+    "jobs_done": 100,
+    "probe_status": [
+      "rejected"
+    ],
+    "verified_receipts": 100,
+    "input_tokens": 21167,
+    "output_tokens": 2400,
+    "max_discrepancy_pct": 0.0,
+    "total_price_usd_at_reference": 0.001296,
+    "splits_usd": {
+      "node": 0.001016,
+      "nram_author": 0.0,
+      "verification": 0.0,
+      "burn": 0.0,
+      "treasury": 0.00028
+    },
+    "wall_time_s": 186.5,
+    "engine_time_s": 180.5,
+    "output_tokens_per_s_engine": 13.29,
+    "gate": {
+      "100_jobs_done": true,
+      "all_receipts_verified": true,
+      "discrepancy_le_1pct": true,
+      "tools_probe_rejected": true
+    },
+    "gate_passed": true
+  },
+  "batch_client_path": "dogfood_client.py → H0 router → worker → Atenhea",
+  "interactive_smoke": {
+    "client_path": "NEXUS browser console → local UI proxy → H0 router → worker → Atenhea",
+    "model": "athenea-e2b:latest",
+    "result": "HTTP 200; non-empty OpenAI-compatible chat completion and usage returned"
+  },
+  "launcher_real_smoke": {
+    "validated_at": "2026-10-25T12:10:11Z",
+    "client_path": "run_h0_local.sh → browser console proxy → H0 router → worker → Atenhea",
+    "model": "athenea-e2b:latest",
+    "result": "HTTP 200; assistant returned OK; 109 prompt tokens, 2 completion tokens; 1.36s",
+    "shutdown": "Router, worker and UI stopped on Ctrl-C; Atenhea remained available"
+  }
+}

@@ -6,15 +6,16 @@ Stdlib + `cryptography` only.
 from __future__ import annotations
 
 import hashlib
-import hmac
+import base64
 import json
+import secrets
 import time
+import urllib.error
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
-    Ed25519PublicKey,
 )
 from cryptography.exceptions import InvalidSignature
 
@@ -101,27 +102,135 @@ def verify_receipt(pub_pem: str, receipt: dict, signature_hex: str) -> bool:
         return False
 
 
-# --- Per-job dispatch token (H0 local stand-in for the spec's JWT) ----------
-
-def job_token(secret: bytes, job_id: str) -> str:
-    return hmac.new(secret, job_id.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def check_job_token(secret: bytes, job_id: str, token: str) -> bool:
-    return hmac.compare_digest(job_token(secret, job_id), token or "")
+def node_id_from_public_pem(public_pem: str) -> str:
+    public_key = serialization.load_pem_public_key(public_pem.encode("ascii"))
+    public_der = public_key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo)
+    return "node_" + sha256_hex(public_der)[:16]
 
 
-def load_router_secret(base_dir: str | Path) -> bytes:
-    path = Path(base_dir) / "router_secret.txt"
-    if path.exists():
-        return path.read_bytes().strip()
-    secret = hashlib.sha256(f"nexus-h0-{time.time()}-{id(object())}".encode()).digest()
-    path.write_bytes(secret.hex().encode("ascii"))
+def resolve_model(requested: str, available: list[str]) -> str:
+    """Resolve a requested model to an advertised engine model or fail closed."""
+    if not available:
+        raise ValueError("worker has no available models")
+    if not requested:
+        return available[0]
+    if requested in available:
+        return requested
+    latest = ":latest"
+    if requested.endswith(latest) and requested[:-len(latest)] in available:
+        return requested[:-len(latest)]
+    if requested + latest in available:
+        return requested + latest
+    raise ValueError(f"requested model is not available on this worker: {requested}")
+
+
+def is_transient_transport_error(exc: BaseException) -> bool:
+    """Retry HTTP 429/5xx and transport failures, but not application errors."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 429 or 500 <= exc.code <= 599
+    return isinstance(exc, (urllib.error.URLError, TimeoutError))
+
+
+def node_request_message(method: str, path: str, timestamp: str, nonce: str, body: dict) -> bytes:
+    body_hash = sha256_hex(canonical_json(body))
+    return f"{method.upper()}\n{path}\n{timestamp}\n{nonce}\n{body_hash}".encode("utf-8")
+
+
+def sign_node_request(private_key, method: str, path: str, body: dict | None = None) -> dict:
+    timestamp = str(int(time.time()))
+    nonce = secrets.token_urlsafe(18)
+    message = node_request_message(method, path, timestamp, nonce, body or {})
+    return {"X-Nexus-Timestamp": timestamp, "X-Nexus-Nonce": nonce,
+            "X-Nexus-Signature": private_key.sign(message).hex()}
+
+
+def verify_node_request(public_pem: str, method: str, path: str, body: dict,
+                        timestamp: str, nonce: str, signature_hex: str) -> bool:
     try:
-        path.chmod(0o600)
-    except OSError:
-        pass
-    return secret.hex().encode("ascii")
+        timestamp_int = int(timestamp)
+        if abs(int(time.time()) - timestamp_int) > 60:
+            return False
+        if not nonce or len(nonce) > 128:
+            return False
+        public_key = serialization.load_pem_public_key(public_pem.encode("ascii"))
+        public_key.verify(bytes.fromhex(signature_hex),
+                          node_request_message(method, path, timestamp, nonce, body))
+        return True
+    except (InvalidSignature, ValueError, TypeError, UnicodeError):
+        return False
+
+
+def _b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64u_dec(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def load_or_create_router_key(base_dir: str | Path):
+    """Load or create the router's Ed25519 signing key and public PEM."""
+    base = Path(base_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / "router_key.pem"
+    if path.exists():
+        private_key = serialization.load_pem_private_key(path.read_bytes(), password=None)
+    else:
+        private_key = Ed25519PrivateKey.generate()
+        path.write_bytes(private_key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()))
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    public_pem = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo).decode("ascii")
+    return private_key, public_pem
+
+
+def issue_job_jwt(private_key, node_id: str, job_id: str, ttl_s: int = 900) -> str:
+    now = int(time.time())
+    header = {"alg": "EdDSA", "typ": "JWT"}
+    claims = {"iss": "nexus-router", "aud": "nexus-node", "sub": node_id,
+              "job_id": job_id, "iat": now, "exp": now + ttl_s,
+              "jti": f"{job_id}-{now}"}
+    signing_input = (_b64u(json.dumps(header, separators=(",", ":")).encode()) + "." +
+                     _b64u(json.dumps(claims, separators=(",", ":")).encode()))
+    signature = private_key.sign(signing_input.encode("ascii"))
+    return signing_input + "." + _b64u(signature)
+
+
+def verify_job_jwt(public_pem: str, token: str, node_id: str, job_id: str) -> dict:
+    """Verify router signature, issuer, audience, node/job binding and expiry."""
+    parts = (token or "").split(".")
+    if len(parts) != 3:
+        raise ValueError("malformed dispatch JWT")
+    try:
+        header = json.loads(_b64u_dec(parts[0]))
+        claims = json.loads(_b64u_dec(parts[1]))
+        signature = _b64u_dec(parts[2])
+        public_key = serialization.load_pem_public_key(public_pem.encode("ascii"))
+        if header != {"alg": "EdDSA", "typ": "JWT"}:
+            raise ValueError("unsupported JWT header")
+        public_key.verify(signature, (parts[0] + "." + parts[1]).encode("ascii"))
+    except InvalidSignature as exc:
+        raise ValueError("invalid dispatch JWT signature") from exc
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid dispatch JWT") from exc
+    now = int(time.time())
+    issued = int(claims.get("iat", 0))
+    expires = int(claims.get("exp", 0))
+    if claims.get("iss") != "nexus-router" or claims.get("aud") != "nexus-node":
+        raise ValueError("invalid dispatch JWT issuer or audience")
+    if claims.get("sub") != node_id or claims.get("job_id") != job_id:
+        raise ValueError("dispatch JWT is bound to another node or job")
+    if issued > now + 30 or expires <= now or expires <= issued or expires - issued > 1800:
+        raise ValueError("dispatch JWT is expired or has invalid lifetime")
+    return claims
 
 
 def utc_now_iso() -> str:

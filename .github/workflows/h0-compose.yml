@@ -1,0 +1,116 @@
+name: h0-compose
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'NEXUS/compose.h0.yml'
+      - 'NEXUS/.dockerignore'
+      - 'NEXUS/.env.h0.example'
+      - 'NEXUS/nexus-h1-node/**'
+      - 'NEXUS/nexus/h0/**'
+      - 'NEXUS/nexus-sdk-js/**'
+      - 'NEXUS/nexus-sdk-python/**'
+      - '.github/workflows/h0-compose.yml'
+  pull_request:
+    paths:
+      - 'NEXUS/compose.h0.yml'
+      - 'NEXUS/.dockerignore'
+      - 'NEXUS/.env.h0.example'
+      - 'NEXUS/nexus-h1-node/**'
+      - 'NEXUS/nexus/h0/**'
+      - 'NEXUS/nexus-sdk-js/**'
+      - 'NEXUS/nexus-sdk-python/**'
+      - '.github/workflows/h0-compose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install H0 test dependency
+        run: python3 -m pip install -r NEXUS/nexus/h0/requirements-h0.txt
+      - name: Run H0 protocol and security regressions
+        working-directory: NEXUS/nexus/h0
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 test_h0.py
+          PYTHONDONTWRITEBYTECODE=1 python3 test_router_concurrency.py
+          PYTHONDONTWRITEBYTECODE=1 python3 test_secure_remote.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: NEXUS/nexus-sdk-js/package-lock.json
+      - name: Test TypeScript SDK
+        working-directory: NEXUS/nexus-sdk-js
+        run: npm ci && npm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install and test Python SDK package
+        run: python -m pip install ./NEXUS/nexus-sdk-python && PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s NEXUS/nexus-sdk-python/tests -v
+      - name: Validate scripts, Python, and Compose configuration
+        working-directory: NEXUS
+        run: |
+          sh -n nexus-h1-node/bootstrap-compose-h0.sh
+          python3 -m py_compile nexus/h0/router.py nexus/h0/nexus_common.py nexus-h1-node/worker2.py nexus-h1-node/jwt_auth.py nexus-h1-node/container_healthcheck.py
+          ./nexus-h1-node/bootstrap-compose-h0.sh
+          docker compose --env-file .env.h0 -f compose.h0.yml config --quiet
+      - name: Build H0 Router and H1 worker image
+        working-directory: NEXUS
+        run: docker compose --env-file .env.h0 -f compose.h0.yml build --pull router
+      - name: Start mock Atenhea and run container E2E
+        working-directory: NEXUS
+        run: |
+          set -euo pipefail
+          sed -i 's#^ATENHEA_URL=.*#ATENHEA_URL=http://host.docker.internal:11436#' .env.h0
+          python3 nexus/h0/mock_atenea.py --host 0.0.0.0 --port 11436 > /tmp/nexus-mock-atenea.log 2>&1 &
+          MOCK_PID=$!
+          trap 'kill "$MOCK_PID" 2>/dev/null || true' EXIT
+          python3 - <<'PY'
+          import time
+          from urllib.request import urlopen
+
+          for _ in range(50):
+              try:
+                  with urlopen("http://127.0.0.1:11436/v1/models", timeout=1) as response:
+                      if response.status == 200:
+                          break
+              except OSError:
+                  time.sleep(0.2)
+          else:
+              raise SystemExit("mock Atenhea did not start")
+          PY
+          docker compose --env-file .env.h0 -f compose.h0.yml up --detach --wait --wait-timeout 300 router worker
+          python3 - <<'PY'
+          import json
+          import ssl
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          token = Path(".secrets/client.token").read_text().strip()
+          context = ssl.create_default_context(cafile=".secrets/ca.crt")
+          body = json.dumps({
+              "model": "athenea-e2b",
+              "messages": [{"role": "user", "content": "compose end-to-end check"}],
+              "max_tokens": 8,
+              "timeout_s": 60,
+          }).encode()
+          request = Request(
+              "https://localhost:18090/v1/chat/completions",
+              data=body,
+              headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+          )
+          with urlopen(request, context=context, timeout=90) as response:
+              result = json.loads(response.read())
+          assert result["choices"][0]["message"]["content"], result
+          assert result["usage"]["completion_tokens"] > 0, result
+          print("Compose Router → H1 worker → mock Atenhea E2E: PASS")
+          PY
+      - name: Stop Compose services
+        if: always()
+        working-directory: NEXUS
+        run: docker compose --env-file .env.h0 -f compose.h0.yml down --volumes --remove-orphans

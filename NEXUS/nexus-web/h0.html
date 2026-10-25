@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NEXUS H0 · Chat local</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+    body { max-width: 780px; margin: 3rem auto; padding: 0 1rem; }
+    header { border-bottom: 1px solid #8886; margin-bottom: 1.5rem; }
+    h1 { margin-bottom: .2rem; }
+    .muted { color: #888; }
+    #status { min-height: 1.5rem; }
+    #messages { display: grid; gap: .75rem; margin: 1.5rem 0; }
+    .message { padding: .8rem 1rem; border-radius: .7rem; background: #8882; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .message.user { border-left: 4px solid #4c9; }
+    .message.assistant { border-left: 4px solid #69c; }
+    textarea, select, button { font: inherit; }
+    textarea { box-sizing: border-box; width: 100%; min-height: 7rem; padding: .7rem; }
+    .controls { display: flex; gap: .7rem; margin: .7rem 0; flex-wrap: wrap; }
+    button { padding: .5rem 1rem; cursor: pointer; }
+    button:disabled { cursor: wait; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>NEXUS H0</h1>
+    <p class="muted">Chat local de texto · respuestas completas, sin streaming</p>
+  </header>
+  <label for="model">Modelo anunciado</label>
+  <div class="controls">
+    <select id="model" disabled><option value="">Esperando modelos…</option></select>
+    <label>Tokens <input id="tokens" type="number" min="1" max="4096" value="256"></label>
+  </div>
+  <div id="messages" aria-live="polite"></div>
+  <form id="chat-form">
+    <label for="prompt">Mensaje</label>
+    <textarea id="prompt" required maxlength="150000" placeholder="Escribe un mensaje…"></textarea>
+    <div class="controls"><button id="send" type="submit" disabled>Enviar</button><span id="status" class="muted"></span></div>
+  </form>
+  <script>
+    const form = document.querySelector('#chat-form');
+    const promptInput = document.querySelector('#prompt');
+    const messagesEl = document.querySelector('#messages');
+    const modelSelect = document.querySelector('#model');
+    const statusEl = document.querySelector('#status');
+    const sendButton = document.querySelector('#send');
+    const history = [];
+    const MAX_REQUEST_BYTES = 1_048_576;
+    const MAX_TOTAL_CHARS = 150_000;
+
+    function addMessage(role, content) {
+      const article = document.createElement('article');
+      article.className = `message ${role}`;
+      const title = document.createElement('strong');
+      title.textContent = role === 'user' ? 'Tú' : 'NEXUS';
+      const text = document.createElement('div');
+      text.textContent = content;
+      article.append(title, text);
+      messagesEl.append(article);
+    }
+
+    async function recoverTimedOutJob(jobId) {
+      for (let attempt = 0; attempt < 60; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        const response = await fetch(`/jobs/${encodeURIComponent(jobId)}`, { cache: 'no-store' });
+        const job = await response.json();
+        if (!response.ok) throw new Error(`No se pudo consultar ${jobId}: ${job.error || response.status}`);
+        if (job.status === 'done' && typeof job.output_text === 'string') return job.output_text;
+        if (['failed', 'rejected'].includes(job.status)) {
+          throw new Error(`${jobId} terminó con estado ${job.status}${job.error ? `: ${job.error}` : ''}`);
+        }
+        statusEl.textContent = `${jobId}: ${job.status || 'en curso'} · comprobación ${attempt + 1}/60`;
+      }
+      throw new Error(`${jobId} sigue en curso. Conserva este ID para consultar el estado.`);
+    }
+
+    fetch('/v1/models').then(r => r.ok ? r.json() : Promise.reject())
+      .then(data => {
+        const models = data.data || [];
+        modelSelect.replaceChildren();
+        if (!models.length) {
+          modelSelect.add(new Option('No hay workers con modelos', ''));
+          statusEl.textContent = 'Registra un worker H0 antes de enviar mensajes.';
+          return;
+        }
+        models.forEach(item => {
+        const option = document.createElement('option');
+        option.value = item.id;
+        option.textContent = item.id;
+        modelSelect.append(option);
+        });
+        modelSelect.value = models[0].id;
+        modelSelect.disabled = false;
+        sendButton.disabled = false;
+        statusEl.textContent = `${models.length} modelo(s) anunciado(s).`;
+      })
+      .catch(() => {
+        modelSelect.replaceChildren(new Option('Router no disponible', ''));
+        statusEl.textContent = 'No se pudo consultar el Router; inicia Router y worker.';
+      });
+
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const content = promptInput.value.trim();
+      if (!content || !modelSelect.value) return;
+      const currentChars = history.reduce((sum, message) => sum + message.content.length, 0);
+      if (currentChars + content.length > MAX_TOTAL_CHARS) {
+        statusEl.textContent = `El historial supera el límite de ${MAX_TOTAL_CHARS.toLocaleString()} caracteres.`;
+        return;
+      }
+      const userMessage = { role: 'user', content };
+      history.push(userMessage);
+      addMessage('user', content);
+      promptInput.value = '';
+      sendButton.disabled = true;
+      statusEl.textContent = 'Esperando al worker…';
+      try {
+        const body = JSON.stringify({
+          model: modelSelect.value,
+          messages: history,
+          max_tokens: Number(document.querySelector('#tokens').value),
+          timeout_s: 1800,
+          stream: false
+        });
+        if (new TextEncoder().encode(body).byteLength > MAX_REQUEST_BYTES) {
+          throw new Error('La petición supera el límite de 1 MiB del Router.');
+        }
+        const response = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body
+        });
+        const data = await response.json();
+        if (response.status === 504 && data.error?.job_id) {
+          statusEl.textContent = `Tiempo de espera; recuperando ${data.error.job_id}…`;
+          data.choices = [{ message: { content: await recoverTimedOutJob(data.error.job_id) } }];
+        }
+        if (!response.ok && response.status !== 504) {
+          throw new Error(data.error?.message || data.error || `HTTP ${response.status}`);
+        }
+        if (response.status === 504 && !data.error?.job_id) {
+          throw new Error(data.error?.message || 'HTTP 504 sin ID de trabajo recuperable');
+        }
+        const answer = data.choices?.[0]?.message?.content;
+        if (typeof answer !== 'string') throw new Error('Respuesta H0 sin choices[0].message.content');
+        history.push({ role: 'assistant', content: answer });
+        addMessage('assistant', answer);
+        statusEl.textContent = `${data.usage?.total_tokens ?? 0} tokens · ${data.model || 'modelo'}`;
+      } catch (error) {
+        history.pop();
+        promptInput.value = content;
+        addMessage('assistant', `Error: ${error.message}`);
+        statusEl.textContent = 'No se pudo completar la petición.';
+      } finally {
+        sendButton.disabled = !modelSelect.value;
+        promptInput.focus();
+      }
+    });
+  </script>
+</body>
+</html>

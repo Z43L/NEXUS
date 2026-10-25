@@ -1,89 +1,116 @@
-import aiohttp
+"""Async Python client for the local NEXUS OpenAI-compatible gateway."""
+
+from __future__ import annotations
+
+import asyncio
 import json
-from typing import Dict, List, Optional, AsyncGenerator
-from datetime import datetime
-from pydantic import BaseModel
+from typing import Any, Optional, Sequence
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-class NexusClient:
-    """Cliente Python para la API de NEXUS"""
-    
-    def __init__(self, api_key: str, base_url: str = "https://api.nexus.ai"):
-        self.api_key = api_key
-        self.base_url = base_url
-        self.session = None
-    
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.session.close()
-    
-    async def _make_request(self, method: str, endpoint: str, **kwargs) -> Dict:
-        """Método interno para realizar requests"""
-        url = f"{self.base_url}{endpoint}"
-        headers = {
-            "X-API-Key": self.api_key,
-            "Content-Type": "application/json"
-        }
-        
-        async with self.session.request(method, url, headers=headers, **kwargs) as response:
-            if response.status != 200:
-                error_data = await response.json()
-                raise NexusAPIError(
-                    f"API request failed: {error_data.get('error', 'Unknown error')}",
-                    response.status
-                )
-            
-            return await response.json()
-    
-    async def query(self, query: str, **kwargs) -> Dict:
-        """Realiza una consulta de conocimiento"""
-        data = {"query": query, **kwargs}
-        return await self._make_request("POST", "/v1/cognitive/query", json=data)
-    
-    async def infer(self, task: str, **kwargs) -> Dict:
-        """Solicita inferencia compleja"""
-        data = {"task": task, **kwargs}
-        return await self._make_request("POST", "/v1/cognitive/infer", json=data)
-    
-    async def chat(self, message: str, context: Optional[Dict] = None) -> AsyncGenerator[str, None]:
-        """Streaming de chat con NEXUS"""
-        data = {"message": message, "context": context or {}, "stream": True}
-        
-        async with self.session.post(
-            f"{self.base_url}/v1/cognitive/chat",
-            headers={"X-API-Key": self.api_key},
-            json=data
-        ) as response:
-            async for line in response.content:
-                if line:
-                    yield line.decode().strip()
-    
-    async def upload_knowledge(self, content: str, metadata: Optional[Dict] = None) -> str:
-        """Sube conocimiento a NEXUS"""
-        data = {"content": content, "metadata": metadata or {}}
-        response = await self._make_request("POST", "/v1/knowledge/upload", json=data)
-        return response["knowledge_id"]
-    
-    async def get_rate_limit_info(self) -> Dict:
-        """Obtiene información de rate limit"""
-        return await self._make_request("GET", "/v1/auth/rate_limit")
 
-class NexusAPIError(Exception):
-    """Excepción personalizada para errores de la API"""
-    
-    def __init__(self, message: str, status_code: int):
+DEFAULT_BASE_URL = "http://127.0.0.1:18080"
+
+
+class NexusAPIError(RuntimeError):
+    """An HTTP or gateway error returned by NEXUS."""
+
+    def __init__(self, message: str, status_code: int, payload: Any = None):
         super().__init__(message)
         self.status_code = status_code
+        self.payload = payload
 
-# Ejemplo de uso
-async def example_usage():
-    async with NexusClient("your_api_key") as client:
-        # Consulta simple
-        result = await client.query("¿Qué es el aprendizaje por refuerzo?")
-        print(result)
-        
-        # Chat streaming
-        async for chunk in client.chat("Explícame la teoría de la relatividad"):
-            print(chunk, end="")
+
+class NexusClient:
+    """Async client for `POST /v1/chat/completions`.
+
+    H0 is intended for loopback use and does not authenticate API keys. The
+    optional `api_key` argument is reserved for deployments with an
+    authenticated reverse proxy in front of the router.
+    """
+
+    def __init__(self, api_key: Optional[str] = None,
+                 base_url: str = DEFAULT_BASE_URL, timeout: float = 300):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    async def __aenter__(self) -> "NexusClient":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        return None
+
+    async def chat(self, messages: str | Sequence[dict[str, str]], *,
+                   model: str = "", max_tokens: int = 256,
+                   temperature: float = 0.3, timeout_s: int = 300) -> dict[str, Any]:
+        """Create a non-streaming chat completion and return the OpenAI-style payload."""
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+        if (isinstance(timeout_s, bool) or not isinstance(timeout_s, int)
+                or not 1 <= timeout_s <= 1800):
+            raise ValueError("timeout_s must be an integer from 1 to 1800")
+        return await self._request("POST", "/v1/chat/completions", timeout=max(
+            self.timeout, timeout_s + 10
+        ), json={
+            "model": model,
+            "messages": list(messages),
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "timeout_s": timeout_s,
+        })
+
+    async def query(self, query: str, **kwargs) -> dict[str, Any]:
+        """Send a knowledge question as an ordinary inference request."""
+        return await self.chat(query, **kwargs)
+
+    async def infer(self, task: str, **kwargs) -> dict[str, Any]:
+        """Send an inference task as an ordinary chat completion."""
+        return await self.chat(task, **kwargs)
+
+    async def _request(self, method: str, endpoint: str, *, timeout: Optional[float] = None,
+                       **kwargs) -> dict[str, Any]:
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        url = f"{self.base_url}{endpoint}"
+        body = kwargs.get("json")
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        req = Request(url, data=data, method=method, headers=headers)
+        return await asyncio.to_thread(self._send, req, timeout or self.timeout)
+
+    def _send(self, request: Request, timeout: float) -> dict[str, Any]:
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                status = response.status
+                raw = response.read().decode("utf-8")
+        except HTTPError as exc:
+            status = exc.code
+            raw = exc.read().decode("utf-8", errors="replace")
+        except URLError as exc:
+            raise NexusAPIError(str(exc.reason), 0) from exc
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            payload = {"error": raw}
+        if status < 200 or status >= 300:
+            raise NexusAPIError(_error_message(payload), status, payload)
+        return payload
+
+
+def _error_message(payload: Any) -> str:
+    """Extract errors from Router, FastAPI, and OpenAI-compatible envelopes."""
+    if not isinstance(payload, dict):
+        return str(payload) if payload else "NEXUS request failed"
+    error = payload.get("error")
+    detail = payload.get("detail")
+    if not error and isinstance(detail, dict):
+        error = detail.get("error", detail)
+    elif not error:
+        error = detail
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("detail") or error)
+    return str(error or "NEXUS request failed")
+
+
+__all__ = ["NexusClient", "NexusAPIError", "DEFAULT_BASE_URL"]

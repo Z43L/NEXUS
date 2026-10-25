@@ -1,0 +1,131 @@
+# Separate from docker-compose.yml: this is the H0/H1 Router + worker path.
+# Atenhea is intentionally external and must be reachable at ATENHEA_URL.
+services:
+  router:
+    build:
+      context: .
+      dockerfile: nexus-h1-node/Dockerfile
+    image: nexus-h0-router-worker:local
+    command:
+      - /app/nexus/h0/router.py
+      - --mode
+      - remote
+      - --host
+      - ${NEXUS_ROUTER_IP:?Set NEXUS_ROUTER_IP in .env.h0}
+      - --port
+      - "18080"
+      - --dir
+      - /var/lib/nexus
+      - --tls-cert
+      - /run/secrets/router_cert
+      - --tls-key
+      - /run/secrets/router_key
+      - --client-token-file
+      - /run/secrets/client_token
+      - --enrollment-token-file
+      - /run/secrets/enrollment_token
+    environment:
+      ROUTER_URL: https://router:18080
+      ROUTER_CA_FILE: /run/secrets/router_ca
+    user: "${NEXUS_UID:?Set NEXUS_UID in .env.h0}:${NEXUS_GID:?Set NEXUS_GID in .env.h0}"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "127.0.0.1:${ROUTER_HOST_PORT:-18090}:18080"
+    volumes:
+      - ./data/h0-router:/var/lib/nexus
+    secrets:
+      - source: router_cert
+        target: router_cert
+      - source: router_key
+        target: router_key
+      - source: router_ca
+        target: router_ca
+      - source: client_token
+        target: client_token
+      - source: enrollment_token
+        target: enrollment_token
+    healthcheck:
+      test: ["CMD", "python", "/app/nexus-h1-node/container_healthcheck.py", "router"]
+      interval: 20s
+      timeout: 8s
+      retries: 3
+      start_period: 15s
+    networks:
+      h0-private:
+        ipv4_address: ${NEXUS_ROUTER_IP:?Set NEXUS_ROUTER_IP in .env.h0}
+
+  worker:
+    image: nexus-h0-router-worker:local
+    command:
+      - /app/nexus-h1-node/worker2.py
+      - --router
+      - https://router:18080
+      - --atenea
+      - ${ATENHEA_URL:?Set ATENHEA_URL to the external Atenhea ENGINE URL in .env.h0}
+      - --node-dir
+      - /var/lib/nexus/node
+      - --router-ca
+      - /run/secrets/router_ca
+      - --enrollment-token-file
+      - /run/secrets/enrollment_token
+      - --wallet
+      - ${NEXUS_H1_WALLET:-}
+    user: "${NEXUS_UID:?Set NEXUS_UID in .env.h0}:${NEXUS_GID:?Set NEXUS_GID in .env.h0}"
+    environment:
+      ROUTER_URL: https://router:18080
+      ROUTER_CA_FILE: /run/secrets/router_ca
+      ATENHEA_URL: ${ATENHEA_URL:?Set ATENHEA_URL to the external Atenhea ENGINE URL in .env.h0}
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    restart: unless-stopped
+    stop_grace_period: 30s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data/h0-worker:/var/lib/nexus
+    secrets:
+      - source: router_ca
+        target: router_ca
+      - source: enrollment_token
+        target: enrollment_token
+    depends_on:
+      router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/app/nexus-h1-node/container_healthcheck.py", "worker"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 180s
+    networks:
+      - h0-private
+
+secrets:
+  router_cert:
+    file: ./.secrets/router.crt
+  router_key:
+    file: ./.secrets/router.key
+  router_ca:
+    file: ./.secrets/ca.crt
+  client_token:
+    file: ./.secrets/client.token
+  enrollment_token:
+    file: ./.secrets/enrollment.token
+
+networks:
+  h0-private:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${NEXUS_H0_SUBNET:-172.30.240.0/24}
