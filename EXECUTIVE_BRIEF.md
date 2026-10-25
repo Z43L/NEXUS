@@ -1,7 +1,7 @@
 # Hoja ejecutiva — NEXUS × Atenhea
 
 **Fecha de análisis:** 25 de octubre de 2026
-**Repositorio analizado:** `NEXUS/`, rama `main`, HEAD base `ed1a9f5` (`H0 metering amendment: calibrate engine scaffolding tokens`) más los cambios locales no confirmados descritos en este informe
+**Repositorio analizado:** `NEXUS/`, rama local `codex/nexus-e2e-functional`, commit `36805c5` (derivada de `main` en `ed1a9f5`)
 **Alcance:** documentación, estructura, rutas de ejecución/configuración y código de integración H0; análisis complementario de backend, cadena/economía, interfaz y operaciones.
 
 ## Resumen para dirección
