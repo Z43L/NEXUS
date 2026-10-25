@@ -20,12 +20,14 @@ interface VmE2E {
 /// batch on a disposable Anvil chain and checks every expected recipient balance.
 contract RunBridgeE2E {
     VmE2E private constant vm = VmE2E(address(uint160(uint256(keccak256("hevm cheat code")))));
-    uint256 private constant CLAIM_WINDOW = 1 days;
 
     struct BatchData {
         bytes32 batchId;
         bytes32 root;
         uint256 rootSum;
+        uint256 chainId;
+        address escrowAddress;
+        address tokenAddress;
         InferenceEscrow.JobClaim[] claims;
     }
 
@@ -42,6 +44,9 @@ contract RunBridgeE2E {
             batchId: vm.parseJsonBytes32(json, ".batchId"),
             root: vm.parseJsonBytes32(json, ".root"),
             rootSum: vm.parseJsonUint(json, ".rootSum"),
+            chainId: vm.parseJsonUint(json, ".settlementContext.chainId"),
+            escrowAddress: vm.parseJsonAddress(json, ".settlementContext.escrowAddress"),
+            tokenAddress: vm.parseJsonAddress(json, ".settlementContext.tokenAddress"),
             claims: new InferenceEscrow.JobClaim[](2)
         });
         // This harness fixture intentionally contains exactly two claims. Parse
@@ -50,6 +55,8 @@ contract RunBridgeE2E {
         data.claims[0] = _parseClaim(json, 0);
         data.claims[1] = _parseClaim(json, 1);
         require(data.claims.length > 0 && data.rootSum > 0, "empty bridge batch");
+        require(block.chainid == data.chainId, "settlement chain mismatch");
+        require(data.escrowAddress.code.length > 0 && data.tokenAddress.code.length > 0, "missing settlement contract");
         _runBatch(data, vm.envUint("NEXUS_E2E_PRIVATE_KEY"));
     }
 
@@ -68,22 +75,22 @@ contract RunBridgeE2E {
     }
 
     function _runBatch(BatchData memory data, uint256 privateKey) private {
-        address payer = vm.addr(privateKey);
         Payouts memory expected = _calculatePayouts(data.claims);
-        (MockSettlementToken token, InferenceEscrow escrow) = _broadcastSettlement(data, privateKey, payer);
+        MockSettlementToken token = MockSettlementToken(data.tokenAddress);
+        InferenceEscrow escrow = InferenceEscrow(data.escrowAddress);
+        require(address(escrow.token()) == data.tokenAddress, "settlement token mismatch");
+        require(escrow.tokenDecimals() == token.decimals(), "settlement token decimals mismatch");
+        _broadcastSettlement(data, privateKey, token, escrow);
         _checkBalances(data, token, escrow, expected);
     }
 
-    function _broadcastSettlement(BatchData memory data, uint256 privateKey, address payer)
-        private
-        returns (MockSettlementToken token, InferenceEscrow escrow)
-    {
+    function _broadcastSettlement(
+        BatchData memory data,
+        uint256 privateKey,
+        MockSettlementToken token,
+        InferenceEscrow escrow
+    ) private {
         vm.startBroadcast(privateKey);
-        token = new MockSettlementToken();
-        escrow = new InferenceEscrow(
-            IERC20Settlement(address(token)), payer, address(0x1001), address(0x1002), 6, uint64(CLAIM_WINDOW)
-        );
-        token.mint(payer, data.rootSum);
         token.approve(address(escrow), data.rootSum);
         escrow.fundBatch(data.batchId, data.rootSum);
         escrow.publishBatch(data.batchId, data.root, data.rootSum, uint64(block.timestamp + 1 hours));

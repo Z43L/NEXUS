@@ -15,7 +15,7 @@ An isolated Foundry project for the H1 escrow vertical described in `docs/spec-f
 
 The gateway signer is trusted to validate the off-chain worker receipts and construct the batch root. The spec uses Ed25519 worker signatures, which this EVM contract does **not** verify; its signer attests to receipts off-chain. A compromised signer could authorize incorrect payouts, capped by the amount deposited in the batch. Signer rotation is owner-controlled. There is no deployment, token issuance, dispute resolution, node staking, marketplace registry, or NEX price policy in this vertical.
 
-Merkle leaves use `keccak256(abi.encode(batchId, jobId, node, author, amount))`, paired with the job amount; parent nodes commit both child hashes and their sums, with children sorted by hash. The configured maximum claim window bounds how long a published batch can remain locked. The contract caps the committed root sum and each claim total at the funded amount, and returns unused funds after expiry.
+Merkle V2 leaves bind their execution context and use `keccak256(abi.encode(LEAF_DOMAIN, chainId, escrowAddress, tokenAddress, batchId, jobId, node, author, amount))`, where `LEAF_DOMAIN = keccak256("NEXUS_INFERENCE_ESCROW_LEAF_V2")`. This prevents a valid proof from being replayed across chains, escrow deployments, or token contracts. Parent nodes commit both child hashes and their sums, with children sorted by hash. The configured maximum claim window bounds how long a published batch can remain locked. The contract caps the committed root sum and each claim total at the funded amount, and returns unused funds after expiry.
 
 H0 job IDs are globally unique in the Router ledger, and the escrow records a
 claimed job ID globally within that contract, preventing a receipt from being
@@ -77,7 +77,7 @@ The project pins Solidity 0.8.24, has no external Solidity dependencies, and inc
 
 ## Build batches from explicit settlement inputs
 
-`batch_builder.py` uses only Python's standard library and emits the exact `batchId`, `root`, `rootSum`, and `claims` shape accepted by the escrow. Inputs are JSON with a bytes32 `batchId`, integer `depositAmount`, and `jobs` containing `jobId` (bytes32), `node` and `author` (20-byte EVM addresses), and positive integer `amount`:
+`batch_builder.py` uses only Python's standard library and emits `settlementContext` alongside `batchId`, `root`, `rootSum`, and `claims`. Context is mandatory and contains a positive integer `chainId`, nonzero `escrowAddress`, and nonzero `tokenAddress`. Inputs also include a bytes32 `batchId`, integer `depositAmount`, and `jobs` containing `jobId` (bytes32), `node` and `author` (20-byte EVM addresses), and positive integer `amount`:
 
 ```sh
 python3 batch_builder.py settlement-input.json > settlement-batch.json
@@ -101,6 +101,11 @@ settlement):
 
 ```json
 {
+  "settlementContext": {
+    "chainId": 31337,
+    "escrowAddress": "0x3333333333333333333333333333333333333333",
+    "tokenAddress": "0x4444444444444444444444444444444444444444"
+  },
   "batchId": "0x<64 hex characters>",
   "depositAmount": 1000000,
   "token": {
@@ -117,6 +122,10 @@ settlement):
   }
 }
 ```
+
+The root is valid only for the exact chain, escrow and token in this object.
+Compare these values with the destination contract and ERC-20 before publishing
+a root. V1 leaf roots are not accepted by the Python builder.
 
 The token price is the explicit rational `USD per token` (numerator /
 denominator); `decimals` declares the ERC-20 base-unit scale. Conversion is

@@ -16,7 +16,7 @@ import sqlite3
 import sys
 from typing import Mapping
 
-from batch_builder import build_batch, keccak256
+from batch_builder import SettlementContext, build_batch, keccak256
 
 H0_DIR = Path(__file__).resolve().parents[1] / "nexus" / "h0"
 if str(H0_DIR) not in sys.path:
@@ -33,10 +33,11 @@ def _integer(value, label: str, *, minimum: int = 0) -> int:
 def _load_config(document: object) -> dict:
     if not isinstance(document, Mapping):
         raise ValueError("config must be a JSON object")
-    required = {"batchId", "depositAmount", "token", "nodeWallets", "authorWallets"}
+    required = {"settlementContext", "batchId", "depositAmount", "token", "nodeWallets", "authorWallets"}
     missing = required - set(document)
     if missing:
         raise ValueError("config missing fields: " + ", ".join(sorted(missing)))
+    context = SettlementContext.from_mapping(document["settlementContext"])
     token = document["token"]
     if not isinstance(token, Mapping):
         raise ValueError("token must be an object")
@@ -65,7 +66,9 @@ def _load_config(document: object) -> dict:
             raise ValueError("authorWallets keys must be non-empty exact NRAM identifiers")
         _address(wallet, f"authorWallets[{identity}]")
     _integer(document["depositAmount"], "depositAmount")
-    return dict(document)
+    normalized = dict(document)
+    normalized["settlementContext"] = context.as_json()
+    return normalized
 
 
 def _amount_in_base_units(price_micro_usd: int, token: Mapping) -> int:
@@ -233,7 +236,8 @@ def main(argv: list[str] | None = None) -> int:
             job["jobId"]: {"routerJobId": job["routerJobId"], "nodeId": job["nodeId"]}
             for job in jobs
         }
-        batch = build_batch(config["batchId"], jobs, config["depositAmount"])
+        batch = build_batch(config["settlementContext"], config["batchId"], jobs,
+                            config["depositAmount"])
     except (OSError, json.JSONDecodeError, TypeError, ValueError, InvalidOperation) as exc:
         parser.error(str(exc))
     output = batch.as_contract_batch()

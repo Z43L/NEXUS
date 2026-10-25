@@ -16,7 +16,7 @@
   "batch": {
     "batchId": "0x1111111111111111111111111111111111111111111111111111111111111111",
     "depositAmount": 300,
-    "root": "0x025da0cc2332cf0e613858edb26a64683144350f4a5614edda7aca827135ed34",
+    "root": "0x11bcb1dd856a9c61bfc226de530076c5cdaba4cd75542f2f39d0a667be030b3c",
     "rootSum": 300,
     "jobs": [
       {
@@ -24,19 +24,33 @@
         "node": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "author": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "amount": 100,
-        "leafHash": "0xe6bf9738ea308fed6a72a941ce39089501c456601df23802c16a9cb5b94b76c8",
-        "proof": ["0x42c68704ff32e2f9fa7e8ba934b0c3aa99c1f5d49197b85ab7a4df32b20dd050"],
-        "proofSums": [200]
+        "leafHash": "0x6b063043e0cafa5aacf73dfc87752a603ee68ad993db70b46fdab5bf40e0d306",
+        "proof": [
+          "0x15fee9412e8e93e983a2a5fc10d06f0c0378b6dd9be6aa890ddfb6534fa91077"
+        ],
+        "proofSums": [
+          200
+        ]
       },
       {
         "jobId": "0x3333333333333333333333333333333333333333333333333333333333333333",
         "node": "0xcccccccccccccccccccccccccccccccccccccccc",
         "author": "0xdddddddddddddddddddddddddddddddddddddddd",
         "amount": 200,
-        "leafHash": "0x9943e3a361a8a6d059ea8acf1c47191a29530954d57218d96377ceef6bbc71d8",
-        "proof": ["0x1b5afc2bece7ad044ef82b210b9eb3d3bb16c0a760186faae2e0e308452342d4"],
-        "proofSums": [100]
+        "leafHash": "0x02b3c27a109dac7920081f3cd3cbb9c19a7e91e45bcca3c23b08adc9c6c6b783",
+        "proof": [
+          "0x07c4d627457e89ce401d77049a66e3c367d1a300747b35de80a5c337beb37da7"
+        ],
+        "proofSums": [
+          100
+        ]
       }
-    ]
+    ],
+    "settlementContext": {
+      "chainId": 31337,
+      "escrowAddress": "0x3333333333333333333333333333333333333333",
+      "tokenAddress": "0x4444444444444444444444444444444444444444"
+    },
+    "leafDomain": "0xef9cf1960adc3f8ffdb20407e64a0636dab428101bf2f706067054dce1e09552"
   }
 }

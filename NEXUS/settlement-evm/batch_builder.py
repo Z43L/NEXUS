@@ -85,6 +85,9 @@ def keccak256(data: bytes) -> bytes:
     return b"".join(lane.to_bytes(8, "little") for lane in state)[:32]
 
 
+LEAF_DOMAIN = keccak256(b"NEXUS_INFERENCE_ESCROW_LEAF_V2")
+
+
 def _bytes32(value: str, field: str, *, allow_zero: bool = False) -> bytes:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a 32-byte hex string")
@@ -141,6 +144,32 @@ class JobInput:
 
 
 @dataclass(frozen=True)
+class SettlementContext:
+    chain_id: int
+    escrow_address: str
+    token_address: str
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "SettlementContext":
+        if not isinstance(value, Mapping):
+            raise ValueError("settlementContext must be an object")
+        required = {"chainId", "escrowAddress", "tokenAddress"}
+        missing = required - set(value)
+        if missing:
+            raise ValueError("settlementContext missing fields: " + ", ".join(sorted(missing)))
+        _uint256(value["chainId"], "settlementContext.chainId")
+        _address(value["escrowAddress"], "settlementContext.escrowAddress")
+        _address(value["tokenAddress"], "settlementContext.tokenAddress")
+        if set(value) != required:
+            raise ValueError("settlementContext must contain exactly chainId, escrowAddress, tokenAddress")
+        return cls(value["chainId"], value["escrowAddress"], value["tokenAddress"])
+
+    def as_json(self) -> dict[str, object]:
+        return {"chainId": self.chain_id, "escrowAddress": self.escrow_address,
+                "tokenAddress": self.token_address}
+
+
+@dataclass(frozen=True)
 class JobProof:
     job_id: str
     node: str
@@ -163,6 +192,7 @@ class JobProof:
 
 @dataclass(frozen=True)
 class BatchProof:
+    settlement_context: SettlementContext
     batch_id: str
     root: str
     root_sum: int
@@ -170,6 +200,7 @@ class BatchProof:
 
     def as_contract_batch(self) -> dict[str, object]:
         return {
+            "settlementContext": self.settlement_context.as_json(),
             "batchId": self.batch_id,
             "root": self.root,
             "rootSum": self.root_sum,
@@ -184,22 +215,34 @@ class _Node:
     indexes: tuple[int, ...]
 
 
-def _leaf_hash(batch_id: bytes, job_id: bytes, node: bytes, author: bytes, amount: int) -> bytes:
+def _leaf_hash(context: SettlementContext, batch_id: bytes, job_id: bytes,
+               node: bytes, author: bytes, amount: int) -> bytes:
     # All fields are static ABI values and occupy one 32-byte word each.
-    encoded = batch_id + job_id + node.rjust(32, b"\x00") + author.rjust(32, b"\x00") + _word_uint(amount)
-    if len(encoded) != 160:
-        raise AssertionError("static ABI encoding must be five 32-byte words")
+    encoded = (LEAF_DOMAIN + _word_uint(context.chain_id)
+               + _address(context.escrow_address, "settlementContext.escrowAddress").rjust(32, b"\x00")
+               + _address(context.token_address, "settlementContext.tokenAddress").rjust(32, b"\x00")
+               + batch_id + job_id + node.rjust(32, b"\x00")
+               + author.rjust(32, b"\x00") + _word_uint(amount))
+    if len(encoded) != 288:
+        raise AssertionError("static ABI encoding must be nine 32-byte words")
     return keccak256(encoded)
 
 
-def encode_job_leaf(batch_id: str, job_id: str, node: str, author: str, amount: int) -> bytes:
-    """Encode `abi.encode(batchId, jobId, node, author, amount)` as 160 bytes."""
+def encode_job_leaf(settlement_context: SettlementContext | Mapping[str, object],
+                    batch_id: str, job_id: str, node: str, author: str, amount: int) -> bytes:
+    """Encode the V2 context-bound leaf as nine static ABI words (288 bytes)."""
+    context = (settlement_context if isinstance(settlement_context, SettlementContext)
+               else SettlementContext.from_mapping(settlement_context))
     batch_bytes = _bytes32(batch_id, "batchId")
     job_bytes = _bytes32(job_id, "jobId")
     node_bytes = _address(node, "node")
     author_bytes = _address(author, "author", allow_zero=True)
     value = _uint256(amount, "amount")
-    return batch_bytes + job_bytes + node_bytes.rjust(32, b"\x00") + author_bytes.rjust(32, b"\x00") + _word_uint(value)
+    return (LEAF_DOMAIN + _word_uint(context.chain_id)
+            + _address(context.escrow_address, "settlementContext.escrowAddress").rjust(32, b"\x00")
+            + _address(context.token_address, "settlementContext.tokenAddress").rjust(32, b"\x00")
+            + batch_bytes + job_bytes + node_bytes.rjust(32, b"\x00")
+            + author_bytes.rjust(32, b"\x00") + _word_uint(value))
 
 
 def _leaf_node(leaf_hash: bytes, amount: int) -> bytes:
@@ -214,13 +257,16 @@ def _parent(left_hash: bytes, left_sum: int, right_hash: bytes, right_sum: int) 
     return keccak256(first_hash + _word_uint(first_sum) + second_hash + _word_uint(second_sum))
 
 
-def build_batch(batch_id: str, jobs: Sequence[JobInput | Mapping[str, object]], deposit_amount: int) -> BatchProof:
+def build_batch(settlement_context: SettlementContext | Mapping[str, object], batch_id: str,
+                jobs: Sequence[JobInput | Mapping[str, object]], deposit_amount: int) -> BatchProof:
     """Build a canonical sorted-pair Merkle-sum batch for the escrow contract.
 
     `amount` and `deposit_amount` are raw ERC-20 units (wei-like base units),
     never decimal token amounts. Receipts must first be deliberately mapped to
     wallet addresses and converted to that token's base units by the caller.
     """
+    context = (settlement_context if isinstance(settlement_context, SettlementContext)
+               else SettlementContext.from_mapping(settlement_context))
     batch_bytes = _bytes32(batch_id, "batchId")
     deposit = _uint256(deposit_amount, "deposit_amount")
     if not jobs:
@@ -266,7 +312,7 @@ def build_batch(batch_id: str, jobs: Sequence[JobInput | Mapping[str, object]], 
         leaf_id = _bytes32(job.job_id, f"jobs[{index}].jobId")
         node_address = _address(job.node, f"jobs[{index}].node")
         author_address = _address(job.author, f"jobs[{index}].author", allow_zero=True)
-        leaf = _leaf_hash(batch_bytes, leaf_id, node_address, author_address, job.amount)
+        leaf = _leaf_hash(context, batch_bytes, leaf_id, node_address, author_address, job.amount)
         level.append(_Node(_leaf_node(leaf, job.amount), job.amount, (index,)))
 
     while len(level) > 1:
@@ -302,18 +348,22 @@ def build_batch(batch_id: str, jobs: Sequence[JobInput | Mapping[str, object]], 
     )
     if not any(level[0].digest):
         raise ValueError("computed root is zero and cannot be published")
-    return BatchProof(batch_id="0x" + batch_bytes.hex(), root="0x" + level[0].digest.hex(),
+    return BatchProof(settlement_context=context, batch_id="0x" + batch_bytes.hex(), root="0x" + level[0].digest.hex(),
                       root_sum=level[0].amount_sum, claims=claims)
 
 
-def verify_claim(batch_id: str, claim: JobProof, root: str, root_sum: int) -> bool:
+def verify_claim(settlement_context: SettlementContext | Mapping[str, object],
+                 batch_id: str, claim: JobProof, root: str, root_sum: int) -> bool:
     """Local verifier mirroring Solidity's leaf and sorted sum-proof rules."""
+    context = (settlement_context if isinstance(settlement_context, SettlementContext)
+               else SettlementContext.from_mapping(settlement_context))
     batch_bytes = _bytes32(batch_id, "batchId")
     root_bytes = _bytes32(root, "root")
     expected_sum = _uint256(root_sum, "root_sum")
     if len(claim.proof) != len(claim.proof_sums):
         return False
     leaf = _leaf_hash(
+        context,
         batch_bytes,
         _bytes32(claim.job_id, "jobId"),
         _address(claim.node, "node"),
@@ -346,10 +396,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 document = json.load(source)
         if not isinstance(document, Mapping):
             raise ValueError("top-level JSON value must be an object")
-        for required in ("batchId", "depositAmount", "jobs"):
+        for required in ("settlementContext", "batchId", "depositAmount", "jobs"):
             if required not in document:
                 raise ValueError(f"input missing field {required}")
-        batch = build_batch(document["batchId"], document["jobs"], document["depositAmount"])
+        batch = build_batch(document["settlementContext"], document["batchId"],
+                            document["jobs"], document["depositAmount"])
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
         parser.error(str(exc))
     json.dump(batch.as_contract_batch(), sys.stdout, indent=2)

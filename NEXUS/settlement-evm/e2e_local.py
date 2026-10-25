@@ -19,12 +19,18 @@ import time
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+# Keep generated Python bytecode out of the source tree during this disposable run.
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+sys.dont_write_bytecode = True
+
 ROOT = Path(__file__).resolve().parent
 H0 = ROOT.parent / "nexus" / "h0"
 ANVIL_TEST_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 NODE_ONE = "0x" + "a1" * 20
 NODE_TWO = "0x" + "a2" * 20
 AUTHOR = "0x" + "b1" * 20
+CHAIN_ID = 31337
+E2E_FUNDING = 1_000_000_000_000
 
 
 def stop_process(proc: subprocess.Popen) -> None:
@@ -49,7 +55,7 @@ def rpc(url: str, method: str, params: list | None = None):
     return body["result"]
 
 
-def start_h0_fixture(directory: Path) -> tuple[Path, Path, list[subprocess.Popen]]:
+def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], list[subprocess.Popen]]:
     """Run the real H0 router, mock engine and signed worker for two jobs."""
     sys.path.insert(0, str(H0))
     import nexus_common as nc
@@ -143,7 +149,22 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, list[subprocess.Popen
     }
     config_path = directory / "test-policy.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
-    return db_path, config_path, procs
+    return db_path, config_path, config, procs
+
+
+def broadcast_contracts(path: Path) -> dict[str, str]:
+    """Read contract addresses from Foundry's local broadcast record."""
+    document = json.loads(path.read_text(encoding="utf-8"))
+    contracts = {}
+    for transaction in document.get("transactions", []):
+        name = transaction.get("contractName")
+        address = transaction.get("contractAddress")
+        if name in {"MockSettlementToken", "InferenceEscrow"} and isinstance(address, str):
+            contracts[name] = address
+    missing = {"MockSettlementToken", "InferenceEscrow"} - set(contracts)
+    if missing:
+        raise RuntimeError(f"Foundry broadcast record missing deployments: {', '.join(sorted(missing))}")
+    return contracts
 
 
 def main() -> int:
@@ -164,24 +185,13 @@ def main() -> int:
     rpc_url = f"http://127.0.0.1:{port}"
     with tempfile.TemporaryDirectory(prefix="nexus-bridge-e2e-") as temp_name:
         workspace = Path(temp_name)
-        db_path, config_path, h0_procs = start_h0_fixture(workspace)
+        db_path, config_path, config, h0_procs = start_h0_fixture(workspace)
         anvil_proc = None
         try:
             anvil_proc = subprocess.Popen(
                 [anvil, "--host", "127.0.0.1", "--port", str(port), "--chain-id", "31337"],
                 cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-            batch_path = workspace / "settlement-batch.json"
-            with batch_path.open("w", encoding="utf-8") as batch_output:
-                subprocess.run([sys.executable, str(ROOT / "receipt_to_batch.py"),
-                                "--db", str(db_path), "--config", str(config_path)],
-                               cwd=ROOT, check=True, stdout=batch_output)
-            batch = json.loads(batch_path.read_text(encoding="utf-8"))
-            if len(batch["claims"]) != 2 or batch["rootSum"] <= 0:
-                raise RuntimeError("receipt bridge did not produce the expected two-claim test batch")
-            source_ids = {row["routerJobId"] for row in batch["sourceReceipts"].values()}
-            if source_ids != {"job_000001", "job_000002"}:
-                raise RuntimeError("bridge did not preserve Router-native receipt references")
             ready = False
             for _ in range(100):
                 if anvil_proc.poll() is not None:
@@ -195,8 +205,45 @@ def main() -> int:
             if not ready:
                 raise RuntimeError("Anvil did not become ready on loopback")
 
-            subprocess.run([forge, "build"], cwd=ROOT, check=True)
-            env = {**os.environ, "NEXUS_E2E_PRIVATE_KEY": ANVIL_TEST_KEY}
+            env = {**os.environ, "NEXUS_E2E_PRIVATE_KEY": ANVIL_TEST_KEY,
+                   "NEXUS_E2E_FUNDING": str(E2E_FUNDING)}
+            broadcast_root = workspace / "broadcast"
+            env["FOUNDRY_BROADCAST"] = str(broadcast_root)
+            env["FOUNDRY_CACHE_PATH"] = str(workspace / "cache")
+            env["FOUNDRY_OUT"] = str(workspace / "out")
+            subprocess.run([forge, "build"], cwd=ROOT, env=env, check=True)
+            deployment = subprocess.run(
+                [forge, "script", "script/DeployBridgeE2E.s.sol:DeployBridgeE2E",
+                 "--rpc-url", rpc_url, "--broadcast", "--non-interactive",
+                 "--private-key", ANVIL_TEST_KEY, "-vvv"],
+                cwd=ROOT, env=env, check=False, capture_output=True, text=True,
+            )
+            if deployment.returncode:
+                sys.stderr.write(deployment.stdout)
+                sys.stderr.write(deployment.stderr)
+                raise RuntimeError(f"forge deployment script failed with exit code {deployment.returncode}")
+            deployments = broadcast_contracts(
+                broadcast_root / "DeployBridgeE2E.s.sol" / str(CHAIN_ID) / "run-latest.json"
+            )
+            config["settlementContext"] = {
+                "chainId": CHAIN_ID,
+                "escrowAddress": deployments["InferenceEscrow"],
+                "tokenAddress": deployments["MockSettlementToken"],
+            }
+            config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+            batch_path = workspace / "settlement-batch.json"
+            with batch_path.open("w", encoding="utf-8") as batch_output:
+                subprocess.run([sys.executable, str(ROOT / "receipt_to_batch.py"),
+                                "--db", str(db_path), "--config", str(config_path)],
+                               cwd=ROOT, check=True, stdout=batch_output)
+            batch = json.loads(batch_path.read_text(encoding="utf-8"))
+            if len(batch["claims"]) != 2 or batch["rootSum"] <= 0:
+                raise RuntimeError("receipt bridge did not produce the expected two-claim test batch")
+            if batch["settlementContext"] != config["settlementContext"]:
+                raise RuntimeError("bridge output settlement context does not match deployed contracts")
+            source_ids = {row["routerJobId"] for row in batch["sourceReceipts"].values()}
+            if source_ids != {"job_000001", "job_000002"}:
+                raise RuntimeError("bridge did not preserve Router-native receipt references")
             result = subprocess.run(
                 [forge, "script", "script/RunBridgeE2E.s.sol:RunBridgeE2E",
                  "--rpc-url", rpc_url, "--broadcast", "--non-interactive", "--private-key", ANVIL_TEST_KEY,

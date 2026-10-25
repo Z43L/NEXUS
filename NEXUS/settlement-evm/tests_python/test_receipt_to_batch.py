@@ -20,10 +20,16 @@ from receipt_to_batch import _load_config, _settlement_job_id, read_verified_job
 NODE_ADDRESS = "0x" + "11" * 20
 AUTHOR_ADDRESS = "0x" + "22" * 20
 BATCH_ID = "0x" + "ab" * 32
+SETTLEMENT_CONTEXT = {
+    "chainId": 31337,
+    "escrowAddress": "0x" + "33" * 20,
+    "tokenAddress": "0x" + "44" * 20,
+}
 
 
 def config(**overrides):
     value = {
+        "settlementContext": SETTLEMENT_CONTEXT,
         "batchId": BATCH_ID,
         "depositAmount": 1000,
         "token": {
@@ -99,8 +105,9 @@ class ReceiptBridgeTests(unittest.TestCase):
         self.assertEqual(jobs[0]["jobId"], expected_job_id)
         self.assertEqual(jobs[0]["routerJobId"], "job_000001")
         self.assertEqual(jobs[0]["amount"], 7)  # 7 micro-USD == 7 USDC base units.
-        batch = __import__("batch_builder").build_batch(BATCH_ID, jobs, 1000)
-        self.assertTrue(verify_claim(BATCH_ID, batch.claims[0], batch.root, batch.root_sum))
+        batch = __import__("batch_builder").build_batch(SETTLEMENT_CONTEXT, BATCH_ID, jobs, 1000)
+        self.assertTrue(verify_claim(SETTLEMENT_CONTEXT, BATCH_ID, batch.claims[0], batch.root, batch.root_sum))
+        self.assertEqual(batch.as_contract_batch()["settlementContext"], SETTLEMENT_CONTEXT)
 
     def test_cli_builds_batch_from_local_router_database(self):
         config_path = Path(self.temp.name) / "policy.json"
@@ -113,6 +120,7 @@ class ReceiptBridgeTests(unittest.TestCase):
         )
         batch = json.loads(completed.stdout)
         self.assertEqual(batch["rootSum"], 7)
+        self.assertEqual(batch["settlementContext"], SETTLEMENT_CONTEXT)
         claim_id = batch["claims"][0]["jobId"]
         self.assertEqual(batch["sourceReceipts"][claim_id]["routerJobId"], "job_000001")
         self.assertEqual(claim_id, _settlement_job_id(self.receipt, nc.sign_receipt(self.private_key, self.receipt)))
@@ -203,6 +211,36 @@ class ReceiptBridgeTests(unittest.TestCase):
                           "usdPerTokenNumerator": 1,
                           "usdPerTokenDenominator": 1})
 
+    def test_settlement_context_is_required_and_strictly_validated(self):
+        for invalid in (
+            None,
+            {"chainId": 0, "escrowAddress": NODE_ADDRESS, "tokenAddress": AUTHOR_ADDRESS},
+            {"chainId": True, "escrowAddress": NODE_ADDRESS, "tokenAddress": AUTHOR_ADDRESS},
+            {"chainId": 31337, "escrowAddress": ZERO_ADDRESS, "tokenAddress": AUTHOR_ADDRESS},
+            {"chainId": 31337, "escrowAddress": NODE_ADDRESS, "tokenAddress": "bad"},
+            {"chainId": 31337, "escrowAddress": NODE_ADDRESS,
+             "tokenAddress": AUTHOR_ADDRESS, "extra": 1},
+        ):
+            with self.subTest(context=invalid), self.assertRaises(ValueError):
+                config(settlementContext=invalid)
+        without_context = config()
+        del without_context["settlementContext"]
+        with self.assertRaisesRegex(ValueError, "missing fields: settlementContext"):
+            _load_config(without_context)
+
+    def test_root_is_bound_to_chain_escrow_and_token(self):
+        from batch_builder import build_batch
+        jobs = [{"jobId": "0x" + "55" * 32, "node": NODE_ADDRESS,
+                 "author": ZERO_ADDRESS, "amount": 7}]
+        original = build_batch(SETTLEMENT_CONTEXT, BATCH_ID, jobs, 7)
+        for key, value in (("chainId", 31338), ("escrowAddress", "0x" + "66" * 20),
+                           ("tokenAddress", "0x" + "77" * 20)):
+            changed = dict(SETTLEMENT_CONTEXT, **{key: value})
+            other = build_batch(changed, BATCH_ID, jobs, 7)
+            self.assertNotEqual(original.root, other.root)
+            self.assertFalse(verify_claim(changed, BATCH_ID, original.claims[0],
+                                          original.root, original.root_sum))
+
     def test_rejects_recomputed_price_and_share_mismatches(self):
         bad_price = dict(self.receipt, price_micro_usd=8)
         self._insert(bad_price)
@@ -221,7 +259,8 @@ class ReceiptBridgeTests(unittest.TestCase):
         self._insert(self.receipt, verified=1)
         with self.assertRaisesRegex(ValueError, "exceeds deposit"):
             __import__("batch_builder").build_batch(
-                BATCH_ID, read_verified_jobs(self.db_path, too_small), too_small["depositAmount"])
+                too_small["settlementContext"], BATCH_ID,
+                read_verified_jobs(self.db_path, too_small), too_small["depositAmount"])
 
 
 if __name__ == "__main__":

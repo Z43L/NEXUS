@@ -5,6 +5,7 @@ import {InferenceEscrow, IERC20Settlement} from "../src/InferenceEscrow.sol";
 
 interface Vm {
     function warp(uint256 timestamp) external;
+    function chainId(uint256 newChainId) external;
     function prank(address sender) external;
     function expectRevert(bytes calldata revertData) external;
 }
@@ -91,6 +92,59 @@ contract InferenceEscrowTest {
         require(token.balanceOf(address(escrow)) == 0, "escrow remainder");
     }
 
+    function testLeafProofIsBoundToCurrentChainId() public {
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, uint64(block.timestamp + 1 days));
+        bytes32[] memory proof = new bytes32[](0);
+        uint256[] memory proofSums = new uint256[](0);
+        InferenceEscrow.JobClaim memory job = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+
+        vm.chainId(block.chainid + 1);
+        (bool ok,) = address(escrow).call(abi.encodeCall(escrow.claim, (BATCH, job)));
+        require(!ok, "proof replayed on another chain id");
+    }
+
+    function testLeafProofIsBoundToEscrowInstance() public {
+        InferenceEscrow otherEscrow =
+            new InferenceEscrow(IERC20Settlement(address(token)), SIGNER, TREASURY, VALIDATORS, 6, 30 days);
+        vm.prank(CLIENT);
+        token.approve(address(otherEscrow), type(uint256).max);
+
+        bytes32 leaf = _leaf(address(escrow), address(token), BATCH, JOB, NODE, AUTHOR, AMOUNT);
+        bytes32 root = _leafNode(leaf, AMOUNT);
+        vm.prank(CLIENT);
+        otherEscrow.fundBatch(BATCH, AMOUNT);
+        vm.prank(SIGNER);
+        otherEscrow.publishBatch(BATCH, root, AMOUNT, uint64(block.timestamp + 1 days));
+
+        bytes32[] memory proof = new bytes32[](0);
+        uint256[] memory proofSums = new uint256[](0);
+        InferenceEscrow.JobClaim memory job = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+        (bool ok,) = address(otherEscrow).call(abi.encodeCall(otherEscrow.claim, (BATCH, job)));
+        require(!ok, "proof replayed on another escrow");
+    }
+
+    function testLeafProofIsBoundToTokenAddress() public {
+        MockToken otherToken = new MockToken();
+        InferenceEscrow otherEscrow =
+            new InferenceEscrow(IERC20Settlement(address(otherToken)), SIGNER, TREASURY, VALIDATORS, 6, 30 days);
+        otherToken.mint(CLIENT, AMOUNT);
+        vm.prank(CLIENT);
+        otherToken.approve(address(otherEscrow), AMOUNT);
+
+        bytes32 leaf = _leaf(address(escrow), address(token), BATCH, JOB, NODE, AUTHOR, AMOUNT);
+        bytes32 root = _leafNode(leaf, AMOUNT);
+        vm.prank(CLIENT);
+        otherEscrow.fundBatch(BATCH, AMOUNT);
+        vm.prank(SIGNER);
+        otherEscrow.publishBatch(BATCH, root, AMOUNT, uint64(block.timestamp + 1 days));
+
+        bytes32[] memory proof = new bytes32[](0);
+        uint256[] memory proofSums = new uint256[](0);
+        InferenceEscrow.JobClaim memory job = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+        (bool ok,) = address(otherEscrow).call(abi.encodeCall(otherEscrow.claim, (BATCH, job)));
+        require(!ok, "proof replayed with another token");
+    }
+
     function testConstructorRejectsWrongExpectedTokenDecimals() public {
         vm.expectRevert(abi.encodeWithSignature("Error(string)", "token decimals mismatch"));
         new InferenceEscrow(IERC20Settlement(address(token)), SIGNER, TREASURY, VALIDATORS, 18, 30 days);
@@ -132,8 +186,8 @@ contract InferenceEscrowTest {
 
     function testClaimManySettlesTwoJobsFromOneBatch() public {
         bytes32 secondJob = keccak256("job-2");
-        bytes32 firstLeaf = keccak256(abi.encode(BATCH, JOB, NODE, AUTHOR, AMOUNT));
-        bytes32 secondLeaf = keccak256(abi.encode(BATCH, secondJob, address(0x2005), AUTHOR, AMOUNT));
+        bytes32 firstLeaf = _leaf(address(escrow), address(token), BATCH, JOB, NODE, AUTHOR, AMOUNT);
+        bytes32 secondLeaf = _leaf(address(escrow), address(token), BATCH, secondJob, address(0x2005), AUTHOR, AMOUNT);
         bytes32 firstNode = _leafNode(firstLeaf, AMOUNT);
         bytes32 secondNode = _leafNode(secondLeaf, AMOUNT);
         bytes32 root = _parent(firstNode, AMOUNT, secondNode, AMOUNT);
@@ -202,8 +256,8 @@ contract InferenceEscrowTest {
 
     function testProofCannotLieAboutSiblingSum() public {
         bytes32 secondJob = keccak256("sum-proof-job-2");
-        bytes32 firstLeaf = keccak256(abi.encode(BATCH, JOB, NODE, AUTHOR, AMOUNT));
-        bytes32 secondLeaf = keccak256(abi.encode(BATCH, secondJob, address(0x2005), AUTHOR, AMOUNT));
+        bytes32 firstLeaf = _leaf(address(escrow), address(token), BATCH, JOB, NODE, AUTHOR, AMOUNT);
+        bytes32 secondLeaf = _leaf(address(escrow), address(token), BATCH, secondJob, address(0x2005), AUTHOR, AMOUNT);
         bytes32 secondNode = _leafNode(secondLeaf, AMOUNT);
         bytes32 root = _parent(_leafNode(firstLeaf, AMOUNT), AMOUNT, secondNode, AMOUNT);
         vm.prank(CLIENT);
@@ -262,7 +316,7 @@ contract InferenceEscrowTest {
         vm.prank(largeClient);
         escrow.fundBatch(batchId, amount);
 
-        bytes32 leaf = keccak256(abi.encode(batchId, jobId, NODE, AUTHOR, amount));
+        bytes32 leaf = _leaf(address(escrow), address(token), batchId, jobId, NODE, AUTHOR, amount);
         bytes32 root = keccak256(abi.encodePacked(leaf, amount));
         vm.prank(SIGNER);
         escrow.publishBatch(batchId, root, amount, uint64(block.timestamp + 1 days));
@@ -288,8 +342,8 @@ contract InferenceEscrowTest {
 
     function testRefundAfterPartialBatchSettlement() public {
         bytes32 secondJob = keccak256("partial-job-2");
-        bytes32 firstLeaf = keccak256(abi.encode(BATCH, JOB, NODE, AUTHOR, AMOUNT));
-        bytes32 secondLeaf = keccak256(abi.encode(BATCH, secondJob, address(0x2005), AUTHOR, AMOUNT));
+        bytes32 firstLeaf = _leaf(address(escrow), address(token), BATCH, JOB, NODE, AUTHOR, AMOUNT);
+        bytes32 secondLeaf = _leaf(address(escrow), address(token), BATCH, secondJob, address(0x2005), AUTHOR, AMOUNT);
         bytes32 secondNode = _leafNode(secondLeaf, AMOUNT);
         bytes32 root = _parent(_leafNode(firstLeaf, AMOUNT), AMOUNT, secondNode, AMOUNT);
 
@@ -321,7 +375,7 @@ contract InferenceEscrowTest {
     ) private {
         vm.prank(CLIENT);
         escrow.fundBatch(batchId, amount);
-        bytes32 leaf = keccak256(abi.encode(batchId, jobId, node, author, amount));
+        bytes32 leaf = _leaf(address(escrow), address(token), batchId, jobId, node, author, amount);
         bytes32 root = keccak256(abi.encodePacked(leaf, amount));
         vm.prank(SIGNER);
         escrow.publishBatch(batchId, root, amount, deadline);
@@ -333,6 +387,30 @@ contract InferenceEscrowTest {
 
     function _leafNode(bytes32 leafHash, uint256 amount) private pure returns (bytes32) {
         return keccak256(abi.encodePacked(leafHash, amount));
+    }
+
+    function _leaf(
+        address escrowAddress,
+        address tokenAddress,
+        bytes32 batchId,
+        bytes32 jobId,
+        address node,
+        address author,
+        uint256 amount
+    ) private view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                keccak256("NEXUS_INFERENCE_ESCROW_LEAF_V2"),
+                block.chainid,
+                escrowAddress,
+                tokenAddress,
+                batchId,
+                jobId,
+                node,
+                author,
+                amount
+            )
+        );
     }
 
     function _claimSingle(

@@ -12,6 +12,7 @@ interface IERC20Settlement {
 /// @dev A trusted gateway signer attests the root after checking signed receipts
 ///      off-chain. This contract does not verify Ed25519 worker signatures.
 contract InferenceEscrow {
+    bytes32 private constant LEAF_DOMAIN = keccak256("NEXUS_INFERENCE_ESCROW_LEAF_V2");
     uint256 public constant BPS = 10_000;
     uint256 public constant NODE_BPS = 7_500;
     uint256 public constant AUTHOR_BPS = 1_000;
@@ -107,7 +108,7 @@ contract InferenceEscrow {
         require(token.balanceOf(address(this)) - beforeBalance == amount, "fee token unsupported");
     }
 
-    /// @notice Publish a Merkle-sum root of (batchId, jobId, node, author, amount) leaves.
+    /// @notice Publish a Merkle-sum root of context-bound V2 job leaves.
     function publishBatch(bytes32 batchId, bytes32 root, uint256 rootSum, uint64 claimDeadline) external nonReentrant {
         require(msg.sender == batchSigner, "only batch signer");
         Batch storage batch = batches[batchId];
@@ -147,7 +148,19 @@ contract InferenceEscrow {
         require(!claimed[batchId][job.jobId] && !claimedJobs[job.jobId], "job already claimed");
 
         require(job.proof.length == job.proofSums.length, "proof shape mismatch");
-        bytes32 leaf = keccak256(abi.encode(batchId, job.jobId, job.node, job.author, job.amount));
+        bytes32 leaf = keccak256(
+            abi.encode(
+                LEAF_DOMAIN,
+                block.chainid,
+                address(this),
+                address(token),
+                batchId,
+                job.jobId,
+                job.node,
+                job.author,
+                job.amount
+            )
+        );
         require(_verifySum(job.proof, job.proofSums, batch.root, batch.rootSum, leaf, job.amount), "invalid proof");
         require(batch.remaining >= job.amount, "batch overdrawn");
         claimed[batchId][job.jobId] = true;
