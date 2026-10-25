@@ -19,6 +19,8 @@ import time
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from batch_builder import keccak256
+
 # Keep generated Python bytecode out of the source tree during this disposable run.
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 sys.dont_write_bytecode = True
@@ -55,6 +57,12 @@ def rpc(url: str, method: str, params: list | None = None):
     return body["result"]
 
 
+def contract_call(url: str, address: str, signature: str) -> bytes:
+    selector = keccak256(signature.encode("ascii"))[:4].hex()
+    result = rpc(url, "eth_call", [{"to": address, "data": "0x" + selector}, "latest"])
+    return bytes.fromhex(result.removeprefix("0x"))
+
+
 def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], list[subprocess.Popen]]:
     """Run the real H0 router, mock engine and signed worker for two jobs."""
     sys.path.insert(0, str(H0))
@@ -67,7 +75,7 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
             return sock.getsockname()[1]
     mock_port, router_port = free_port(), free_port()
     router_url = f"http://127.0.0.1:{router_port}"
-    logs = [directory / "mock.log", directory / "router.log"]
+    logs = [directory / "mock.log", directory / "router.log", directory / "worker.log"]
     streams = [path.open("w+") for path in logs]
     procs = [
         subprocess.Popen([sys.executable, str(H0 / "mock_atenea.py"), "--port", str(mock_port)],
@@ -79,7 +87,7 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
                                    "--router", router_url,
                                    "--atenea", f"http://127.0.0.1:{mock_port}",
                                    "--node-dir", str(key_dir)], cwd=H0,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                                  stdout=streams[2], stderr=subprocess.STDOUT))
     try:
         for _ in range(200):
             if any(proc.poll() is not None for proc in procs):
@@ -152,7 +160,7 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
     return db_path, config_path, config, procs
 
 
-def broadcast_contracts(path: Path) -> dict[str, str]:
+def broadcast_contracts(path: Path, required: set[str] | None = None) -> dict[str, str]:
     """Read contract addresses from Foundry's local broadcast record."""
     document = json.loads(path.read_text(encoding="utf-8"))
     contracts = {}
@@ -161,7 +169,8 @@ def broadcast_contracts(path: Path) -> dict[str, str]:
         address = transaction.get("contractAddress")
         if name in {"MockSettlementToken", "InferenceEscrow"} and isinstance(address, str):
             contracts[name] = address
-    missing = {"MockSettlementToken", "InferenceEscrow"} - set(contracts)
+    required = required or {"MockSettlementToken", "InferenceEscrow"}
+    missing = required - set(contracts)
     if missing:
         raise RuntimeError(f"Foundry broadcast record missing deployments: {', '.join(sorted(missing))}")
     return contracts
@@ -223,11 +232,76 @@ def main() -> int:
                 sys.stderr.write(deployment.stderr)
                 raise RuntimeError(f"forge deployment script failed with exit code {deployment.returncode}")
             deployments = broadcast_contracts(
-                broadcast_root / "DeployBridgeE2E.s.sol" / str(CHAIN_ID) / "run-latest.json"
+                broadcast_root / "DeployBridgeE2E.s.sol" / str(CHAIN_ID) / "run-latest.json",
+                required={"MockSettlementToken"},
             )
+
+            deploy_env = {
+                **env,
+                "NEXUS_SETTLEMENT_EXPECTED_CHAIN_ID": str(CHAIN_ID),
+                "NEXUS_SETTLEMENT_DEPLOYER_PRIVATE_KEY": ANVIL_TEST_KEY,
+                "NEXUS_SETTLEMENT_TOKEN": deployments["MockSettlementToken"],
+                "NEXUS_SETTLEMENT_TOKEN_DECIMALS": "6",
+                "NEXUS_SETTLEMENT_BATCH_SIGNER": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+                "NEXUS_SETTLEMENT_TREASURY": "0x0000000000000000000000000000000000001001",
+                "NEXUS_SETTLEMENT_VERIFICATION_POOL": "0x0000000000000000000000000000000000001002",
+                "NEXUS_SETTLEMENT_MAX_CLAIM_WINDOW": str(24 * 60 * 60),
+            }
+            deploy_script = "script/DeploySettlementEscrow.s.sol:DeploySettlementEscrow"
+            wrong_chain_env = {**deploy_env, "NEXUS_SETTLEMENT_EXPECTED_CHAIN_ID": "1"}
+            preflight = subprocess.run(
+                [forge, "script", deploy_script, "--rpc-url", rpc_url, "--non-interactive", "-vvv"],
+                cwd=ROOT, env=wrong_chain_env, check=False, capture_output=True, text=True,
+            )
+            if preflight.returncode == 0 or "NEXUS_SETTLEMENT_CHAIN_MISMATCH" not in (
+                preflight.stdout + preflight.stderr
+            ):
+                raise RuntimeError("deployment preflight did not reject the wrong chain ID")
+            wrong_decimals_env = {**deploy_env, "NEXUS_SETTLEMENT_TOKEN_DECIMALS": "18"}
+            token_preflight = subprocess.run(
+                [forge, "script", deploy_script, "--rpc-url", rpc_url, "--non-interactive", "-vvv"],
+                cwd=ROOT, env=wrong_decimals_env, check=False, capture_output=True, text=True,
+            )
+            if token_preflight.returncode == 0 or "NEXUS_SETTLEMENT_DECIMALS_MISMATCH" not in (
+                token_preflight.stdout + token_preflight.stderr
+            ):
+                raise RuntimeError("deployment preflight did not reject mismatched token decimals")
+            deployment = subprocess.run(
+                [forge, "script", deploy_script, "--rpc-url", rpc_url,
+                 "--broadcast", "--non-interactive", "--private-key", ANVIL_TEST_KEY, "-vvv"],
+                cwd=ROOT, env=deploy_env, check=False, capture_output=True, text=True,
+            )
+            if deployment.returncode:
+                sys.stderr.write(deployment.stdout)
+                sys.stderr.write(deployment.stderr)
+                raise RuntimeError("production escrow deployment script failed on local Anvil")
+            operational_deployment = broadcast_contracts(
+                broadcast_root / "DeploySettlementEscrow.s.sol" / str(CHAIN_ID) / "run-latest.json",
+                required={"InferenceEscrow"},
+            )
+            operational_escrow = operational_deployment["InferenceEscrow"]
+            if rpc(rpc_url, "eth_getCode", [operational_escrow, "latest"]) == "0x":
+                raise RuntimeError("deployment script did not create an escrow contract")
+            expected_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+            expected_token = bytes.fromhex(deploy_env["NEXUS_SETTLEMENT_TOKEN"][2:]).rjust(32, b"\x00")
+            expected_signer = bytes.fromhex(deploy_env["NEXUS_SETTLEMENT_BATCH_SIGNER"][2:]).rjust(32, b"\x00")
+            actual_config = {
+                "owner": "0x" + contract_call(rpc_url, operational_escrow, "owner()")[-20:].hex(),
+                "token": contract_call(rpc_url, operational_escrow, "token()")[-32:],
+                "signer": contract_call(rpc_url, operational_escrow, "batchSigner()")[-32:],
+                "decimals": int.from_bytes(contract_call(rpc_url, operational_escrow, "tokenDecimals()"), "big"),
+                "claim_window": int.from_bytes(contract_call(rpc_url, operational_escrow, "maxClaimWindow()"), "big"),
+            }
+            if (actual_config["owner"].lower() != expected_address.lower()
+                    or actual_config["token"] != expected_token
+                    or actual_config["signer"] != expected_signer
+                    or actual_config["decimals"] != 6
+                    or actual_config["claim_window"] != 24 * 60 * 60):
+                raise RuntimeError(f"on-chain deployment configuration mismatch: {actual_config}")
+
             config["settlementContext"] = {
                 "chainId": CHAIN_ID,
-                "escrowAddress": deployments["InferenceEscrow"],
+                "escrowAddress": operational_escrow,
                 "tokenAddress": deployments["MockSettlementToken"],
             }
             config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -256,6 +330,7 @@ def main() -> int:
                 raise RuntimeError(f"forge script failed with exit code {result.returncode}")
             print(result.stdout)
             print("NEXUS BRIDGE -> ANVIL E2E PASS")
+            print("settlement deployment chain guard + Anvil deployment PASS")
             print(f"claims={len(batch['claims'])} rootSum={batch['rootSum']}")
             return 0
         finally:

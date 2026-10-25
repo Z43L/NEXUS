@@ -13,7 +13,7 @@ An isolated Foundry project for the H1 escrow vertical described in `docs/spec-f
 
 ## Trust and accounting boundaries
 
-The gateway signer is trusted to validate the off-chain worker receipts and construct the batch root. The spec uses Ed25519 worker signatures, which this EVM contract does **not** verify; its signer attests to receipts off-chain. A compromised signer could authorize incorrect payouts, capped by the amount deposited in the batch. Signer rotation is owner-controlled. There is no deployment, token issuance, dispute resolution, node staking, marketplace registry, or NEX price policy in this vertical.
+The gateway signer is trusted to validate the off-chain worker receipts and construct the batch root. The spec uses Ed25519 worker signatures, which this EVM contract does **not** verify; its signer attests to receipts off-chain. A compromised signer could authorize incorrect payouts, capped by the amount deposited in the batch. Signer rotation is owner-controlled. No public deployment or token issuance has been performed. A parameterized escrow deployment script exists and is tested only on local Anvil. Dispute resolution, node staking, marketplace registry, and NEX price policy are not implemented in this vertical.
 
 Merkle V2 leaves bind their execution context and use `keccak256(abi.encode(LEAF_DOMAIN, chainId, escrowAddress, tokenAddress, batchId, jobId, node, author, amount))`, where `LEAF_DOMAIN = keccak256("NEXUS_INFERENCE_ESCROW_LEAF_V2")`. This prevents a valid proof from being replayed across chains, escrow deployments, or token contracts. Parent nodes commit both child hashes and their sums, with children sorted by hash. The configured maximum claim window bounds how long a published batch can remain locked. The contract caps the committed root sum and each claim total at the funded amount, and returns unused funds after expiry.
 
@@ -79,6 +79,35 @@ operational H0-to-H1 network path, production wallet authorization, token
 economics, or Base Sepolia deployment.
 
 The project pins Solidity 0.8.24, has no external Solidity dependencies, and includes tests for split conservation, rounding dust, no-author routing, multi-job aggregate claims, invalid and duplicate claims, sibling-sum tampering, signer authorization, root budget and deadline bounds, unpublished cancellation, fee-on-payout token rejection, large-amount arithmetic, and expired refunds. Base Sepolia deployment remains a later step after local test execution, receipt/root integration, review, and testnet faucet funding.
+
+### Deploy an escrow against an existing token
+
+`script/DeploySettlementEscrow.s.sol` is the non-fixture deployment path. It
+requires an explicit expected chain ID, checks the connected chain, token code
+and token decimals, deploys only `InferenceEscrow` (never a token), and verifies
+the resulting owner, signer, token and claim window. The deployer key becomes
+the contract owner; use an appropriately controlled key and record the emitted
+deployment event. The script does not send transactions without Foundry's
+`--broadcast` flag. Start with a simulation:
+
+```sh
+: "${SETTLEMENT_RPC_URL:?Set the RPC URL for the intended chain}"
+: "${NEXUS_SETTLEMENT_EXPECTED_CHAIN_ID:?Set the independently verified chain ID}"
+: "${NEXUS_SETTLEMENT_DEPLOYER_PRIVATE_KEY:?Load the deployment key securely}"
+: "${NEXUS_SETTLEMENT_TOKEN:?Set the reviewed ERC-20 address}"
+: "${NEXUS_SETTLEMENT_TOKEN_DECIMALS:?Set the reviewed token decimals}"
+: "${NEXUS_SETTLEMENT_BATCH_SIGNER:?Set the gateway signer address}"
+: "${NEXUS_SETTLEMENT_TREASURY:?Set the treasury address}"
+: "${NEXUS_SETTLEMENT_VERIFICATION_POOL:?Set the verification pool address}"
+: "${NEXUS_SETTLEMENT_MAX_CLAIM_WINDOW:?Set the approved claim window in seconds}"
+forge script script/DeploySettlementEscrow.s.sol:DeploySettlementEscrow --rpc-url "$SETTLEMENT_RPC_URL"
+```
+
+Only after reviewing the simulation, chain ID, token, decimals, owner and
+recipients should an operator explicitly add `--broadcast` to that command.
+This is a deployment primitive, not an endorsement or automatic Base Sepolia
+release: token policy,
+signer custody, wallet mappings, funding and root review remain operator gates.
 
 ## Build batches from explicit settlement inputs
 
