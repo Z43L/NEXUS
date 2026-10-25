@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT.parent / "nexus" / "h0"))
 
 import nexus_common as nc
 from batch_builder import ZERO_ADDRESS, verify_claim
-from receipt_to_batch import _load_config, _settlement_job_id, read_verified_jobs
+from receipt_to_batch import _amount_in_base_units, _load_config, _settlement_job_id, read_verified_jobs
 
 
 NODE_ADDRESS = "0x" + "11" * 20
@@ -210,6 +210,19 @@ class ReceiptBridgeTests(unittest.TestCase):
             config(token={"symbol": "TKN", "decimals": 37,
                           "usdPerTokenNumerator": 1,
                           "usdPerTokenDenominator": 1})
+
+    def test_sub_micro_usd_evm_precision_is_distinct_from_h0_share_precision(self):
+        token_policy = {
+            "symbol": "TKN", "decimals": 6,
+            "usdPerTokenNumerator": 1, "usdPerTokenDenominator": 10_000,
+        }
+        self.assertEqual(_amount_in_base_units(1, token_policy), 10_000)
+        # The receipt's H0 accounting shares are whole micro-USD; the escrow
+        # distributes those converted 10,000 token units at finer precision.
+        self.assertEqual(nc.split_payment(1, True), {
+            "node": 0, "nram_author": 0, "verification": 0,
+            "burn": 0, "treasury": 1,
+        })
 
     def test_settlement_context_is_required_and_strictly_validated(self):
         for invalid in (

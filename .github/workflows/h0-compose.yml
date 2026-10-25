@@ -57,6 +57,7 @@ jobs:
         run: |
           sh -n nexus-h1-node/bootstrap-compose-h0.sh
           python3 -m py_compile nexus/h0/router.py nexus/h0/nexus_common.py nexus-h1-node/worker2.py nexus-h1-node/jwt_auth.py nexus-h1-node/container_healthcheck.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s nexus-h1-node -p 'test_*.py' -v
           ./nexus-h1-node/bootstrap-compose-h0.sh
           docker compose --env-file .env.h0 -f compose.h0.yml config --quiet
       - name: Build H0 Router and H1 worker image

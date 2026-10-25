@@ -7,6 +7,7 @@ from pathlib import Path
 
 from batch_builder import (
     JobInput,
+    SettlementContext,
     ZERO_ADDRESS,
     build_batch,
     encode_job_leaf,
@@ -44,6 +45,21 @@ class KeccakTests(unittest.TestCase):
 
 
 class BatchBuilderTests(unittest.TestCase):
+    def test_settlement_context_direct_constructor_is_strict(self):
+        valid_escrow = CONTEXT["escrowAddress"]
+        valid_token = CONTEXT["tokenAddress"]
+        invalid_contexts = [
+            (0, valid_escrow, valid_token),
+            (True, valid_escrow, valid_token),
+            (2**256, valid_escrow, valid_token),
+            (CONTEXT["chainId"], ZERO_ADDRESS, valid_token),
+            (CONTEXT["chainId"], valid_escrow, "0x" + "00" * 20),
+            (CONTEXT["chainId"], "not-an-address", valid_token),
+        ]
+        for values in invalid_contexts:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                SettlementContext(*values)
+
     def test_cli_reads_json_and_emits_contract_batch(self):
         vector = VECTORS["batch"]
         completed = subprocess.run(
@@ -102,6 +118,14 @@ class BatchBuilderTests(unittest.TestCase):
         duplicate = dict(job, jobId=job["jobId"].upper().replace("0X", "0x"))
         with self.assertRaisesRegex(ValueError, "duplicate jobId"):
             build_batch(CONTEXT, VECTORS["batch"]["batchId"], [job, duplicate], 1000)
+
+    def test_rejects_escrow_as_node_or_author_before_proof_generation(self):
+        vector = VECTORS["batch"]
+        job = dict(vector["jobs"][0])
+        with self.assertRaisesRegex(ValueError, "node cannot equal"):
+            build_batch(CONTEXT, vector["batchId"], [dict(job, node=CONTEXT["escrowAddress"])], 1000)
+        with self.assertRaisesRegex(ValueError, "author cannot equal"):
+            build_batch(CONTEXT, vector["batchId"], [dict(job, author=CONTEXT["escrowAddress"])], 1000)
 
     def test_rejects_job_sum_above_deposit(self):
         jobs = VECTORS["batch"]["jobs"]

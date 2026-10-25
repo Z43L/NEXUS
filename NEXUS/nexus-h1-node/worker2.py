@@ -64,6 +64,11 @@ class Worker:
         else:
             raise ValueError("Router URL must use HTTPS remotely or HTTP on loopback locally")
         self.priv, self.pub_pem, self.node_id = nc.load_or_create_node_key(node_dir)
+        self.ready_file = node_dir / ".worker-ready"
+        # A previous container run may have left its marker in the persistent
+        # node volume. Readiness is restored only after engine discovery and
+        # successful Router registration in this process.
+        self.ready_file.unlink(missing_ok=True)
         self.model_id = None
         self.models: list[str] = []
         self.scaffolding_tokens = 0
@@ -147,8 +152,9 @@ class Worker:
         while True:
             try:
                 self.router_json("/nodes/heartbeat", {"node_id": self.node_id}, timeout=10)
+                self.ready_file.touch()
             except Exception:
-                pass
+                self.ready_file.unlink(missing_ok=True)
             time.sleep(5)
 
     def next_job(self) -> dict | None:
@@ -227,6 +233,7 @@ class Worker:
         self.models = models
         self.scaffolding_tokens = self.calibrate_scaffolding()
         self.register(models, [])
+        self.ready_file.touch()
         threading.Thread(target=self.heartbeat_loop, daemon=True).start()
         print(f"worker {self.node_id} model={self.model_id} wallet={self.wallet} "
               f"scaffolding_tokens={self.scaffolding_tokens}", flush=True)

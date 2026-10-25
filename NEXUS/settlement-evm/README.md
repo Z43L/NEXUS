@@ -7,7 +7,7 @@ An isolated Foundry project for the H1 escrow vertical described in `docs/spec-f
 - Clients fund one ERC-20 batch escrow.
 - A configured gateway signer publishes a Merkle-sum root of verified job receipts before a bounded deadline. The committed sum cannot exceed the funded batch.
 - Anyone can submit valid `(batchId, jobId, node, author, amount)` leaves and proofs through `claimMany` in one transaction (or use `claim` for an individual leaf). A job can be claimed once.
-- Each claimed amount is split 75% to the worker, 10% royalty to the author when present (otherwise the unused 10% goes to the worker), 5% verification pool, 5% dead-address sink, and 5% treasury. Percentage shares are floored independently; remaining integer dust goes to treasury, matching H0.
+- Each claimed amount is split in ERC-20 base units: 75% to the worker, 10% royalty to the author when present (otherwise the unused 10% goes to the worker), 5% verification pool, 5% dead-address sink, and 5% treasury. Percentage shares are floored independently; remaining integer dust goes to treasury. The EVM split is authoritative after converting the total price into token base units. H0's signed `shares` are accounting amounts in whole micro-USD and can differ below one micro-USD because H0 rounds each share at lower precision.
 - After expiry, the original payer can reclaim the remaining unclaimed batch balance.
 - The payer can cancel and recover a funded batch before the gateway publishes a root.
 
@@ -29,9 +29,14 @@ the original Router job ID and node ID. The escrow constructor reads the ERC-20
 `decimals()` and requires it to match the expected value supplied at deploy
 time. The offline bridge still relies on the operator to set the rational
 USD/token price correctly and to use the same token contract and chain for the
-escrow. Before signing a production root, compare token address, chain ID,
-decimals, price source and policy with the deployed escrow; the token contract
-does not prove the USD price.
+escrow. It verifies the signed H0 micro-USD `shares` as receipt accounting, but
+the contract splits the converted total in token base units, so sub-micro-USD
+rounding can differ. Before signing a production root, compare token address,
+chain ID, decimals, price source and policy with the deployed escrow; the token
+contract does not prove the USD price. The SQLite ledger and registered
+public-key table are privileged bridge inputs: protect the database and take
+snapshots through a controlled, auditable process before using a production
+signer.
 
 The 5% “burn” is transferred to the conventional `0x...dEaD` sink; it is not an ERC-20 supply burn because the contract accepts any ERC-20 and cannot call a token-specific `burn` method. Fee-on-transfer tokens are rejected at deposit. Use a reviewed, non-rebasing token with standard transfer behavior.
 

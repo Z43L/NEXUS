@@ -5,6 +5,8 @@ import json
 import os
 import ssl
 import sys
+import time
+from pathlib import Path
 from urllib.request import urlopen
 
 
@@ -27,6 +29,15 @@ def main() -> int:
         if mode == "router":
             return 0
         if mode == "worker":
+            ready_file = Path(os.environ.get(
+                "NEXUS_WORKER_READY_FILE", "/var/lib/nexus/node/.worker-ready"
+            ))
+            try:
+                age_seconds = time.time() - ready_file.stat().st_mtime
+            except OSError:
+                return 1
+            if age_seconds < -5 or age_seconds > 30:
+                return 1
             atenea = os.environ["ATENHEA_URL"].rstrip("/")
             models = get_json(atenea + "/v1/models").get("data")
             return 0 if isinstance(models, list) and any(

@@ -82,6 +82,7 @@ services:
       ROUTER_URL: https://router:18080
       ROUTER_CA_FILE: /run/secrets/router_ca
       ATENHEA_URL: ${ATENHEA_URL:?Set ATENHEA_URL to the external Atenhea ENGINE URL in .env.h0}
+      NEXUS_WORKER_READY_FILE: /var/lib/nexus/node/.worker-ready
     read_only: true
     tmpfs:
       - /tmp:mode=1777,size=16m

@@ -149,6 +149,14 @@ class SettlementContext:
     escrow_address: str
     token_address: str
 
+    def __post_init__(self) -> None:
+        # Validate direct constructor use as strictly as JSON mapping input.
+        # Otherwise callers could bypass from_mapping with chainId=0 or
+        # zero/malformed contract addresses.
+        _uint256(self.chain_id, "settlementContext.chainId")
+        _address(self.escrow_address, "settlementContext.escrowAddress")
+        _address(self.token_address, "settlementContext.tokenAddress")
+
     @classmethod
     def from_mapping(cls, value: object) -> "SettlementContext":
         if not isinstance(value, Mapping):
@@ -269,6 +277,7 @@ def build_batch(settlement_context: SettlementContext | Mapping[str, object], ba
                else SettlementContext.from_mapping(settlement_context))
     batch_bytes = _bytes32(batch_id, "batchId")
     deposit = _uint256(deposit_amount, "deposit_amount")
+    escrow_bytes = _address(context.escrow_address, "settlementContext.escrowAddress")
     if not jobs:
         raise ValueError("jobs cannot be empty")
 
@@ -297,6 +306,10 @@ def build_batch(settlement_context: SettlementContext | Mapping[str, object], ba
         seen_job_ids.add(job_id_bytes)
         node_bytes = _address(job.node, f"jobs[{index}].node")
         author_bytes = _address(job.author, f"jobs[{index}].author", allow_zero=True)
+        if node_bytes == escrow_bytes:
+            raise ValueError(f"jobs[{index}].node cannot equal the settlement escrow")
+        if author_bytes == escrow_bytes:
+            raise ValueError(f"jobs[{index}].author cannot equal the settlement escrow")
         amount = _uint256(job.amount, f"jobs[{index}].amount")
         if total > _MAX_UINT256 - amount:
             raise ValueError("sum of job amounts exceeds uint256")

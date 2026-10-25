@@ -166,7 +166,9 @@ El endpoint local es `https://localhost:18090`; valida TLS con `.secrets/ca.crt`
 y envía `.secrets/client.token` como bearer a `/v1/chat/completions` y
 `/v1/models`. No imprimas ni incluyas el contenido de los tokens en logs o
 líneas de comandos. `/ready` y los healthchecks comprueban la disponibilidad
-del Router; el del worker comprueba además que Atenhea anuncia modelos. Docker
+del Router. El worker escribe un marcador de readiness solo tras descubrir el
+modelo y registrarse; cada heartbeat correcto mantiene el marcador fresco, y
+el healthcheck también comprueba los modelos anunciados por Atenhea. Docker
 marca un servicio unhealthy, pero la política `restart` no reinicia solo por
 estado unhealthy. SQLite en volumen local es una instancia única, no HA.
 
