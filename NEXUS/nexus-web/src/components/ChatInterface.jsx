@@ -1,11 +1,11 @@
-import React, { useState, useRef } from 'react';
-import { NexusClient } from 'nexus-sdk-js';
+import React, { useState, useMemo } from 'react';
+import NexusClient from '@nexus-network/sdk';
 
 const ChatInterface = ({ apiKey }) => {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const client = useRef(new NexusClient({ apiKey }));
+  const client = useMemo(() => new NexusClient({ apiKey }), [apiKey]);
 
   const handleSend = async () => {
     if (!input.trim()) return;
@@ -22,28 +22,13 @@ const ChatInterface = ({ apiKey }) => {
     
     try {
       const newMessages = [...messages, userMessage];
-      let fullResponse = '';
-      
-      for await (const chunk of client.current.chatStream(newMessages)) {
-        fullResponse += chunk;
-        
-        // Actualizar el último mensaje con el chunk recibido
-        setMessages(prev => {
-          const lastMessage = prev[prev.length - 1];
-          if (lastMessage.role === 'assistant') {
-            return [...prev.slice(0, -1), {
-              ...lastMessage,
-              content: fullResponse
-            }];
-          } else {
-            return [...prev, {
-              role: 'assistant',
-              content: fullResponse,
-              timestamp: new Date()
-            }];
-          }
-        });
-      }
+      const completion = await client.chat(newMessages);
+      const answer = completion.choices?.[0]?.message?.content || '';
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: answer,
+        timestamp: new Date()
+      }]);
     } catch (error) {
       console.error('Chat error:', error);
       setMessages(prev => [...prev, {
@@ -74,7 +59,7 @@ const ChatInterface = ({ apiKey }) => {
           type="text"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyPress={(e) => e.key === 'Enter' && handleSend()}
+          onKeyDown={(e) => e.key === 'Enter' && handleSend()}
           disabled={isLoading}
           placeholder="Ask NEXUS anything..."
         />

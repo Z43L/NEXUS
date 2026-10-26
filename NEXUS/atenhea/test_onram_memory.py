@@ -47,6 +47,22 @@ class OnramMemoryTests(unittest.TestCase):
         app.record_interaction('/v1/chat/completions', request, response, 500)
         app.episodic.remember.assert_not_called()
 
+    def test_nexus_worker_traffic_does_not_recall_or_capture_shared_memory(self):
+        app = self.app()
+        app.auto_learn = True
+        app.learning = Mock()
+        raw = json.dumps({'nexus_worker': True, 'messages': [
+            {'role': 'user', 'content': 'Private account prompt'}]}).encode()
+        forwarded = json.loads(app.augment_request('/v1/chat/completions', raw))
+        self.assertNotIn('nexus_worker', forwarded)
+        self.assertEqual(forwarded['messages'][0]['content'], 'Private account prompt')
+        app.episodic.augment.assert_not_called()
+        app.record_interaction('/v1/chat/completions', raw,
+                               b'{"choices":[{"message":{"content":"private answer"}}]}')
+        app.episodic.remember.assert_not_called()
+        app.learning.capture_facts.assert_not_called()
+        app.learning.add.assert_not_called()
+
     def test_failure_preserves_request_and_reports_error(self):
         app = self.app()
         app.episodic.augment.side_effect = RuntimeError('unavailable')

@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker
+  labels: {{- include "nexus.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector: {{- include "nexus.selector" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: worker
+  labels: {{- include "nexus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  serviceName: worker
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels: {{- include "nexus.selector" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels: {{- include "nexus.selector" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: { type: RuntimeDefault } }
+      {{- include "nexus.imagePullSecrets" . | nindent 6 }}
+      initContainers:
+        - name: prepare-secrets
+          image: {{ required "images.routerWorker is required" .Values.images.routerWorker | quote }}
+          command: ["python", "-c"]
+          args: ["import os,shutil; os.makedirs('/run/secrets',mode=0o700,exist_ok=True); [(shutil.copyfile('/source/'+a,'/run/secrets/'+b),os.chmod('/run/secrets/'+b,0o600)) for a,b in [('ca.crt','router_ca'),('enrollment.token','enrollment_token'),('atenea.api.key','atenea_api_key')]]"]
+          securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: source, mountPath: /source, readOnly: true }
+            - { name: runtime-secrets, mountPath: /run/secrets }
+      containers:
+        - name: worker
+          image: {{ .Values.images.routerWorker | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["python", "/app/nexus-h1-node/worker2.py", "--router", "https://router:18080", "--atenea", {{ required "atenea.url is required" .Values.atenea.url | quote }}, "--node-dir", "/var/lib/nexus/node", "--router-ca", "/run/secrets/router_ca", "--enrollment-token-file", "/run/secrets/enrollment_token", "--atenea-api-key-file", "/run/secrets/atenea_api_key", "--wallet", {{ .Values.worker.wallet | quote }}]
+          env:
+            - { name: ROUTER_URL, value: "https://router:18080" }
+            - { name: ROUTER_CA_FILE, value: /run/secrets/router_ca }
+            - { name: ATENHEA_URL, value: {{ .Values.atenea.url | quote }} }
+            - { name: ATENHEA_API_KEY_FILE, value: /run/secrets/atenea_api_key }
+            - { name: NEXUS_H1_ALLOW_HTTP_SERVICE_NAME, value: {{ .Values.atenea.allowHttpServiceName | quote }} }
+            - { name: NEXUS_WORKER_READY_FILE, value: /var/lib/nexus/node/.worker-ready }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          resources: {{- toYaml .Values.resources.worker | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/nexus }
+            - { name: runtime-secrets, mountPath: /run/secrets, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          startupProbe: { exec: { command: ["python", "-c", "import os; os.kill(1,0)"] }, failureThreshold: 36, periodSeconds: 5 }
+          readinessProbe: { exec: { command: ["python", "/app/nexus-h1-node/container_healthcheck.py", "worker"] }, periodSeconds: 20, timeoutSeconds: 8 }
+          livenessProbe: { exec: { command: ["python", "-c", "import os; os.kill(1,0)"] }, periodSeconds: 30 }
+      volumes:
+        - name: source
+          secret: { secretName: {{ .Values.secrets.worker | quote }}, defaultMode: 0440 }
+        - { name: runtime-secrets, emptyDir: { medium: Memory } }
+        - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 32Mi } }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: { storage: 1Gi }

@@ -19,7 +19,7 @@ SOURCES = ('nram_container.py', 'nram_generic.py', 'nram_evolve_generic.py',
            'interaction_learning.py', 'requirements.txt', 'micro_extensions.py',
            'micro_training.py', 'world_memory.py', 'nram_convert.py',
            'native_runtime.py', 'native_protocol.py', 'inference_settings.py', 'prefix_cache.py',
-           'native_placement.py', 'micro_training_control.py')
+           'native_placement.py')
 
 
 def digest(value: str) -> str:

@@ -1,0 +1,19 @@
+{
+  "name": "@nexus-network/sdk",
+  "version": "0.2.0",
+  "description": "TypeScript client for the NEXUS OpenAI-compatible gateway",
+  "license": "UNLICENSED",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.cjs"
+  },
+  "dependencies": {
+    "axios": "^1.7.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

@@ -1,0 +1,316 @@
+# H0 product path: authenticated API -> private TLS Router -> H1 worker.
+# Atenhea is normally external and must be reachable at ATENHEA_URL.
+# The isolated e2e profile provides a mock engine on the private bridge.
+services:
+  router:
+    build:
+      context: .
+      dockerfile: nexus-h1-node/Dockerfile
+    image: nexus-h0-router-worker:local
+    command:
+      - /app/nexus/h0/router.py
+      - --mode
+      - remote
+      - --host
+      - auto
+      - --port
+      - "18080"
+      - --dir
+      - /var/lib/nexus
+      - --tls-cert
+      - /run/secrets/router_cert
+      - --tls-key
+      - /run/secrets/router_key
+      - --client-token-file
+      - /run/secrets/client_token
+      - --enrollment-token-file
+      - /run/secrets/enrollment_token
+    environment:
+      ROUTER_URL: https://router:18080
+      ROUTER_CA_FILE: /run/secrets/router_ca
+      NEXUS_H0_NODE_HEARTBEAT_TTL_SECONDS: ${NEXUS_H0_NODE_HEARTBEAT_TTL_SECONDS:-30}
+    user: "${NEXUS_UID:?Set NEXUS_UID in .env.h0}:${NEXUS_GID:?Set NEXUS_GID in .env.h0}"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - ./data/h0-router:/var/lib/nexus
+    secrets:
+      - source: router_cert
+        target: router_cert
+      - source: router_key
+        target: router_key
+      - source: router_ca
+        target: router_ca
+      - source: client_token
+        target: client_token
+      - source: enrollment_token
+        target: enrollment_token
+    healthcheck:
+      test: ["CMD", "python", "/app/nexus-h1-node/container_healthcheck.py", "router"]
+      interval: 20s
+      timeout: 8s
+      retries: 3
+      start_period: 15s
+    networks:
+      - h0-private
+
+  worker:
+    image: nexus-h0-router-worker:local
+    command:
+      - /app/nexus-h1-node/worker2.py
+      - --router
+      - https://router:18080
+      - --atenea
+      - ${ATENHEA_URL:?Set ATENHEA_URL to the external Atenhea ENGINE URL in .env.h0}
+      - --node-dir
+      - /var/lib/nexus/node
+      - --router-ca
+      - /run/secrets/router_ca
+      - --enrollment-token-file
+      - /run/secrets/enrollment_token
+      - --atenea-api-key-file
+      - /run/secrets/atenea_api_key
+      - --wallet
+      - ${NEXUS_H1_WALLET:-}
+    user: "${NEXUS_UID:?Set NEXUS_UID in .env.h0}:${NEXUS_GID:?Set NEXUS_GID in .env.h0}"
+    environment:
+      ROUTER_URL: https://router:18080
+      ROUTER_CA_FILE: /run/secrets/router_ca
+      ATENHEA_URL: ${ATENHEA_URL:?Set ATENHEA_URL to the external Atenhea ENGINE URL in .env.h0}
+      ATENHEA_API_KEY_FILE: /run/secrets/atenea_api_key
+      NEXUS_H1_ALLOW_HTTP_SERVICE_NAME: ${NEXUS_H1_ALLOW_HTTP_SERVICE_NAME:-}
+      NEXUS_WORKER_READY_FILE: /var/lib/nexus/node/.worker-ready
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    restart: unless-stopped
+    stop_grace_period: 30s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data/h0-worker:/var/lib/nexus
+    secrets:
+      - source: router_ca
+        target: router_ca
+      - source: enrollment_token
+        target: enrollment_token
+      - source: atenea_api_key
+        target: atenea_api_key
+    depends_on:
+      router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/app/nexus-h1-node/container_healthcheck.py", "worker"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 180s
+    networks:
+      - h0-private
+
+  mock-atenea:
+    profiles: [e2e]
+    build:
+      context: .
+      dockerfile: nexus/h0/Dockerfile.mock
+    image: nexus-h0-mock-atenea:local
+    environment:
+      MOCK_MODEL_ID: athenea-e2b
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=8m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 64
+    restart: unless-stopped
+    stop_grace_period: 5s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json,urllib.request;
+          d=json.load(urllib.request.urlopen('http://127.0.0.1:11436/v1/models',timeout=3));
+          raise SystemExit(0 if d.get('data') else 1)
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 2s
+    networks:
+      - h0-private
+
+  valkey:
+    image: valkey/valkey:9.1.2-alpine
+    command: ["valkey-server", "/run/secrets/valkey.conf"]
+    user: "${NEXUS_UID:?Set NEXUS_UID in .env.h0}:${NEXUS_GID:?Set NEXUS_GID in .env.h0}"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - ./data/h0-valkey:/data
+    secrets:
+      - source: valkey_conf
+        target: valkey.conf
+      - source: valkey_password
+        target: valkey.password
+    healthcheck:
+      test: ["CMD-SHELL", "VALKEYCLI_AUTH=\"$$(cat /run/secrets/valkey.password)\" valkey-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - h0-private
+
+  api:
+    build:
+      context: .
+      dockerfile: nexus/api/Dockerfile
+    image: nexus-h0-api:local
+    command: ["--host", "0.0.0.0", "--port", "8000", "--no-server-header"]
+    environment:
+      NEXUS_H0_ROUTER_URL: https://router:18080
+      NEXUS_H0_ROUTER_CA_FILE: /run/secrets/router_ca
+      NEXUS_H0_CLIENT_TOKEN_FILE: /run/secrets/client_token
+      NEXUS_API_CLIENTS_FILE: /run/secrets/api_clients
+      NEXUS_API_USERS_FILE: /run/secrets/api_users.json
+      NEXUS_REDIS_URL_FILE: /run/secrets/redis.url
+      NEXUS_API_REQUIRE_DISTRIBUTED_RATE_LIMIT: "1"
+      NEXUS_AUTH_ALLOWED_ORIGINS: ${NEXUS_AUTH_ALLOWED_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+      NEXUS_AUTH_COOKIE_SECURE: "0"
+      NEXUS_API_MAX_BODY_BYTES: "1048576"
+      NEXUS_API_MAX_INFLIGHT_INFERENCES: "8"
+    user: "${NEXUS_UID:?Set NEXUS_UID in .env.h0}:${NEXUS_GID:?Set NEXUS_GID in .env.h0}"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
+    secrets:
+      - source: router_ca
+        target: router_ca
+      - source: client_token
+        target: client_token
+      - source: api_clients
+        target: api_clients
+      - source: api_users
+        target: api_users.json
+      - source: redis_url
+        target: redis.url
+    depends_on:
+      worker:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json,urllib.request;
+          d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/ready',timeout=5));
+          raise SystemExit(0 if d.get('success') else 1)
+      interval: 20s
+      timeout: 8s
+      retries: 3
+      start_period: 30s
+    networks:
+      - h0-private
+
+  web:
+    build:
+      context: .
+      dockerfile: nexus-web/Dockerfile
+    image: nexus-h0-web:local
+    environment:
+      NEXUS_H0_API_URL: http://api:8000
+      NEXUS_H0_API_ALLOW_HTTP_SERVICE_NAME: "1"
+      NEXUS_API_TOKEN_FILE: /run/secrets/api_token
+      NEXUS_H0_UI_BIND_HOST: 0.0.0.0
+      NEXUS_H0_UI_PORT: "8080"
+      NEXUS_H0_UI_PUBLIC_PORT: ${UI_HOST_PORT:-8080}
+      NEXUS_H0_UI_ALLOWED_HOSTS: "localhost:${UI_HOST_PORT:-8080},127.0.0.1:${UI_HOST_PORT:-8080}"
+      NEXUS_AUTH_COOKIE_SECURE: "0"
+    user: "${NEXUS_UID:?Set NEXUS_UID in .env.h0}:${NEXUS_GID:?Set NEXUS_GID in .env.h0}"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 64
+    restart: unless-stopped
+    stop_grace_period: 10s
+    ports:
+      - "127.0.0.1:${UI_HOST_PORT:-8080}:8080"
+    secrets:
+      - source: api_token
+        target: api_token
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          request=urllib.request.Request('http://127.0.0.1:8080/',headers={'Host':'127.0.0.1:${UI_HOST_PORT:-8080}'});
+          urllib.request.urlopen(request,timeout=5).read(1)
+      interval: 20s
+      timeout: 8s
+      retries: 3
+      start_period: 10s
+    networks:
+      - h0-private
+
+secrets:
+  router_cert:
+    file: ./.secrets/router.crt
+  router_key:
+    file: ./.secrets/router.key
+  router_ca:
+    file: ./.secrets/ca.crt
+  client_token:
+    file: ./.secrets/client.token
+  enrollment_token:
+    file: ./.secrets/enrollment.token
+  atenea_api_key:
+    file: ./.secrets/atenea_api.key
+  api_token:
+    file: ./.secrets/api.token
+  api_clients:
+    file: ./.secrets/api_clients.json
+  api_users:
+    file: ./.secrets/api_users.json
+  redis_url:
+    file: ./.secrets/redis.url
+  valkey_conf:
+    file: ./.secrets/valkey.conf
+  valkey_password:
+    file: ./.secrets/valkey.password
+
+networks:
+  h0-private:
+    driver: bridge

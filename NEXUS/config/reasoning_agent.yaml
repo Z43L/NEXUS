@@ -32,7 +32,7 @@ llm:
   # Parámetros para OpenRouter
   provider: "openrouter" # Indicamos el nuevo proveedor
   model: "deepseek/deepseek-chat-v3.1" # Modelo de ejemplo de OpenRouter
-  api_key: "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" # <-- PON TU CLAVE AQUÍ
+  api_key: "${OPENROUTER_API_KEY}"
 
   # Parámetros de LangChain
   temperature: 0.1

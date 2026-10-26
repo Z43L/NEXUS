@@ -1,0 +1,248 @@
+name: h0-compose
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'NEXUS/compose.h0.yml'
+      - 'NEXUS/.dockerignore'
+      - 'NEXUS/.env.h0.example'
+      - 'NEXUS/requirements-cryptography.lock'
+      - 'NEXUS/nexus-h1-node/**'
+      - 'NEXUS/nexus/h0/**'
+      - 'NEXUS/nexus/api/**'
+      - 'NEXUS/nexus-sdk-js/**'
+      - 'NEXUS/nexus-sdk-python/**'
+      - 'NEXUS/nexus-web/**'
+      - 'NEXUS/atenhea/**'
+      - 'NEXUS/charts/nexus/**'
+      - 'NEXUS/settlement-evm/e2e_local.py'
+      - '.github/workflows/h0-compose.yml'
+  pull_request:
+    paths:
+      - 'NEXUS/compose.h0.yml'
+      - 'NEXUS/.dockerignore'
+      - 'NEXUS/.env.h0.example'
+      - 'NEXUS/requirements-cryptography.lock'
+      - 'NEXUS/nexus-h1-node/**'
+      - 'NEXUS/nexus/h0/**'
+      - 'NEXUS/nexus/api/**'
+      - 'NEXUS/nexus-sdk-js/**'
+      - 'NEXUS/nexus-sdk-python/**'
+      - 'NEXUS/nexus-web/**'
+      - 'NEXUS/atenhea/**'
+      - 'NEXUS/charts/nexus/**'
+      - 'NEXUS/settlement-evm/e2e_local.py'
+      - '.github/workflows/h0-compose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.18.4
+      - name: Lint and render private H0 Helm chart
+        run: |
+          helm lint NEXUS/charts/nexus --strict \
+            --set api.authAllowedOrigins=https://nexus.invalid \
+            --set web.allowedHosts=nexus.invalid \
+            --set web.allowedOrigins=https://nexus.invalid
+          rendered=$(helm template nexus NEXUS/charts/nexus --namespace nexus \
+            --set images.routerWorker=ghcr.io/example/nexus-worker:ci \
+            --set images.api=ghcr.io/example/nexus-api:ci \
+            --set images.web=ghcr.io/example/nexus-web:ci \
+            --set atenea.url=https://atenhea.invalid \
+            --set api.authAllowedOrigins=https://nexus.invalid \
+            --set web.allowedHosts=nexus.invalid \
+            --set web.allowedOrigins=https://nexus.invalid)
+          grep -Eq 'path: /, port: http, httpHeaders:.*value: "nexus.invalid"' <<<"$rendered"
+          grep -Fq 'name: NEXUS_API_REDIS_REQUIRE_TLS, value: "1"' <<<"$rendered"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Install H0 test dependency
+        run: "python3 -m pip install --require-hashes --only-binary=:all: -r NEXUS/nexus/h0/requirements-h0.txt"
+      - name: Run Atenhea NEXUS memory privacy regression
+        working-directory: NEXUS/atenhea
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_onram_memory test_onram_security
+      - name: Install locked API test dependencies
+        run: python3 -m pip install --require-hashes -r NEXUS/nexus/api/requirements-h0.lock
+      - name: Run FastAPI security regressions
+        run: PYTHONPATH=NEXUS PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s NEXUS/nexus/api/tests -v
+      - name: Run H0 protocol and security regressions
+        working-directory: NEXUS/nexus/h0
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 test_h0.py
+          PYTHONDONTWRITEBYTECODE=1 python3 test_router_concurrency.py
+          PYTHONDONTWRITEBYTECODE=1 python3 test_secure_remote.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_job_ownership
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: NEXUS/nexus-sdk-js/package-lock.json
+      - name: Test TypeScript SDK
+        working-directory: NEXUS/nexus-sdk-js
+        run: npm ci && npm test
+      - name: Install and test Python SDK package
+        run: python -m pip install ./NEXUS/nexus-sdk-python && PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s NEXUS/nexus-sdk-python/tests -v
+      - name: Validate scripts, Python, and Compose configuration
+        working-directory: NEXUS
+        run: |
+          sh -n nexus-h1-node/bootstrap-compose-h0.sh
+          sh -n nexus-h1-node/rotate-compose-router-cert.sh
+          python3 -m py_compile nexus/h0/router.py nexus/h0/nexus_common.py nexus-h1-node/worker2.py nexus-h1-node/jwt_auth.py nexus-h1-node/container_healthcheck.py
+          PYTHONPATH=nexus/h0 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_backup_h0
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s nexus-h1-node -p 'test_*.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s nexus-web -p 'test_h0_auth_bff.py' -v
+          NEXUS_H0_CA_KEY_OUT="$RUNNER_TEMP/nexus-h0-ca.key" ./nexus-h1-node/bootstrap-compose-h0.sh
+          docker compose --profile e2e --env-file .env.h0 -f compose.h0.yml config --quiet
+      - name: Build H0 Router, H1 worker, API, and UI images
+        working-directory: NEXUS
+        run: docker compose --profile e2e --env-file .env.h0 -f compose.h0.yml build --pull router api web mock-atenea
+      - name: Start private mock engine and run container E2E
+        working-directory: NEXUS
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import secrets
+          from nexus.api import manage_api_users
+
+          users = Path(".secrets/api_users.json")
+          passwords = {}
+          for username in ("e2e-alice", "e2e-bob"):
+              password = secrets.token_urlsafe(32)
+              manage_api_users.manage(users, "add", username,
+                                      scopes="inference,models:read,jobs:read", password=password)
+              passwords[username] = password
+          fd = os.open(".secrets/e2e-passwords.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, "w", encoding="utf-8") as stream:
+              import json
+              json.dump(passwords, stream)
+          PY
+          docker compose --profile e2e --env-file .env.h0 -f compose.h0.yml up --detach --wait --wait-timeout 60 mock-atenea
+          ATENHEA_URL=http://mock-atenea:11436 \
+          NEXUS_H1_ALLOW_HTTP_SERVICE_NAME=mock-atenea \
+            docker compose --profile e2e --env-file .env.h0 -f compose.h0.yml up --detach --wait --wait-timeout 300 web
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from http.cookiejar import CookieJar
+          import time
+          from urllib.error import HTTPError, URLError
+          from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
+
+          token = Path(".secrets/api.token").read_text().strip()
+          body = json.dumps({
+              "model": "athenea-e2b",
+              "messages": [{"role": "user", "content": "compose end-to-end check"}],
+              "max_tokens": 8,
+              "timeout_s": 60,
+          }).encode()
+          url = "http://127.0.0.1:8000/v1/chat/completions"
+          for _ in range(60):
+              try:
+                  with urlopen("http://127.0.0.1:8000/ready", timeout=2) as response:
+                      if response.status == 200:
+                          break
+              except OSError:
+                  time.sleep(1)
+          else:
+              raise SystemExit("FastAPI facade did not become ready")
+          try:
+              with urlopen(Request(url, data=body, headers={"Content-Type": "application/json"}), timeout=5):
+                  raise SystemExit("FastAPI accepted an unauthenticated request")
+          except HTTPError as exc:
+              assert exc.code == 401, exc.code
+          request = Request(url, data=body, headers={
+              "Authorization": f"Bearer {token}", "Content-Type": "application/json",
+          })
+          with urlopen(request, timeout=90) as response:
+              result = json.loads(response.read())
+          assert result["choices"][0]["message"]["content"], result
+          assert result["usage"]["completion_tokens"] > 0, result
+          ui = "http://127.0.0.1:8080"
+          origin = ui
+          with urlopen(ui + "/", timeout=5) as response:
+              page = response.read()
+          assert token.encode() not in page, "UI exposed its API token"
+          passwords = json.loads(Path(".secrets/e2e-passwords.json").read_text())
+
+          def browser():
+              return build_opener(HTTPCookieProcessor(CookieJar()))
+
+          alice, bob = browser(), browser()
+
+          def browser_request(client, path, method="GET", data=None, with_origin=False):
+              headers = {}
+              if data is not None:
+                  headers["Content-Type"] = "application/json"
+              if with_origin:
+                  headers["Origin"] = origin
+              return client.open(Request(ui + path, data=data, method=method, headers=headers), timeout=90)
+
+          try:
+              browser_request(alice, "/v1/models")
+              raise SystemExit("BFF accepted a browser request without a user session")
+          except HTTPError as exc:
+              assert exc.code == 401, exc.code
+          initial = browser_request(alice, "/auth/session")
+          assert json.loads(initial.read()) == {"authenticated": False}
+          login_body = json.dumps({"username": "e2e-alice", "password": passwords["e2e-alice"]}).encode()
+          with browser_request(alice, "/auth/login", "POST", login_body, with_origin=True) as response:
+              assert response.status == 200
+              assert "HttpOnly" in response.headers.get("Set-Cookie", "")
+          with browser_request(alice, "/auth/session") as response:
+              assert json.loads(response.read())["authenticated"] is True
+          with browser_request(alice, "/v1/models") as response:
+              models = json.loads(response.read())
+          assert models["data"], models
+          browser_request(bob, "/auth/session")
+          bob_login = json.dumps({"username": "e2e-bob", "password": passwords["e2e-bob"]}).encode()
+          with browser_request(bob, "/auth/login", "POST", bob_login, with_origin=True) as response:
+              assert response.status == 200
+          browser_request(alice, "/auth/session")
+          browser_request(bob, "/auth/session")
+          with browser_request(alice, "/v1/chat/completions", "POST", body, with_origin=True) as response:
+              browser_result = json.loads(response.read())
+          assert browser_result["choices"][0]["message"]["content"], browser_result
+          job_id = browser_result["id"]
+          deadline = time.monotonic() + 30
+          while True:
+              with browser_request(alice, "/jobs/" + job_id) as response:
+                  job = json.loads(response.read())
+              assert job["job_id"] == job_id, job
+              if job["status"] in {"done", "failed"}:
+                  break
+              if time.monotonic() >= deadline:
+                  raise SystemExit(f"job did not finish before deadline: {job}")
+              time.sleep(0.5)
+          assert job["status"] == "done", job
+          try:
+              browser_request(bob, "/jobs/" + job_id)
+              raise SystemExit("a different user read another user's job")
+          except HTTPError as exc:
+              assert exc.code == 404, exc.code
+          with browser_request(alice, "/auth/logout", "POST", b"", with_origin=True) as response:
+              assert response.status == 200
+          try:
+              browser_request(alice, "/v1/models")
+              raise SystemExit("BFF accepted the logged-out browser session")
+          except HTTPError as exc:
+              assert exc.code == 401, exc.code
+          Path(".secrets/e2e-passwords.json").unlink(missing_ok=True)
+          print("Compose accounts/session BFF → API → TLS Router → H1 → mock E2E and cross-user job isolation: PASS")
+          PY
+      - name: Stop Compose services
+        if: always()
+        working-directory: NEXUS
+        run: |
+          docker compose --profile e2e --env-file .env.h0 -f compose.h0.yml down --volumes --remove-orphans
+          rm -f .secrets/e2e-passwords.json

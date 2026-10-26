@@ -5,7 +5,17 @@ NEXUS/nexus/h0/nexus_h0.db.bak-*
 NEXUS/nexus/h0/h0_report.json
 NEXUS/nexus/h0/h0_report.json.bak-*
 NEXUS/nexus/h0/router_secret.txt
+NEXUS/nexus/h0/router_key.pem
 NEXUS/nexus/h0/node/
 NEXUS/nexus/h0/*.log
 NEXUS/nexus/h0/.venv/
+NEXUS/nexus/api/.venv/
 __pycache__/
+NEXUS/nexus-sdk-js/node_modules/
+NEXUS/nexus-sdk-js/dist/
+NEXUS/nexus-h1-node/node/
+NEXUS/.env
+NEXUS/.env.h0
+NEXUS/.secrets/
+NEXUS/data/
+.DS_Store

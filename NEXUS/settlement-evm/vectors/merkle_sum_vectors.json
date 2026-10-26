@@ -1,0 +1,56 @@
+{
+  "keccak256": [
+    {
+      "inputHex": "",
+      "digest": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+    },
+    {
+      "inputHex": "616263",
+      "digest": "0x4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"
+    },
+    {
+      "inputHex": "7472616e7366657228616464726573732c75696e7432353629",
+      "digest": "0xa9059cbb2ab09eb219583f4a59a5d0623ade346d962bcd4e46b11da047c9049b"
+    }
+  ],
+  "batch": {
+    "batchId": "0x1111111111111111111111111111111111111111111111111111111111111111",
+    "depositAmount": 300,
+    "root": "0x11bcb1dd856a9c61bfc226de530076c5cdaba4cd75542f2f39d0a667be030b3c",
+    "rootSum": 300,
+    "jobs": [
+      {
+        "jobId": "0x2222222222222222222222222222222222222222222222222222222222222222",
+        "node": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "author": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "amount": 100,
+        "leafHash": "0x6b063043e0cafa5aacf73dfc87752a603ee68ad993db70b46fdab5bf40e0d306",
+        "proof": [
+          "0x15fee9412e8e93e983a2a5fc10d06f0c0378b6dd9be6aa890ddfb6534fa91077"
+        ],
+        "proofSums": [
+          200
+        ]
+      },
+      {
+        "jobId": "0x3333333333333333333333333333333333333333333333333333333333333333",
+        "node": "0xcccccccccccccccccccccccccccccccccccccccc",
+        "author": "0xdddddddddddddddddddddddddddddddddddddddd",
+        "amount": 200,
+        "leafHash": "0x02b3c27a109dac7920081f3cd3cbb9c19a7e91e45bcca3c23b08adc9c6c6b783",
+        "proof": [
+          "0x07c4d627457e89ce401d77049a66e3c367d1a300747b35de80a5c337beb37da7"
+        ],
+        "proofSums": [
+          100
+        ]
+      }
+    ],
+    "settlementContext": {
+      "chainId": 31337,
+      "escrowAddress": "0x3333333333333333333333333333333333333333",
+      "tokenAddress": "0x4444444444444444444444444444444444444444"
+    },
+    "leafDomain": "0xef9cf1960adc3f8ffdb20407e64a0636dab428101bf2f706067054dce1e09552"
+  }
+}

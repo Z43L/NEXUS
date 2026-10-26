@@ -33,17 +33,32 @@ def http_json(url: str, payload: dict | None = None, timeout=600) -> dict:
 
 
 class Worker:
-    def __init__(self, router: str, atenea: str, node_dir: Path):
+    def __init__(self, router: str, atenea: str, node_dir: Path, nram_capable: bool = False):
         self.router = router.rstrip("/")
         self.atenea = atenea.rstrip("/")
+        self.nram_capable = nram_capable
         self.priv, self.pub_pem, self.node_id = nc.load_or_create_node_key(node_dir)
         self.model_id = None
+        self.models: list[str] = []
         self.scaffolding_tokens = 0
+        self.router_pub_pem = ""
 
     # -- Atenhea -------------------------------------------------------------
     def atenea_models(self) -> list[str]:
         out = http_json(self.atenea + "/v1/models", timeout=15)
         return [m.get("id", "") for m in out.get("data", []) if m.get("id")]
+
+    def router_json(self, path: str, payload: dict | None = None, timeout: int = 30) -> dict:
+        method = "GET" if payload is None else "POST"
+        body = payload or {}
+        url = self.router + path
+        headers = {"Content-Type": "application/json"}
+        headers.update(nc.sign_node_request(self.priv, method, path, body))
+        headers["X-Nexus-Node-ID"] = self.node_id
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
 
     def count_input_tokens(self, messages: list[dict]) -> int | None:
         """Token count from the engine's own tokenizer.
@@ -66,10 +81,10 @@ class Worker:
                 raise
         return None
 
-    def run_inference(self, job: dict) -> dict:
+    def run_inference(self, job: dict, model_id: str) -> dict:
         params = job.get("params") or {}
         payload = {
-            "model": self.model_id,
+            "model": model_id,
             "messages": job["messages"],
             "temperature": params.get("temperature", 0.3),
             "max_tokens": min(int(params.get("max_tokens", 220)), 4096),
@@ -102,37 +117,55 @@ class Worker:
         return max(0, eng_prompt - counted)
 
     def register(self, models: list[str], nram: list[str]) -> None:
-        http_json(self.router + "/nodes/register", {
+        out = self.router_json("/nodes/register", {
             "node_id": self.node_id, "pubkey_pem": self.pub_pem,
             "models": models, "nram": nram, "region": "local",
         }, timeout=15)
+        self.router_pub_pem = out.get("router_pubkey_pem", "")
 
     def heartbeat(self) -> None:
         try:
-            http_json(self.router + "/nodes/heartbeat", {"node_id": self.node_id}, timeout=10)
+            self.router_json("/nodes/heartbeat", {"node_id": self.node_id}, timeout=10)
         except Exception:
             pass
 
     def next_job(self) -> dict | None:
-        out = http_json(self.router + f"/jobs/next?node_id={self.node_id}", timeout=15)
+        out = self.router_json(f"/jobs/next?node_id={self.node_id}", timeout=15)
         return out.get("job")
 
     def post_result(self, job_id: str, payload: dict) -> dict:
-        return http_json(self.router + f"/jobs/{job_id}/result", payload, timeout=30)
+        return self.router_json(f"/jobs/{job_id}/result", payload, timeout=30)
 
     # -- Main loop ---------------------------------------------------------------
     def process(self, job: dict) -> None:
         job_id = job["job_id"]
+        try:
+            nc.verify_job_jwt(self.router_pub_pem, job.get("dispatch_jwt", ""),
+                              self.node_id, job_id)
+        except ValueError as exc:
+            print(f"[{job_id}] refused: invalid dispatch JWT ({exc})", flush=True)
+            return
         # Spec 5.2.3: remote jobs never run with tools.
         if job.get("tools"):
             self.post_result(job_id, {"status": "rejected",
-                                      "error": "tools_not_allowed_in_remote_jobs"})
+                                      "error": "tools_not_allowed_in_remote_jobs",
+                                      "dispatch_jwt": job.get("dispatch_jwt", "")})
             print(f"[{job_id}] rejected: tools requested", flush=True)
+            return
+        # H2: a receipt may only claim a .nram the engine really applied. The
+        # engine has no per-request adapter selection yet, so refuse instead of
+        # signing a receipt that would pay an author for unused weights.
+        if job.get("nram") and not self.nram_capable:
+            self.post_result(job_id, {"status": "rejected",
+                                      "error": "nram_unsupported_by_engine",
+                                      "dispatch_jwt": job.get("dispatch_jwt", "")})
+            print(f"[{job_id}] rejected: nram requested but engine cannot apply it", flush=True)
             return
         started = time.time()
         started_iso = nc.utc_now_iso()
+        model_id = nc.resolve_model(job.get("model", ""), self.models)
         counted_in = self.count_input_tokens(job["messages"])
-        resp = self.run_inference(job)
+        resp = self.run_inference(job, model_id)
         finished = time.time()
         choice = (resp.get("choices") or [{}])[0]
         output_text = ((choice.get("message") or {}).get("content")
@@ -150,7 +183,7 @@ class Worker:
         receipt = {
             "job_id": job_id,
             "node_id": self.node_id,
-            "model": self.model_id,
+            "model": model_id,
             "input_tokens": counted_in,
             "output_tokens": eng_out,
             "engine_prompt_tokens": eng_in,
@@ -168,7 +201,7 @@ class Worker:
         signature = nc.sign_receipt(self.priv, receipt)
         self.post_result(job_id, {"status": "done", "receipt": receipt,
                                   "signature": signature,
-                                  "dispatch_token": job.get("dispatch_token", ""),
+                                  "dispatch_jwt": job.get("dispatch_jwt", ""),
                                   "output_text": output_text})
         print(f"[{job_id}] done in={counted_in} out={eng_out} "
               f"{receipt['elapsed_s']}s price={price}µ$", flush=True)
@@ -178,6 +211,7 @@ class Worker:
         if not models:
             raise SystemExit("Atenhea engine returned no models at " + self.atenea)
         self.model_id = models[0]
+        self.models = models
         self.scaffolding_tokens = self.calibrate_scaffolding()
         self.register(models, [])
         print(f"worker {self.node_id} model={self.model_id} atenea={self.atenea} "
@@ -200,10 +234,15 @@ class Worker:
             try:
                 self.process(job)
             except Exception as exc:
-                print(f"job {job.get('job_id')} failed: {exc}", flush=True)
+                transient = nc.is_transient_transport_error(exc)
+                status = "retry" if transient else "rejected"
+                error = (f"transient {type(exc).__name__}" if transient
+                         else f"worker_error: {exc}")
+                print(f"job {job.get('job_id')} {status}: {error}", flush=True)
                 try:
-                    self.post_result(job["job_id"], {"status": "rejected",
-                                                      "error": f"worker_error: {exc}"})
+                    self.post_result(job["job_id"], {"status": status,
+                                                      "error": error,
+                                                      "dispatch_jwt": job.get("dispatch_jwt", "")})
                 except Exception:
                     pass
 
@@ -214,8 +253,11 @@ def main():
     ap.add_argument("--atenea", default="http://127.0.0.1:11436",
                     help="Atenhea ENGINE base URL (not the :11434 agent proxy)")
     ap.add_argument("--node-dir", default=str(BASE / "node"))
+    ap.add_argument("--nram-capable", action="store_true",
+                    help="declare that the engine applies .nram adapters per request")
     args = ap.parse_args()
-    Worker(args.router, args.atenea, Path(args.node_dir)).serve_forever()
+    Worker(args.router, args.atenea, Path(args.node_dir),
+           nram_capable=args.nram_capable).serve_forever()
 
 
 if __name__ == "__main__":

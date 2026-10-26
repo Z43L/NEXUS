@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
@@ -47,7 +48,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/v1/models":
             return self._json({"object": "list",
-                               "data": [{"id": "athenea-e2b", "object": "model"}]})
+                               "data": [{"id": os.environ.get("MOCK_MODEL_ID", "athenea-e2b"),
+                                         "object": "model"}]})
         return self._json({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -59,6 +61,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/messages/count_tokens":
             return self._json({"input_tokens": count_tokens(messages_text(body.get("messages", [])))})
         if self.path == "/v1/chat/completions":
+            delay_ms = int(os.environ.get("MOCK_INFERENCE_DELAY_MS", "0"))
+            if delay_ms > 0:
+                time.sleep(min(delay_ms, 5000) / 1000)
             prompt = messages_text(body.get("messages", []))
             seed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:8]
             max_tokens = int(body.get("max_tokens", 220))
@@ -81,10 +86,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="bind address; use 0.0.0.0 only for isolated container tests")
     ap.add_argument("--port", type=int, default=11436)
     args = ap.parse_args()
-    print(f"mock atenea on 127.0.0.1:{args.port}", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    print(f"mock atenea on {args.host}:{args.port}", flush=True)
+    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 # NEXUS × Atenhea — proyecto unificado
 
+> **Estado de ejecución actualizado a 2026-10-26:** para límites, pruebas y puertas abiertas, consulta [EXECUTIVE_BRIEF.md](EXECUTIVE_BRIEF.md) y [PROJECT_DELIVERY.md](PROJECT_DELIVERY.md). Las notas de diseño posteriores a esta sección pueden ser históricas.
+
 Desde el 2026-10-20 todo vive en este único repositorio: NEXUS deja de ser solo
 el plano económico/red y Atenhea deja de ser un repo separado. Un proyecto,
 dos capas:
@@ -24,16 +26,17 @@ dos capas:
 
 ## Estado
 
-- **H0** (integración en un solo equipo): código completo y probado de extremo
-  a extremo contra un motor simulado (100/100 trabajos, 100 recibos
-  verificados, discrepancia de conteo 0 %, sonda con `tools` rechazada,
-  recibo manipulado rechazado). Ejecución contra el motor real en el Mac del
-  autor: primera corrida detectó que el motor local solo expone el conteo de
-  tokens en `/v1/messages/count_tokens`; el worker ya trae el fallback
-  (probado) y la re-ejecución de la puerta H0 queda pendiente de esa corrida.
-- Siguientes hitos (spec §11): H1 dos nodos + liquidación en testnet Base,
-  H2 `.nram` por la red + verificación por canarios, H3 nodos externos,
-  H4 beta pública.
+- **H0**: el E2E mock pasa 100/100 jobs, recibos verificados, discrepancia 0%,
+  rechazos de tools/firma/replay y prueba de workers. La corrida Atenhea real
+  también pasó 100/100, con salida limitada a 24 tokens/job; no se registró el
+  hash de pesos ni se completó la puerta económica de la spec.
+- **API y Compose**: SDK → FastAPI autenticada → Router → worker está probado
+  localmente. Compose ahora define esa misma entrada, con TLS/CA privada entre
+  API y Router y Router sin puerto del host; el build/runtime Docker y CI aún
+  deben ejecutarse.
+- **H1–H4**: no se ha validado conectividad entre redes ni liquidación en
+  testnet. Adaptadores `.nram` por red, canarios, nodos externos y beta pública
+  siguen pendientes; véanse las puertas en la hoja ejecutiva.
 
 ## Ejecutar H0
 

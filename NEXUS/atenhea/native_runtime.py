@@ -22,7 +22,6 @@ from prefix_cache import PrefixCache,stable_prefix_length
 from native_placement import place_native
 from micro_extensions import load_extension
 from native_protocol import messages_for, response_for, LiveStream
-from micro_training_control import MicroTrainingController,TRAIN_TOOL
 
 ROOT=Path(__file__).resolve().parent
 
@@ -48,8 +47,6 @@ class NativeEngine:
         self.extension_path=Path(self.manifest['micro_extension']['path']) if self.manifest.get('micro_extension') else None
         self.micro_manifest=load_bundle(self.extension_path)[0] if self.extension_path else None
         self.version=self.micro_manifest['version'] if self.micro_manifest else 0
-        self.micro_controller=MicroTrainingController(self,
-            memory_path=Path(self.manifest.get('episodic_memory',{}).get('path') or ROOT/'models/athenea.memory'))
         print(json.dumps({'event':'native_loaded','device':self.device,'bundle':str(bundle),'micro_version':self.version}),flush=True)
 
     def health(self):
@@ -59,7 +56,6 @@ class NativeEngine:
                 'show_reasoning_summary':summary_enabled(),
                 'reasoning_display':'brief_public_explanation',
                 'prefix_cache':self.prefix_cache.status(),'placement':self.placement,
-                'micro_training_schedule':self.micro_controller.status() if hasattr(self,'micro_controller') else None,
                 'pid':os.getpid(),'loaded_at':getattr(self,'loaded_at',None),
                 'activity':getattr(self,'activity',{'state':'idle'}),'weights_load_count':1,
                 'context_size':self.ctx_size,'model_context_size':self.model_context_size,
@@ -93,8 +89,6 @@ class NativeEngine:
                 raise ValueError('Unknown previous_response_id; resend the full message history')
             messages,tools=messages_for(path,body,self.history.get(previous))
             tools=list(tools)
-            if not any(tool.get('function',{}).get('name')==TRAIN_TOOL['function']['name'] for tool in tools):
-                tools.append(copy.deepcopy(TRAIN_TOOL))
             show_summary=summary_enabled(body)
             prepared_messages=public_messages(messages,show_summary)
             rendered=self.render(prepared_messages,tools)
@@ -172,35 +166,6 @@ class NativeEngine:
             if live and parser:
                 message,events=parser.finalize();consume(events)
             message.pop('thinking',None)
-            internal_calls=[call for call in message.get('tool_calls',[])
-                            if call.get('function',{}).get('name')==TRAIN_TOOL['function']['name']]
-            if internal_calls:
-                user_text=next((str(item.get('content','')) for item in reversed(messages)
-                                if item.get('role')=='user'),'')
-                if not any(word in user_text.casefold() for word in ('entren','train','microexperto','micro experto')):
-                    message={'role':'assistant','content':'Solo inicio el entrenamiento de un microexperto cuando el usuario lo pide explícitamente.'}
-                else:
-                    try:
-                        request=internal_calls[-1]['function'].get('arguments',{})
-                        if isinstance(request,str):request=json.loads(request)
-                        if not isinstance(request,dict):raise ValueError('Parámetros de entrenamiento inválidos.')
-                        report=self.micro_controller.train_topic(request.get('topic',''),messages,
-                            request.get('expert'))
-                        if report.get('state')=='insufficient_topic_data':
-                            detail=report['message']
-                        elif report.get('accepted'):
-                            detail=(f"Entrenamiento del microexperto para «{report.get('topic',request.get('topic'))}» "
-                                    f"aceptado y activado. Experto {report['expert']}; versión {report['micro_version']}; "
-                                    f"NLL validación {report['validation_nll_before']:.4f} → {report['validation_nll_after']:.4f}; "
-                                    f"control de regresión {'superado' if report['guardrail_ok'] else 'fallido'}.")
-                            if report.get('chat_data_fact_verified') is False:
-                                detail+=' Se usaron pares del chat autorizados para esta ronda, pero no se consideran hechos verificados.'
-                        else:
-                            detail=(f"El candidato para «{report.get('topic',request.get('topic'))}» fue rechazado; "
-                                    "la extensión activa se conserva porque no mejoró la validación o falló el control de regresión.")
-                    except Exception as exc:
-                        detail=f'No pude completar el entrenamiento del microexperto: {exc}'
-                    message={'role':'assistant','content':detail}
             custom_names={tool['function']['name'] for tool in tools if tool.get('onram_custom')}
             for call in message.get('tool_calls',[]):
                 if call['function']['name'] in custom_names:call['onram_custom']=True
@@ -352,9 +317,6 @@ def handler_for(engine):
                 if not 0<size<=4_000_000:return self.json({'error':'request body too large or empty'},400)
                 body=json.loads(self.rfile.read(size));path=urlsplit(self.path).path
                 if path=='/onram/train':return self.json(engine.train(body))
-                if path=='/onram/train-topic':
-                    report=engine.micro_controller.train_topic(body.get('topic',''),body.get('messages',[]),body.get('expert'))
-                    return self.json(report,200 if report.get('accepted') else 202)
                 if path=='/v1/messages/count_tokens':
                     messages,tools=messages_for(path,body)
                     return self.json({'input_tokens':len(engine.tokenizer(engine.render(public_messages(messages,summary_enabled(body)),tools))['input_ids'])})

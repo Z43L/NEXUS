@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: router
+  labels: {{- include "nexus.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: {{- include "nexus.selector" . | nindent 4 }}
+    app.kubernetes.io/component: router
+  ports: [{ name: https, port: 18080, targetPort: https }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: router
+  labels: {{- include "nexus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+spec:
+  serviceName: router
+  replicas: 1
+  selector:
+    matchLabels: {{- include "nexus.selector" . | nindent 6 }}
+      app.kubernetes.io/component: router
+  template:
+    metadata:
+      labels: {{- include "nexus.selector" . | nindent 8 }}
+        app.kubernetes.io/component: router
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: { type: RuntimeDefault } }
+      {{- include "nexus.imagePullSecrets" . | nindent 6 }}
+      initContainers:
+        - name: prepare-secrets
+          image: {{ required "images.routerWorker is required" .Values.images.routerWorker | quote }}
+          command: ["python", "-c"]
+          args: ["import os,shutil; os.makedirs('/run/secrets',mode=0o700,exist_ok=True); [(shutil.copyfile('/source/'+a,'/run/secrets/'+b),os.chmod('/run/secrets/'+b,0o600)) for a,b in [('tls.crt','router_cert'),('tls.key','router_key'),('ca.crt','router_ca'),('client.token','client_token'),('enrollment.token','enrollment_token')]]"]
+          securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: source, mountPath: /source, readOnly: true }
+            - { name: runtime-secrets, mountPath: /run/secrets }
+      containers:
+        - name: router
+          image: {{ .Values.images.routerWorker | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["python", "/app/nexus/h0/router.py", "--mode", "remote", "--host", "auto", "--port", "18080", "--dir", "/var/lib/nexus", "--tls-cert", "/run/secrets/router_cert", "--tls-key", "/run/secrets/router_key", "--client-token-file", "/run/secrets/client_token", "--enrollment-token-file", "/run/secrets/enrollment_token"]
+          env:
+            - { name: ROUTER_URL, value: "https://router:18080" }
+            - { name: ROUTER_CA_FILE, value: /run/secrets/router_ca }
+            - { name: NEXUS_H0_NODE_HEARTBEAT_TTL_SECONDS, value: {{ .Values.router.heartbeatTtlSeconds | quote }} }
+          ports: [{ name: https, containerPort: 18080 }]
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          resources: {{- toYaml .Values.resources.router | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/nexus }
+            - { name: runtime-secrets, mountPath: /run/secrets, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          startupProbe:
+            exec: { command: ["python", "/app/nexus-h1-node/container_healthcheck.py", "router"] }
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:
+            exec: { command: ["python", "/app/nexus-h1-node/container_healthcheck.py", "router"] }
+            periodSeconds: 10
+          livenessProbe: { tcpSocket: { port: https }, initialDelaySeconds: 20, periodSeconds: 20 }
+      volumes:
+        - name: source
+          secret: { secretName: {{ .Values.secrets.router | quote }}, defaultMode: 0440 }
+        - { name: runtime-secrets, emptyDir: { medium: Memory } }
+        - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 32Mi } }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.router.storage.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests: { storage: {{ .Values.router.storage.size | quote }} }

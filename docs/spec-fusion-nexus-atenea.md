@@ -6,7 +6,7 @@
 - Fecha: 2026-10-20
 - Repos: `Z43L/NEXUS` (commit 452c68e) y `Z43L/4T3NH34` — Atenhea (commit d3e64f1)
 - Autor del análisis: Wally, a petición de David Moreno
-- Estado: **sin código nuevo todavía**. Este documento define qué se construye, en qué orden, y con qué criterios se abandona si no funciona.
+- Estado: **borrador de producto con implementación parcial**. Desde esta propuesta existe una ruta local H0/H1 con Router, worker, recibos y una vertical aislada de settlement EVM. No equivale a red multi-host, marketplace, testnet ni producto listo para producción; el estado verificable y sus límites están en `EXECUTIVE_BRIEF.md` y `PROJECT_DELIVERY.md`. Este documento conserva los objetivos y criterios de producto pendientes.
 
 ---
 

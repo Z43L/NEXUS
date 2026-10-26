@@ -3,17 +3,19 @@
 # Everything runs on this machine: Atenhea (real engine) + Router + worker + client.
 # Usage:  cd ~/Desktop/nexus-h0 && ./run_h0_mac.sh
 set -eu
-cd "$(dirname "$0")"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$SCRIPT_DIR"
 
-ONGRAM="$HOME/Desktop/ongram"
+ATENHEA_DIR=${ATENHEA_DIR:-"$SCRIPT_DIR/../../atenhea"}
 PY=.venv/bin/python
 
-# 1) Python env (only external dependency: cryptography, for Ed25519 receipts)
+# 1) Python env (H0-pinned cryptography for Ed25519 receipts)
 if [ ! -x "$PY" ]; then
-  echo ">> creating .venv and installing cryptography"
+  echo ">> creating .venv"
   python3 -m venv .venv
-  .venv/bin/pip install --quiet --upgrade pip
-  .venv/bin/pip install --quiet cryptography
+fi
+if ! "$PY" -c 'import cryptography; assert cryptography.__version__ == "50.0.2"' 2>/dev/null; then
+  .venv/bin/pip install --quiet --require-hashes --only-binary=:all: -r "$SCRIPT_DIR/requirements-h0.txt"
 fi
 
 # 2) Atenhea engine: the worker talks to the ENGINE at :11436 (not the :11434
@@ -28,17 +30,12 @@ elif proxy_up; then
   echo "   Stop the current Atenhea and re-run this script; it will start the nram backend."
   exit 1
 else
-  echo ">> starting Atenhea (nram backend) from $ONGRAM"
-  if [ -x "$ONGRAM/start-athenea.sh" ]; then
-    (cd "$ONGRAM" && nohup ./start-athenea.sh >"$OLDPWD/atenea-h0.log" 2>&1 &)
-  elif [ -x "$ONGRAM/atenhea" ]; then
-    (cd "$ONGRAM" && nohup ./atenhea serve --backend nram \
-      --model models/gemma4-e2b-trainable --bundle models/athenea-e2b.nram \
-      --model-name athenea-e2b --ctx-size 131072 \
-      --chl-memory models/athenea.memory --no-auto-learn --no-inference-debug \
-      >"$OLDPWD/atenea-h0.log" 2>&1 &)
+  echo ">> starting Atenhea (nram backend) from $ATENHEA_DIR"
+  if [ -x "$ATENHEA_DIR/start-athenea.sh" ]; then
+    (cd "$ATENHEA_DIR" && nohup ./start-athenea.sh >"$SCRIPT_DIR/atenea-h0.log" 2>&1 &)
   else
-    echo "!! Atenhea not found at $ONGRAM - install it first (repo Z43L/4T3NH34)."
+    echo "!! Atenhea launcher not found at $ATENHEA_DIR/start-athenea.sh."
+    echo "   Set ATENHEA_DIR to the integrated NEXUS/atenhea directory."
     exit 1
   fi
   i=0
@@ -53,9 +50,8 @@ fi
 # 3) Jobs batch; archive any previous run's ledger/report for a clean gate
 if [ -f nexus_h0.db ]; then
   mv nexus_h0.db "nexus_h0.db.bak-$(date +%s)"
-  [ -f h0_report.json ] && mv h0_report.json "h0_report.json.bak-$(date +%s)"
-  rm -f router_secret.txt
 fi
+[ -f h0_report.json ] && mv h0_report.json "h0_report.json.bak-$(date +%s)"
 [ -f jobs.jsonl ] || $PY gen_jobs.py
 
 # 4) Router + worker (killed at the end; Atenhea is left running)
