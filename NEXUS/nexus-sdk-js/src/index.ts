@@ -1,7 +1,7 @@
 import axios, { AxiosInstance } from 'axios';
 
 export interface NexusSDKConfig {
-  /** H0 runs on loopback and does not authenticate this key. */
+  /** Client token accepted by the FastAPI facade when NEXUS_API_TOKEN is set. */
   apiKey?: string;
   baseURL?: string;
   timeout?: number;
@@ -55,7 +55,7 @@ export class NexusClient {
 
   constructor(config: NexusSDKConfig = {}) {
     this.client = axios.create({
-      baseURL: (config.baseURL || 'http://127.0.0.1:18080').replace(/\/$/, ''),
+      baseURL: (config.baseURL || 'http://127.0.0.1:8000').replace(/\/$/, ''),
       timeout: config.timeout ?? 300_000,
       headers: {
         Accept: 'application/json',

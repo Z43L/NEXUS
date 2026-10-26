@@ -13,10 +13,11 @@ Or from the `NEXUS` directory use `python -m pip install ./nexus-sdk-python`.
 
 ```python
 import asyncio
+import os
 from nexus_client import NexusClient
 
 async def main():
-    async with NexusClient(base_url="http://127.0.0.1:18080") as nexus:
+    async with NexusClient(api_key=os.environ.get("NEXUS_API_TOKEN")) as nexus:
         result = await nexus.chat("Resume la historia de NEXUS", max_tokens=256)
         print(result["choices"][0]["message"]["content"])
 
@@ -35,6 +36,8 @@ client-level `timeout` can extend the transport deadline further.
 Run the client regression tests from the repository's `NEXUS` directory with
 `PYTHONPATH=./nexus-sdk-python python -m unittest discover -s nexus-sdk-python/tests -v`.
 
-H0 binds to loopback and does not authenticate API keys. Keep it local; do not
-expose it to the Internet. `api_key` is only sent as `X-API-Key` when an
-authenticated reverse proxy is configured in front of the gateway.
+The SDK defaults to the local FastAPI facade on port 8000. Start the H0 Router,
+then start `nexus/api/run_h0_api.sh` with `NEXUS_API_TOKEN` configured; the
+facade checks this client token and applies local quotas. Set `base_url` to
+`http://127.0.0.1:18080` only for trusted local development that intentionally
+bypasses the facade. Never embed a shared API token into browser code.

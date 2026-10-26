@@ -3,21 +3,32 @@ const assert = require('node:assert/strict');
 const axios = require('axios');
 
 let lastCall;
+let lastConfig;
 let nextError;
-axios.create = (config) => ({
-  defaults: { timeout: config.timeout },
-  post: async (...args) => {
-    lastCall = args;
-    if (nextError) {
-      const error = nextError;
-      nextError = undefined;
-      throw error;
-    }
-    return { data: { choices: [] } };
-  },
-});
+axios.create = (config) => {
+  lastConfig = config;
+  return {
+    defaults: { timeout: config.timeout },
+    post: async (...args) => {
+      lastCall = args;
+      if (nextError) {
+        const error = nextError;
+        nextError = undefined;
+        throw error;
+      }
+      return { data: { choices: [] } };
+    },
+  };
+};
 
 const { NexusAPIError, NexusClient } = require('../dist/index.js');
+
+test('defaults to the FastAPI facade and sends the configured client token', async () => {
+  const client = new NexusClient({ apiKey: 'client-token' });
+  await client.chat('hello');
+  assert.equal(lastConfig.baseURL, 'http://127.0.0.1:8000');
+  assert.equal(lastConfig.headers['X-API-Key'], 'client-token');
+});
 
 test('per-request HTTP deadline exceeds Router job deadline', async () => {
   const client = new NexusClient({ timeout: 30_000 });

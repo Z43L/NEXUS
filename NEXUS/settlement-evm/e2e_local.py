@@ -7,17 +7,19 @@ The RPC binds only to 127.0.0.1; this harness refuses non-loopback RPC URLs.
 """
 from __future__ import annotations
 
-import json
+import asyncio
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from batch_builder import keccak256
@@ -68,7 +70,7 @@ def contract_call(url: str, address: str, signature: str) -> bytes:
 
 
 def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], list[subprocess.Popen]]:
-    """Run the real H0 router, mock engine and signed worker for two jobs."""
+    """Run FastAPI, the real H0 router, mock engine and signed worker."""
     sys.path.insert(0, str(H0))
     import nexus_common as nc
     key_dir = directory / "node-key"
@@ -82,9 +84,12 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             return sock.getsockname()[1]
-    mock_port, router_port = free_port(), free_port()
+    mock_port, router_port, api_port = free_port(), free_port(), free_port()
     router_url = f"http://127.0.0.1:{router_port}"
-    logs = [directory / "mock.log", directory / "router.log", directory / "worker.log"]
+    api_url = f"http://127.0.0.1:{api_port}"
+    api_token = "nexus-e2e-" + os.urandom(24).hex()
+    logs = [directory / "mock.log", directory / "router.log", directory / "worker.log",
+            directory / "api.log"]
     streams = [path.open("w+") for path in logs]
     procs = [
         subprocess.Popen([sys.executable, str(H0 / "mock_atenea.py"), "--port", str(mock_port)],
@@ -115,37 +120,65 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
             raise RuntimeError("H0 Router did not become ready")
         # Wait until the worker has registered its signing key.
         for _ in range(100):
-            with __import__("sqlite3").connect(directory / "nexus_h0.db") as conn:
+            with sqlite3.connect(directory / "nexus_h0.db") as conn:
                 if conn.execute("SELECT 1 FROM nodes WHERE node_id=?", (node_id,)).fetchone():
                     break
             time.sleep(0.1)
         else:
             raise RuntimeError("H0 worker did not register")
-        jobs = [
-            {"kind": "inference", "model": "athenea-e2b", "nram": ["author_e2e_test"],
-             "messages": [{"role": "user", "content": "E2E settlement job one"}],
-             "params": {"max_tokens": 3}},
-            {"kind": "inference", "model": "athenea-e2b", "nram": [],
-             "messages": [{"role": "user", "content": "E2E settlement job two"}],
-             "params": {"max_tokens": 3}},
-        ]
-        for job in jobs:
-            request = Request(router_url + "/jobs", data=json.dumps(job).encode(),
-                              headers={"Content-Type": "application/json"})
-            with urlopen(request, timeout=5) as response:
-                job_id = json.loads(response.read())["job_id"]
-            for _ in range(200):
-                with urlopen(router_url + f"/jobs/{job_id}", timeout=2) as response:
-                    status = json.loads(response.read())
-                if status["status"] == "done":
-                    if not status.get("verified"):
-                        raise RuntimeError(f"Router did not verify receipt for {job_id}")
-                    break
-                if status["status"] in ("failed", "rejected"):
-                    raise RuntimeError(f"H0 job failed: {status}")
+        api_env = {
+            **os.environ,
+            "NEXUS_H0_ROUTER_URL": router_url,
+            "NEXUS_API_TOKEN": api_token,
+            "NEXUS_API_RATE_LIMIT_PER_MINUTE": "60",
+        }
+        procs.append(subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "nexus.api.core.api_server:app",
+             "--host", "127.0.0.1", "--port", str(api_port)],
+            cwd=ROOT.parent, env=api_env, stdout=streams[3], stderr=subprocess.STDOUT,
+        ))
+        for _ in range(100):
+            if procs[-1].poll() is not None:
+                streams[3].flush()
+                streams[3].seek(0)
+                raise RuntimeError("FastAPI exited during startup:\n" + streams[3].read())
+            try:
+                with urlopen(api_url + "/ready", timeout=0.5) as response:
+                    if response.status == 200 and json.loads(response.read()).get("success"):
+                        break
+            except (URLError, TimeoutError, OSError):
                 time.sleep(0.1)
-            else:
-                raise RuntimeError(f"H0 job timed out: {job_id}")
+        else:
+            raise RuntimeError("FastAPI facade did not become ready")
+
+        # The public client path must reject an absent token before the Router
+        # creates a job. Then use the Python SDK through the authenticated API.
+        unauthorized_payload = json.dumps({
+            "model": "athenea-e2b", "messages": [{"role": "user", "content": "must be rejected"}],
+            "max_tokens": 3,
+        }).encode()
+        try:
+            with urlopen(Request(api_url + "/v1/chat/completions", data=unauthorized_payload,
+                                 headers={"Content-Type": "application/json"}), timeout=5):
+                raise RuntimeError("FastAPI accepted a chat request without its client token")
+        except HTTPError as exc:
+            if exc.code != 401:
+                raise RuntimeError(f"FastAPI unauthenticated request returned HTTP {exc.code}") from exc
+
+        sys.path.insert(0, str(ROOT.parent / "nexus-sdk-python"))
+        from nexus_client import NexusClient
+        client = NexusClient(api_key=api_token, base_url=api_url, timeout=310)
+        for text in ("E2E settlement job one", "E2E settlement job two"):
+            completion = asyncio.run(client.chat(text, model="athenea-e2b", max_tokens=3, timeout_s=300))
+            job_id = completion.get("id")
+            if not isinstance(job_id, str) or not job_id.startswith("job_"):
+                raise RuntimeError(f"Authenticated API returned no Router job ID: {completion}")
+            with sqlite3.connect(directory / "nexus_h0.db") as conn:
+                job_row = conn.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+                receipt_row = conn.execute("SELECT verified FROM receipts WHERE job_id=?", (job_id,)).fetchone()
+            if job_row != ("done",) or receipt_row != (1,):
+                row = (job_row, receipt_row)
+                raise RuntimeError(f"FastAPI -> Router -> worker job was not verified: {job_id} {row}")
         db_path = directory / "nexus_h0.db"
     except Exception:
         for proc in reversed(procs):

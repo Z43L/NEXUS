@@ -6,7 +6,7 @@ from urllib.error import HTTPError
 from urllib.request import Request
 from unittest.mock import patch
 
-from nexus_client import NexusAPIError, NexusClient
+from nexus_client import DEFAULT_BASE_URL, NexusAPIError, NexusClient
 
 
 class _Response:
@@ -29,6 +29,14 @@ class NexusClientTests(unittest.TestCase):
             asyncio.run(client.chat("hello"))
         payload = json.loads(open_url.call_args.args[0].data.decode("utf-8"))
         self.assertEqual(payload["model"], "")
+        self.assertEqual(DEFAULT_BASE_URL, "http://127.0.0.1:8000")
+
+    def test_client_token_is_sent_to_the_facade_as_api_key(self):
+        client = NexusClient(api_key="client-token")
+        with patch("nexus_client.urlopen", return_value=_Response()) as open_url:
+            asyncio.run(client.chat("hello"))
+        self.assertEqual(open_url.call_args.args[0].full_url, "http://127.0.0.1:8000/v1/chat/completions")
+        self.assertEqual(open_url.call_args.args[0].get_header("X-api-key"), "client-token")
 
     def test_request_deadline_covers_router_deadline(self):
         client = NexusClient(timeout=30)

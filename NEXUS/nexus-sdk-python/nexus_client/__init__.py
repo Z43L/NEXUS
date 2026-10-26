@@ -9,7 +9,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-DEFAULT_BASE_URL = "http://127.0.0.1:18080"
+DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 
 
 class NexusAPIError(RuntimeError):
@@ -24,9 +24,9 @@ class NexusAPIError(RuntimeError):
 class NexusClient:
     """Async client for `POST /v1/chat/completions`.
 
-    H0 is intended for loopback use and does not authenticate API keys. The
-    optional `api_key` argument is reserved for deployments with an
-    authenticated reverse proxy in front of the router.
+    By default requests go through the FastAPI facade on loopback, which can
+    require `NEXUS_API_TOKEN`. Set `base_url` to the Router URL only for a
+    trusted local development setup that intentionally bypasses that facade.
     """
 
     def __init__(self, api_key: Optional[str] = None,

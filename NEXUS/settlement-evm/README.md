@@ -54,13 +54,17 @@ The local integration harness starts the actual H0 Router, mock Atenhea engine,
 and signed worker as separate processes. It submits two jobs through the Router,
 waits for the Router to verify the worker's Ed25519 receipts, invokes
 `receipt_to_batch.py` against the resulting Router database, starts a disposable
-Anvil node bound exclusively to `127.0.0.1`, deploys a test-only mock ERC-20 and
-the escrow, then runs `PublishSettlementBatch.s.sol` with a payer key separate
+Anvil node bound exclusively to `127.0.0.1`, starts an authenticated FastAPI
+facade in front of the Router, confirms that a missing client token gets HTTP
+401, and sends both jobs using the Python SDK through FastAPI → Router → worker.
+It deploys a test-only mock ERC-20 and the escrow, then runs
+`PublishSettlementBatch.s.sol` with a payer key separate
 from the configured gateway signer. It checks the batch context, approved
 policy hash, token decimals, payout addresses, signer identity, payer balance,
 funding cap, unique batch and claim deadline before broadcasting approve/fund
 from the payer and publish from the signer. A separate call then runs
-`claimMany`. It checks exact aggregate node and author balances, verification,
+`claimMany`. These API-created test jobs have no NRAM royalty; it checks the
+node, verification,
 burn-sink and treasury balances, and zero remaining escrow. The test policy uses
 an explicit synthetic token price and wallet mapping; all generated files are
 removed with the temporary directory after the run.

@@ -12,6 +12,13 @@ If it is unset, the launcher remains a loopback-only development service.
 `/health` and `/ready` are exempt for local process supervision; all other
 routes, including `/v1/models`, require the configured token.
 
+The Python and TypeScript SDKs default to `http://127.0.0.1:8000`, the FastAPI
+facade. Pass the configured token as `api_key` / `apiKey`; both send
+`X-API-Key`. Direct access to the Router on port 18080 is for trusted local
+development and bypasses this facade's client-token and quota checks. The
+separate HTML UI served by `nexus-web/h0_local.py` remains loopback-only and
+connects directly to the Router.
+
 For an H0 Router running in remote/authenticated mode, set
 `NEXUS_H0_CLIENT_TOKEN` to its client token. This service credential is sent to
 the Router and takes precedence over the caller's bearer token. If it is

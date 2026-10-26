@@ -1,11 +1,11 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useMemo } from 'react';
 import NexusClient from '@nexus-network/sdk';
 
 const ChatInterface = ({ apiKey }) => {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const client = useRef(new NexusClient({ apiKey }));
+  const client = useMemo(() => new NexusClient({ apiKey }), [apiKey]);
 
   const handleSend = async () => {
     if (!input.trim()) return;
@@ -22,7 +22,7 @@ const ChatInterface = ({ apiKey }) => {
     
     try {
       const newMessages = [...messages, userMessage];
-      const completion = await client.current.chat(newMessages);
+      const completion = await client.chat(newMessages);
       const answer = completion.choices?.[0]?.message?.content || '';
       setMessages(prev => [...prev, {
         role: 'assistant',
