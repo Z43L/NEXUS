@@ -273,6 +273,14 @@ class Worker:
                                       "dispatch_jwt": job.get("dispatch_jwt", "")})
             print(f"[{job_id}] rejected: tools requested", flush=True)
             return
+        # This worker has no engine adapter directory, so it must never sign a
+        # receipt that claims a .nram. Use nexus/h0/worker_agent.py --engine-adapter-dir.
+        if job.get("nram"):
+            self.post_result(job_id, {"status": "rejected",
+                                      "error": "nram_unsupported_by_engine",
+                                      "dispatch_jwt": job.get("dispatch_jwt", "")})
+            print(f"[{job_id}] rejected: nram requested but worker has no adapter support", flush=True)
+            return
         started = time.time()
         started_iso = nc.utc_now_iso()
         model_id = nc.resolve_model(job.get("model", ""), self.models)

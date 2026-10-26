@@ -79,7 +79,8 @@ def request(url, data=None, headers=None, method=None):
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
+        with exc:
+            return exc.code, exc.read()
 
 
 class RouterRegistryTests(unittest.TestCase):
@@ -168,6 +169,84 @@ class RouterRegistryTests(unittest.TestCase):
         status, body = request(self.url + "/ledger/summary")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["royalties_micro_usd_by_author"], {})
+
+
+class WorkerAdapterTests(unittest.TestCase):
+    """A .nram job must be refused when the engine does not confirm the adapter.
+
+    The mock engine ignores nram_adapter, so the worker must not sign a receipt
+    that would pay the author for weights nobody applied.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        root = Path(cls.tmp.name)
+        cls.mock_port, cls.router_port = free_port(), free_port()
+        cls.router = f"http://127.0.0.1:{cls.router_port}"
+        cls.procs = [
+            subprocess.Popen([sys.executable, str(BASE / "mock_atenea.py"),
+                              "--port", str(cls.mock_port)]),
+            subprocess.Popen([sys.executable, str(BASE / "router.py"),
+                              "--port", str(cls.router_port), "--dir", str(root / "router")]),
+        ]
+        wait_for(lambda: request(cls.router + "/health")[0] == 200)
+        cls.procs.append(subprocess.Popen(
+            [sys.executable, str(BASE / "worker_agent.py"), "--router", cls.router,
+             "--atenea", f"http://127.0.0.1:{cls.mock_port}",
+             "--node-dir", str(root / "node"), "--engine-adapter-dir", str(root / "adapters")]))
+        cls.model = wait_for(lambda: first_model(cls.router))
+
+    @classmethod
+    def tearDownClass(cls):
+        for proc in cls.procs:
+            proc.terminate()
+        for proc in cls.procs:
+            proc.wait(timeout=10)
+        cls.tmp.cleanup()
+
+    def test_job_with_unapplied_adapter_is_rejected(self):
+        data = build_bundle(name="expert-worker")
+        status, _ = request(self.router + "/nram", data=data, method="POST",
+                            headers={"Content-Type": "application/octet-stream",
+                                     "X-Nexus-Client-ID": "alice"})
+        self.assertEqual(status, 201)
+        payload = {"kind": "inference", "model": self.model, "nram": [nr.bundle_id(data)],
+                   "messages": [{"role": "user", "content": "hola"}],
+                   "params": {"max_tokens": 8}}
+        status, body = request(self.router + "/jobs", data=json.dumps(payload).encode(),
+                               headers={"Content-Type": "application/json"}, method="POST")
+        self.assertEqual(status, 200)
+        job_id = json.loads(body)["job_id"]
+        job = wait_for(lambda: finished_job(self.router, job_id), seconds=60)
+        self.assertEqual(job["status"], "rejected")
+        self.assertEqual(job["error"], "nram_not_applied")
+        self.assertIsNone(job.get("receipt"))
+
+
+def wait_for(check, seconds=30):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            value = check()
+            if value:
+                return value
+        except OSError:
+            pass
+        time.sleep(0.2)
+    raise RuntimeError("condition not reached in time")
+
+
+def first_model(router):
+    status, body = request(router + "/v1/models")
+    data = json.loads(body)["data"] if status == 200 else []
+    return data[0]["id"] if data else None
+
+
+def finished_job(router, job_id):
+    status, body = request(f"{router}/jobs/{job_id}")
+    job = json.loads(body) if status == 200 else {}
+    return job if job.get("status") in ("rejected", "failed", "done") else None
 
 
 if __name__ == "__main__":

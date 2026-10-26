@@ -56,7 +56,11 @@ def save_bundle(path: str | Path, manifest: dict[str, Any], tensors: dict[str, t
 
 
 def load_bundle(path: str | Path) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
-    raw = Path(path).read_bytes()
+    return parse_bundle(Path(path).read_bytes())
+
+
+def parse_bundle(raw: bytes) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+    """Validate and decode an NRA-M v2 container already held in memory."""
     prefix_len = len(MAGIC) + HEADER.size
     if len(raw) < prefix_len or raw[: len(MAGIC)] != MAGIC:
         raise NRAMContainerError("Invalid NRA-M v2 magic/header")

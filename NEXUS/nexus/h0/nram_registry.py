@@ -63,11 +63,10 @@ def bundle_id(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def store_bundle(base: Path, nram_id: str, data: bytes) -> Path:
-    """Write the bundle atomically under <base>/nram/<id>.nram (mode 0644)."""
+def store_bundle(folder: Path, nram_id: str, data: bytes) -> Path:
+    """Write the bundle atomically as <folder>/<id>.nram (mode 0644)."""
     if not ID_RE.fullmatch(nram_id):
         raise NramError("invalid bundle id")
-    folder = base / "nram"
     folder.mkdir(parents=True, exist_ok=True)
     target = folder / f"{nram_id}.nram"
     fd, tmp_name = tempfile.mkstemp(prefix=f".{nram_id}.", suffix=".tmp", dir=folder)
@@ -87,10 +86,10 @@ def store_bundle(base: Path, nram_id: str, data: bytes) -> Path:
     return target
 
 
-def read_bundle(base: Path, nram_id: str) -> bytes:
+def read_bundle(folder: Path, nram_id: str) -> bytes:
     if not ID_RE.fullmatch(nram_id):
         raise NramError("invalid bundle id")
-    data = (base / "nram" / f"{nram_id}.nram").read_bytes()
+    data = (folder / f"{nram_id}.nram").read_bytes()
     if bundle_id(data) != nram_id:
         raise NramError("stored bundle does not match its id")
     return data

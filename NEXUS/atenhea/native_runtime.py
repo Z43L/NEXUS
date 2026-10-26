@@ -1,6 +1,7 @@
 """Onram direct Transformers/NRAM runtime with transactional in-memory micro-updates."""
 from __future__ import annotations
 import argparse
+import contextlib
 import copy
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -21,13 +22,14 @@ from inference_settings import enabled as summary_enabled,public_messages
 from prefix_cache import PrefixCache,stable_prefix_length
 from native_placement import place_native
 from micro_extensions import load_extension
+from nram_adapters import AdapterSlot
 from native_protocol import messages_for, response_for, LiveStream
 
 ROOT=Path(__file__).resolve().parent
 
 
 class NativeEngine:
-    def __init__(self,bundle,model_name='athenea-e2b:latest',device='auto',ctx_size=0):
+    def __init__(self,bundle,model_name='athenea-e2b:latest',device='auto',ctx_size=0,adapter_dir=None):
         self.lock=threading.RLock();self.name=model_name;self.bundle=Path(bundle)
         self.executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='atenhea-inference')
         self.activity={'state':'idle'};self.loaded_at=time.time()
@@ -47,12 +49,19 @@ class NativeEngine:
         self.extension_path=Path(self.manifest['micro_extension']['path']) if self.manifest.get('micro_extension') else None
         self.micro_manifest=load_bundle(self.extension_path)[0] if self.extension_path else None
         self.version=self.micro_manifest['version'] if self.micro_manifest else 0
-        print(json.dumps({'event':'native_loaded','device':self.device,'bundle':str(bundle),'micro_version':self.version}),flush=True)
+        self.adapter_slot=None
+        if adapter_dir:
+            if not self.micro_manifest or not hasattr(self.model,'onram_micro_extensions'):
+                raise ValueError('--adapter-dir requires a bundle with an attached micro-extension slot')
+            self.adapter_slot=AdapterSlot(self.model.onram_micro_extensions,self.micro_manifest,adapter_dir)
+        print(json.dumps({'event':'native_loaded','device':self.device,'bundle':str(bundle),'micro_version':self.version,
+                          'nram_adapters':bool(self.adapter_slot)}),flush=True)
 
     def health(self):
         return {'loaded':True,'backend':'nram','device':self.device,'model':self.name,
                 'bundle':str(self.bundle),'micro_version':self.version,
                 'base_weights_frozen':True,
+                'nram_adapters':self.adapter_slot.installed() if getattr(self,'adapter_slot',None) else None,
                 'show_reasoning_summary':summary_enabled(),
                 'reasoning_display':'brief_public_explanation',
                 'prefix_cache':self.prefix_cache.status(),'placement':self.placement,
@@ -80,8 +89,16 @@ class NativeEngine:
     def _generate(self,path,body,emit=None,cancel=None):
         with self.lock:
             self.activity={'state':'preparing','started_at':time.time()}
-            try:return self._generate_locked(path,body,emit,cancel)
+            try:
+                with self._adapter_scope(body.get('nram_adapter')):
+                    return self._generate_locked(path,body,emit,cancel)
             finally:self.activity={'state':'idle'}
+
+    def _adapter_scope(self,adapter_id):
+        if not adapter_id:return contextlib.nullcontext()
+        if getattr(self,'adapter_slot',None) is None:
+            raise ValueError('engine has no adapter slot; start it with --adapter-dir and a micro-extension bundle')
+        return self.adapter_slot.applied(adapter_id)
 
     def _generate_locked(self,path,body,emit=None,cancel=None):
             previous=body.get('previous_response_id')
@@ -146,7 +163,8 @@ class NativeEngine:
             started=time.perf_counter();first_token=None
             cache_info={'hit':False,'tokens':0}
             cache=getattr(self,'prefix_cache',None)
-            if cache is not None:
+            # KV entries depend on the adapter, so adapter requests never reuse or fill the cache.
+            if cache is not None and not body.get('nram_adapter'):
                 prefix_length=stable_prefix_length(prepared_messages,tools,self.render,self.tokenizer,
                     encoded['input_ids'][0].detach().cpu().tolist())
                 self.activity['phase']='prefix_cache'
@@ -194,6 +212,9 @@ class NativeEngine:
                                  'prefix_cache_hit':cache_info['hit'],
                                  'cached_prefix_tokens':cache_info['tokens'],
                                  'reused_prefix_tokens':cache_info['tokens'] if cache_info['hit'] else 0}
+            if body.get('nram_adapter'):
+                # Echo the adapter actually applied so the worker can refuse to bill an unused one.
+                response['onram_nram_adapter']=body['nram_adapter']
             if live:
                 for item in final_events:emit(item)
             return response
@@ -355,9 +376,11 @@ def main():
     parser.add_argument('--model-name',default='athenea-e2b:latest')
     parser.add_argument('--device',default='auto',choices=['auto','cpu','mps','cuda'])
     parser.add_argument('--ctx-size',type=int,default=0)
+    parser.add_argument('--adapter-dir',type=Path,default=None,
+        help='directory of verified <sha256>.nram adapters that requests may select with nram_adapter')
     args=parser.parse_args()
     torch.set_num_threads(4)
-    engine=NativeEngine(args.bundle,args.model_name,args.device,args.ctx_size)
+    engine=NativeEngine(args.bundle,args.model_name,args.device,args.ctx_size,args.adapter_dir)
     ThreadingHTTPServer(('127.0.0.1',args.port),handler_for(engine)).serve_forever()
 
 

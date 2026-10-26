@@ -20,6 +20,7 @@ import urllib.error
 from pathlib import Path
 
 import nexus_common as nc
+import nram_registry as nr
 
 BASE = Path(__file__).resolve().parent
 
@@ -33,10 +34,10 @@ def http_json(url: str, payload: dict | None = None, timeout=600) -> dict:
 
 
 class Worker:
-    def __init__(self, router: str, atenea: str, node_dir: Path, nram_capable: bool = False):
+    def __init__(self, router: str, atenea: str, node_dir: Path, adapter_dir: Path | None = None):
         self.router = router.rstrip("/")
         self.atenea = atenea.rstrip("/")
-        self.nram_capable = nram_capable
+        self.adapter_dir = adapter_dir
         self.priv, self.pub_pem, self.node_id = nc.load_or_create_node_key(node_dir)
         self.model_id = None
         self.models: list[str] = []
@@ -90,7 +91,22 @@ class Worker:
             "max_tokens": min(int(params.get("max_tokens", 220)), 4096),
             "stream": False,
         }
+        if job.get("nram"):
+            payload["nram_adapter"] = job["nram"][0]
         return http_json(self.atenea + "/v1/chat/completions", payload, timeout=1200)
+
+    def ensure_adapter(self, adapter_id: str) -> None:
+        """Fetch a published .nram once and verify it before the engine may read it."""
+        target = self.adapter_dir / f"{adapter_id}.nram"
+        if target.exists():
+            nr.read_bundle(self.adapter_dir, adapter_id)  # re-verify the cached copy
+            return
+        with urllib.request.urlopen(f"{self.router}/nram/{adapter_id}/blob", timeout=120) as resp:
+            data = resp.read()
+        if nr.bundle_id(data) != adapter_id:
+            raise nr.NramError("downloaded bundle does not match its id")
+        nr.inspect_bundle(data)
+        nr.store_bundle(self.adapter_dir, adapter_id, data)
 
     # -- Router ----------------------------------------------------------------
     def calibrate_scaffolding(self) -> int:
@@ -152,15 +168,26 @@ class Worker:
                                       "dispatch_jwt": job.get("dispatch_jwt", "")})
             print(f"[{job_id}] rejected: tools requested", flush=True)
             return
-        # H2: a receipt may only claim a .nram the engine really applied. The
-        # engine has no per-request adapter selection yet, so refuse instead of
-        # signing a receipt that would pay an author for unused weights.
-        if job.get("nram") and not self.nram_capable:
-            self.post_result(job_id, {"status": "rejected",
-                                      "error": "nram_unsupported_by_engine",
-                                      "dispatch_jwt": job.get("dispatch_jwt", "")})
-            print(f"[{job_id}] rejected: nram requested but engine cannot apply it", flush=True)
-            return
+        # H2: a receipt may only claim a .nram the engine really applied.
+        nram = job.get("nram") or []
+        if nram:
+            if self.adapter_dir is None:
+                self.post_result(job_id, {"status": "rejected",
+                                          "error": "nram_unsupported_by_engine",
+                                          "dispatch_jwt": job.get("dispatch_jwt", "")})
+                print(f"[{job_id}] rejected: nram requested but no engine adapter dir", flush=True)
+                return
+            try:
+                self.ensure_adapter(nram[0])
+            except nr.NramError as exc:
+                self.post_result(job_id, {"status": "rejected", "error": f"nram_invalid: {exc}",
+                                          "dispatch_jwt": job.get("dispatch_jwt", "")})
+                print(f"[{job_id}] rejected: {exc}", flush=True)
+                return
+            except (urllib.error.URLError, OSError) as exc:
+                self.post_result(job_id, {"status": "retry", "error": f"nram_fetch: {exc}",
+                                          "dispatch_jwt": job.get("dispatch_jwt", "")})
+                return
         started = time.time()
         started_iso = nc.utc_now_iso()
         model_id = nc.resolve_model(job.get("model", ""), self.models)
@@ -178,7 +205,12 @@ class Worker:
             meter_source = "engine_usage_fallback"
         else:
             meter_source = "engine_tokenizer_endpoint"
-        nram_used = bool(job.get("nram"))
+        if nram and resp.get("onram_nram_adapter") != nram[0]:
+            self.post_result(job_id, {"status": "rejected", "error": "nram_not_applied",
+                                      "dispatch_jwt": job.get("dispatch_jwt", "")})
+            print(f"[{job_id}] rejected: engine did not confirm the adapter", flush=True)
+            return
+        nram_used = bool(nram)
         price = nc.price_micro_usd(counted_in, eng_out)
         receipt = {
             "job_id": job_id,
@@ -253,11 +285,11 @@ def main():
     ap.add_argument("--atenea", default="http://127.0.0.1:11436",
                     help="Atenhea ENGINE base URL (not the :11434 agent proxy)")
     ap.add_argument("--node-dir", default=str(BASE / "node"))
-    ap.add_argument("--nram-capable", action="store_true",
-                    help="declare that the engine applies .nram adapters per request")
+    ap.add_argument("--engine-adapter-dir", default=None,
+                    help="directory the engine reads with --adapter-dir; enables .nram jobs")
     args = ap.parse_args()
-    Worker(args.router, args.atenea, Path(args.node_dir),
-           nram_capable=args.nram_capable).serve_forever()
+    adapter_dir = Path(args.engine_adapter_dir) if args.engine_adapter_dir else None
+    Worker(args.router, args.atenea, Path(args.node_dir), adapter_dir).serve_forever()
 
 
 if __name__ == "__main__":

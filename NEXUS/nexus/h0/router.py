@@ -466,7 +466,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "not found"}, 404)
             if len(parts) == 4 and parts[3] == "blob":
                 try:
-                    data = nr.read_bundle(_db_path.parent, nram_id)
+                    data = nr.read_bundle(_db_path.parent / "nram", nram_id)
                 except (OSError, nr.NramError):
                     return self._json({"error": "bundle file is missing or corrupt"}, 500)
                 self.send_response(200)
@@ -692,7 +692,7 @@ class Handler(BaseHTTPRequestHandler):
         with _lock, db() as conn:
             if conn.execute("SELECT 1 FROM nram_assets WHERE nram_id=?", (nram_id,)).fetchone():
                 return self._json({"error": "already_published", "nram_id": nram_id}, 409)
-            nr.store_bundle(_db_path.parent, nram_id, data)
+            nr.store_bundle(_db_path.parent / "nram", nram_id, data)
             conn.execute("INSERT INTO nram_assets VALUES(?,?,?,?,?,?,?)",
                          (nram_id, author, info["name"], info["version"], info["size_bytes"],
                           json.dumps(info["manifest"], sort_keys=True), nc.utc_now_iso()))

@@ -229,7 +229,9 @@ class Onram:
         self.backend = subprocess.Popen(
             [sys.executable, str(ROOT / "native_runtime.py"), "--bundle", str(self.bundle),
              "--port", str(self.backend_port), "--model-name", self.model_name,
-             "--ctx-size", str(self.ctx_size)], cwd=ROOT,
+             "--ctx-size", str(self.ctx_size),
+             *(["--adapter-dir", os.environ["NEXUS_NRAM_ADAPTER_DIR"]]
+               if os.environ.get("NEXUS_NRAM_ADAPTER_DIR") else [])], cwd=ROOT,
             stdout=self.backend_log, stderr=subprocess.STDOUT, text=True)
         deadline = time.monotonic() + 600
         try:
