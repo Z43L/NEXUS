@@ -1,4 +1,4 @@
-# Separate from docker-compose.yml: this is the H0/H1 Router + worker path.
+# H0 product path: authenticated API -> private TLS Router -> H1 worker.
 # Atenhea is intentionally external and must be reachable at ATENHEA_URL.
 services:
   router:
@@ -36,8 +36,6 @@ services:
     pids_limit: 128
     restart: unless-stopped
     stop_grace_period: 30s
-    ports:
-      - "127.0.0.1:${ROUTER_HOST_PORT:-18090}:18080"
     volumes:
       - ./data/h0-router:/var/lib/nexus
     secrets:
@@ -112,6 +110,57 @@ services:
     networks:
       - h0-private
 
+  api:
+    build:
+      context: .
+      dockerfile: nexus/api/Dockerfile
+    image: nexus-h0-api:local
+    command: ["--host", "0.0.0.0", "--port", "8000", "--no-server-header"]
+    environment:
+      NEXUS_H0_ROUTER_URL: https://router:18080
+      NEXUS_H0_ROUTER_CA_FILE: /run/secrets/router_ca
+      NEXUS_H0_CLIENT_TOKEN_FILE: /run/secrets/client_token
+      NEXUS_API_TOKEN_FILE: /run/secrets/api_token
+      NEXUS_API_RATE_LIMIT_PER_MINUTE: "60"
+      NEXUS_API_MAX_BODY_BYTES: "1048576"
+      NEXUS_API_MAX_INFLIGHT_INFERENCES: "8"
+    user: "${NEXUS_UID:?Set NEXUS_UID in .env.h0}:${NEXUS_GID:?Set NEXUS_GID in .env.h0}"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
+    secrets:
+      - source: router_ca
+        target: router_ca
+      - source: client_token
+        target: client_token
+      - source: api_token
+        target: api_token
+    depends_on:
+      worker:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json,urllib.request;
+          d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/ready',timeout=5));
+          raise SystemExit(0 if d.get('success') else 1)
+      interval: 20s
+      timeout: 8s
+      retries: 3
+      start_period: 30s
+    networks:
+      - h0-private
+
 secrets:
   router_cert:
     file: ./.secrets/router.crt
@@ -123,6 +172,8 @@ secrets:
     file: ./.secrets/client.token
   enrollment_token:
     file: ./.secrets/enrollment.token
+  api_token:
+    file: ./.secrets/api.token
 
 networks:
   h0-private:

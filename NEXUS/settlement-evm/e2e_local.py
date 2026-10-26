@@ -20,6 +20,8 @@ import sys
 import tempfile
 import time
 from urllib.error import HTTPError, URLError
+from http.client import HTTPConnection
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from batch_builder import keccak256
@@ -164,6 +166,19 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
         except HTTPError as exc:
             if exc.code != 401:
                 raise RuntimeError(f"FastAPI unauthenticated request returned HTTP {exc.code}") from exc
+
+        api_address = urlsplit(api_url)
+        oversized = HTTPConnection(api_address.hostname, api_address.port, timeout=5)
+        oversized.putrequest("POST", "/v1/chat/completions")
+        oversized.putheader("X-API-Key", api_token)
+        oversized.putheader("Content-Type", "application/json")
+        oversized.putheader("Content-Length", str(1_048_576 + 1))
+        oversized.endheaders()
+        oversized_response = oversized.getresponse()
+        oversized_status = oversized_response.status
+        oversized.close()
+        if oversized_status != 413:
+            raise RuntimeError(f"FastAPI oversized request returned HTTP {oversized_status}")
 
         sys.path.insert(0, str(ROOT.parent / "nexus-sdk-python"))
         from nexus_client import NexusClient

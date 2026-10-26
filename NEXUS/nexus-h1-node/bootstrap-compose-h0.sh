@@ -31,7 +31,8 @@ chmod 600 "$ENV_FILE"
 
 openssl rand -hex 32 > "$SECRETS_DIR/client.token"
 openssl rand -hex 32 > "$SECRETS_DIR/enrollment.token"
-chmod 600 "$SECRETS_DIR/client.token" "$SECRETS_DIR/enrollment.token"
+openssl rand -hex 32 > "$SECRETS_DIR/api.token"
+chmod 600 "$SECRETS_DIR/client.token" "$SECRETS_DIR/enrollment.token" "$SECRETS_DIR/api.token"
 
 # The CA private key never enters either container. Cert SANs support internal
 # worker-to-router TLS and host clients using https://localhost.
@@ -59,5 +60,6 @@ chown -R "$UID_VALUE:$GID_VALUE" "$SECRETS_DIR" "$DATA_DIR"
 
 echo "Created .env.h0 and private .secrets/ + data/ directories."
 echo "Edit ATENHEA_URL and, if needed, the subnet/router address in .env.h0."
+echo "The API client token is in .secrets/api.token; the Router token stays server-side."
 echo "If changing NEXUS_ROUTER_IP, reissue router.crt with that IP in its SAN."
 echo "Keep .secrets/ca.key offline; securely back up the Router and node data."

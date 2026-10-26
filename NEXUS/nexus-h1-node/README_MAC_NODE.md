@@ -120,8 +120,8 @@ o testnet.
 ## Router + worker en Docker Compose
 
 La ruta Compose se define en `NEXUS/compose.h0.yml`, separada del stack
-heredado `NEXUS/docker-compose.yml`. Construye una imagen pequeña que contiene
-solo el Router H0, el worker H1 y sus módulos compartidos. Atenhea no se
+heredado `NEXUS/docker-compose.yml`. Construye imágenes mínimas para FastAPI y
+para Router/worker H1. Atenhea no se
 construye ni se inicia en Docker: `ATENHEA_URL` es obligatorio y debe apuntar
 al **engine API** (`/v1/models`, `/v1/chat/completions`), no al proxy de agentes
 `:11434`. En Docker Desktop se puede probar `http://host.docker.internal:11436`;
@@ -139,11 +139,11 @@ Desde la carpeta `NEXUS`:
 # Edita .env.h0 y configura ATENHEA_URL. Si cambias la IP/subred del Router,
 # genera un certificado cuyo SAN contenga DNS:router, DNS:localhost y la IP.
 docker compose --env-file .env.h0 -f compose.h0.yml config --quiet
-docker compose --env-file .env.h0 -f compose.h0.yml up -d --build
+docker compose --env-file .env.h0 -f compose.h0.yml up -d --build --wait --wait-timeout 300
 docker compose --env-file .env.h0 -f compose.h0.yml ps
 ```
 
-El bootstrap crea tokens aleatorios de cliente y enrolamiento, una CA privada y
+El bootstrap crea tokens aleatorios de API, Router y enrolamiento, una CA privada y
 certificado TLS del Router. Los ficheros se guardan bajo `.secrets/` con modo
 `0600`; `.secrets/`, `.env.h0` y `data/` están excluidos de Git y del contexto
 Docker. El proceso del Router y del worker corre con el UID/GID del operador.
@@ -155,22 +155,51 @@ del nodo requiere enrolar una clave nueva.
 
 El Router usa TLS 1.2+, exige bearer token para chat/modelos y un token de
 enrolamiento para nuevas claves. El worker confía en la CA privada y envía el
-token de enrolamiento durante el registro. El puerto se publica únicamente en
-`127.0.0.1:18090` (cambiable con `ROUTER_HOST_PORT`), aunque el Router enlaza
-su IP estática privada en el bridge para la comunicación entre contenedores.
-Asegura que `NEXUS_H0_SUBNET` no colisione con rutas Docker/VPN del host. El
+token de enrolamiento durante el registro. El Router no publica un puerto al
+host: solo la API autenticada y ligada a loopback queda accesible en
+`127.0.0.1:8000` (cambiable con `API_HOST_PORT`). Asegura que
+`NEXUS_H0_SUBNET` no colisione con rutas Docker/VPN del host. El
 certificado inicial contiene `router`, `localhost`, `127.0.0.1` y la IP
 predeterminada `172.30.240.2`; si se cambia esta IP hay que reemitirlo.
 
-El endpoint local es `https://localhost:18090`; valida TLS con `.secrets/ca.crt`
-y envía `.secrets/client.token` como bearer a `/v1/chat/completions` y
-`/v1/models`. No imprimas ni incluyas el contenido de los tokens en logs o
-líneas de comandos. `/ready` y los healthchecks comprueban la disponibilidad
-del Router. El worker escribe un marcador de readiness solo tras descubrir el
+El endpoint local de producto es `http://127.0.0.1:8000`; lee el token de
+cliente de `.secrets/api.token` y úsalo como bearer desde un cliente local. La
+API presenta `.secrets/client.token` al Router por HTTPS dentro de la red
+privada y valida `.secrets/ca.crt`. No imprimas ni incluyas el contenido de
+ninguno de los tokens en logs o líneas de comandos. `/ready` y los healthchecks
+comprueban la disponibilidad del Router. El worker escribe un marcador de readiness solo tras descubrir el
 modelo y registrarse; cada heartbeat correcto mantiene el marcador fresco, y
 el healthcheck también comprueba los modelos anunciados por Atenhea. Docker
 marca un servicio unhealthy, pero la política `restart` no reinicia solo por
 estado unhealthy. SQLite en volumen local es una instancia única, no HA.
+
+Smoke de chat por la entrada autenticada (el token se lee dentro del proceso y
+no se imprime):
+
+```sh
+python3 - <<'PY'
+import json
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+payload = json.dumps({
+    "model": "athenea-e2b",
+    "messages": [{"role": "user", "content": "Responde solo: NEXUS listo"}],
+    "max_tokens": 16,
+}).encode()
+request = Request(
+    "http://127.0.0.1:8000/v1/chat/completions",
+    data=payload,
+    headers={
+        "Authorization": "Bearer " + Path(".secrets/api.token").read_text().strip(),
+        "Content-Type": "application/json",
+    },
+)
+with urlopen(request, timeout=90) as response:
+    result = json.load(response)
+print(result["choices"][0]["message"]["content"])
+PY
+```
 
 Para parar sin borrar ledger ni identidades:
 

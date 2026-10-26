@@ -8,16 +8,20 @@ unfinished legacy Weaviate/AGE/ReAct stack during startup.
 from __future__ import annotations
 
 import asyncio
+from functools import lru_cache
+from ipaddress import ip_address
 import json
-import os
 import hashlib
 import hmac
+import os
+import ssl
 import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -25,7 +29,30 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-H0_ROUTER_URL = os.environ.get("NEXUS_H0_ROUTER_URL", "http://127.0.0.1:18080").rstrip("/")
+def _validate_router_url(value: str) -> str:
+    """Allow local HTTP for development and verified HTTPS for private deployments."""
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:
+        raise RuntimeError("NEXUS_H0_ROUTER_URL is malformed") from None
+    try:
+        loopback = ip_address(host).is_loopback
+    except ValueError:
+        loopback = host.lower() == "localhost"
+    if (parsed.scheme not in {"http", "https"} or not host or parsed.username is not None
+            or parsed.password is not None or parsed.path not in {"", "/"}
+            or parsed.query or parsed.fragment or port == 0):
+        raise RuntimeError("NEXUS_H0_ROUTER_URL must be a plain HTTP(S) origin")
+    if parsed.scheme == "http" and not loopback:
+        raise RuntimeError("NEXUS_H0_ROUTER_URL must use HTTPS outside loopback")
+    return value.rstrip("/")
+
+
+H0_ROUTER_URL = _validate_router_url(
+    os.environ.get("NEXUS_H0_ROUTER_URL", "http://127.0.0.1:18080")
+)
 _RATE_WINDOW_SECONDS = 60
 _rate_lock = threading.Lock()
 _rate_buckets: Dict[str, tuple[int, int]] = {}
@@ -82,9 +109,9 @@ def _client_authorization(request: Request) -> Optional[str]:
 
 
 def _enforce_client_auth(request: Request) -> None:
-    expected = os.environ.get("NEXUS_API_TOKEN", "")
+    expected = _secret_value("NEXUS_API_TOKEN")
     if not expected:
-        return
+        raise HTTPException(status_code=503, detail="API client authentication is not configured")
     supplied = _client_authorization(request)
     if supplied is None or not hmac.compare_digest(supplied.encode(), expected.encode()):
         raise HTTPException(
@@ -103,12 +130,8 @@ def _consume_rate_limit(request: Request) -> tuple[int, int, int, bool]:
     limit = min(max(limit, 1), 10000)
     now = int(time.time())
     window = now // _RATE_WINDOW_SECONDS
-    # Without a configured API token, arbitrary caller-supplied keys must not
-    # let a local client evade the shared per-address budget.
-    credential = _client_authorization(request) if os.environ.get("NEXUS_API_TOKEN") else None
-    identity = hashlib.sha256(credential.encode()).hexdigest() if credential else (
-        request.client.host if request.client else "unknown"
-    )
+    credential = _client_authorization(request) or ""
+    identity = hashlib.sha256(credential.encode()).hexdigest()
     key = f"{identity}:{window}"
     with _rate_lock:
         # Keep memory bounded when clients create many distinct identities.
@@ -132,14 +155,6 @@ async def local_api_controls(request: Request, call_next):
     # is not an inference request and must not consume a rate-limit slot.
     if request.method == "OPTIONS" or request.url.path in {"/health", "/ready"}:
         return await call_next(request)
-    try:
-        _enforce_client_auth(request)
-    except HTTPException as exc:
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"detail": exc.detail},
-            headers=exc.headers,
-        )
     if request.method == "POST" and request.url.path in {
         "/v1/chat/completions", "/cognitive/query", "/cognitive/infer"
     }:
@@ -171,9 +186,133 @@ class StandardResponse(BaseModel):
     timestamp: datetime
 
 
-def _upstream_auth(authorization: Optional[str]) -> Optional[str]:
-    # An explicit service credential takes precedence over the caller's token.
-    return os.environ.get("NEXUS_H0_CLIENT_TOKEN") or authorization
+def _secret_value(name: str) -> str:
+    """Read a secret from an environment variable or a Docker-secret file."""
+    value = os.environ.get(name, "")
+    if value:
+        return value.strip()
+    path = os.environ.get(name + "_FILE", "")
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as secret_file:
+            return secret_file.read().strip()
+    except OSError as exc:
+        raise RuntimeError(f"Configured secret file for {name} is unavailable") from exc
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+@lru_cache(maxsize=1)
+def _tls_context() -> ssl.SSLContext:
+    ca_file = os.environ.get("NEXUS_H0_ROUTER_CA_FILE")
+    return ssl.create_default_context(cafile=ca_file or None)
+
+
+def _open_upstream(request: urllib.request.Request, timeout: int):
+    # Router endpoints never need redirects. Refusing them prevents credentials
+    # from being forwarded to a different authority after an upstream response.
+    opener = urllib.request.build_opener(
+        _NoRedirect(), urllib.request.HTTPSHandler(context=_tls_context())
+    )
+    return opener.open(request, timeout=timeout)
+
+
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
+class RequestSafetyMiddleware:
+    """Bound request bytes and in-flight inference work before JSON parsing."""
+
+    def __init__(self, app, max_body_bytes: int = 1_048_576,
+                 max_inflight_inferences: int = 8):
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+        self.inference_slots = threading.BoundedSemaphore(max_inflight_inferences)
+
+    async def _respond(self, send, status: int, message: str, headers=None):
+        body = json.dumps({"detail": message}, separators=(",", ":")).encode()
+        response_headers = [(b"content-type", b"application/json; charset=utf-8"),
+                            (b"content-length", str(len(body)).encode())]
+        if headers:
+            response_headers.extend(headers)
+        await send({"type": "http.response.start", "status": status,
+                    "headers": response_headers})
+        await send({"type": "http.response.body", "body": body})
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        method = scope.get("method", "GET").upper()
+        path = scope.get("path", "")
+        if method != "OPTIONS" and path not in {"/health", "/ready"}:
+            try:
+                _enforce_client_auth(Request(scope, receive=receive))
+            except HTTPException as exc:
+                auth_headers = []
+                if exc.headers:
+                    auth_headers = [(name.lower().encode(), value.encode())
+                                    for name, value in exc.headers.items()]
+                return await self._respond(send, exc.status_code, str(exc.detail), auth_headers)
+
+        headers = scope.get("headers", [])
+        length_values = [value for name, value in headers if name.lower() == b"content-length"]
+        if len(length_values) > 1:
+            return await self._respond(send, 400, "Invalid Content-Length")
+        if length_values:
+            try:
+                declared_length = int(length_values[0])
+            except ValueError:
+                return await self._respond(send, 400, "Invalid Content-Length")
+            if declared_length < 0:
+                return await self._respond(send, 400, "Invalid Content-Length")
+            if declared_length > self.max_body_bytes:
+                return await self._respond(send, 413, "Request body too large")
+
+        inference = method == "POST" and path in {
+            "/v1/chat/completions", "/cognitive/query", "/cognitive/infer"
+        }
+        acquired = self.inference_slots.acquire(blocking=False) if inference else False
+        if inference and not acquired:
+            return await self._respond(send, 503, "Inference capacity is full",
+                                       [(b"retry-after", b"1")])
+
+        received_bytes = 0
+
+        async def limited_receive():
+            nonlocal received_bytes
+            message = await receive()
+            if message.get("type") == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > self.max_body_bytes:
+                    raise _RequestBodyTooLarge
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _RequestBodyTooLarge:
+            await self._respond(send, 413, "Request body too large")
+        finally:
+            if acquired:
+                self.inference_slots.release()
+
+
+def _upstream_auth() -> Optional[str]:
+    """Return only the server-to-server credential; never forward client tokens."""
+    service_token = _secret_value("NEXUS_H0_CLIENT_TOKEN")
+    if service_token:
+        return service_token
+    if urlsplit(H0_ROUTER_URL).scheme == "https":
+        raise HTTPException(
+            status_code=503,
+            detail="H0 gateway service authentication is not configured",
+        )
+    return None
 
 
 def _bounded_timeout(value: Any, field: str) -> int:
@@ -187,10 +326,9 @@ def _bounded_timeout(value: Any, field: str) -> int:
     return min(max(timeout, 1), 1800)
 
 
-def _post_gateway(payload: Dict[str, Any], timeout: int,
-                  authorization: Optional[str] = None) -> Dict[str, Any]:
+def _post_gateway(payload: Dict[str, Any], timeout: int) -> Dict[str, Any]:
     headers = {"Content-Type": "application/json"}
-    upstream_token = _upstream_auth(authorization)
+    upstream_token = _upstream_auth()
     if upstream_token:
         headers["Authorization"] = f"Bearer {upstream_token}"
     request = urllib.request.Request(
@@ -200,9 +338,13 @@ def _post_gateway(payload: Dict[str, Any], timeout: int,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _open_upstream(request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise HTTPException(
+                status_code=502, detail="H0 gateway redirects are not allowed"
+            ) from exc
         try:
             detail = json.loads(exc.read().decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
@@ -215,25 +357,25 @@ def _post_gateway(payload: Dict[str, Any], timeout: int,
     return result
 
 
-def _get_gateway(path: str, authorization: Optional[str] = None) -> Dict[str, Any]:
+def _get_gateway(path: str) -> Dict[str, Any]:
     headers = {}
-    upstream_token = _upstream_auth(authorization)
+    upstream_token = _upstream_auth()
     if upstream_token:
         headers["Authorization"] = f"Bearer {upstream_token}"
     request = urllib.request.Request(f"{H0_ROUTER_URL}{path}", headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with _open_upstream(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raise HTTPException(status_code=exc.code, detail="H0 gateway request failed") from exc
+        status = 502 if 300 <= exc.code < 400 else exc.code
+        raise HTTPException(status_code=status, detail="H0 gateway request failed") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise HTTPException(status_code=502, detail="H0 gateway is unavailable") from exc
     except (ValueError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=502, detail="H0 gateway returned invalid JSON") from exc
 
 
-async def _complete(messages: list, parameters: Optional[Dict[str, Any]], timeout: int,
-                    authorization: Optional[str] = None):
+async def _complete(messages: list, parameters: Optional[Dict[str, Any]], timeout: int):
     params = parameters or {}
     payload = {
         "model": params.get("model", ""),
@@ -242,7 +384,7 @@ async def _complete(messages: list, parameters: Optional[Dict[str, Any]], timeou
         "max_tokens": params.get("max_tokens", 256),
         "timeout_s": timeout,
     }
-    return await asyncio.to_thread(_post_gateway, payload, timeout + 5, authorization)
+    return await asyncio.to_thread(_post_gateway, payload, timeout + 5)
 
 
 @app.post("/v1/chat/completions")
@@ -258,16 +400,12 @@ async def chat_completions(payload: Dict[str, Any], request: Request):
     timeout = _bounded_timeout(payload.get("timeout_s", 300), "timeout_s")
     forwarded = dict(payload)
     forwarded["timeout_s"] = timeout
-    return await asyncio.to_thread(
-        _post_gateway, forwarded, timeout + 5, _client_authorization(request)
-    )
+    return await asyncio.to_thread(_post_gateway, forwarded, timeout + 5)
 
 
 @app.get("/v1/models")
 async def list_models(request: Request):
-    return await asyncio.to_thread(
-        _get_gateway, "/v1/models", _client_authorization(request)
-    )
+    return await asyncio.to_thread(_get_gateway, "/v1/models")
 
 
 @app.post("/cognitive/query", response_model=StandardResponse, tags=["Cognitive Functions"])
@@ -280,10 +418,7 @@ async def query_knowledge(payload: Dict[str, Any], request: Request):
         if not isinstance(context, dict):
             raise HTTPException(status_code=422, detail="context must be an object")
         query += "\n\nContext:\n" + json.dumps(context, ensure_ascii=False)
-    result = await _complete(
-        [{"role": "user", "content": query}], None, 300,
-        _client_authorization(request),
-    )
+    result = await _complete([{"role": "user", "content": query}], None, 300)
     return StandardResponse(
         success=True,
         data={"results": result},
@@ -301,10 +436,7 @@ async def perform_inference(payload: Dict[str, Any], request: Request):
     parameters = payload.get("parameters") or {}
     if not isinstance(parameters, dict):
         raise HTTPException(status_code=422, detail="parameters must be an object")
-    result = await _complete(
-        [{"role": "user", "content": task}], parameters, timeout,
-        _client_authorization(request),
-    )
+    result = await _complete([{"role": "user", "content": task}], parameters, timeout)
     return StandardResponse(
         success=True,
         data={"inference_result": result},
@@ -314,9 +446,18 @@ async def perform_inference(payload: Dict[str, Any], request: Request):
 
 
 def _gateway_ready() -> bool:
+    try:
+        if not _secret_value("NEXUS_API_TOKEN"):
+            return False
+        if urlsplit(H0_ROUTER_URL).scheme == "https":
+            if not _secret_value("NEXUS_H0_CLIENT_TOKEN"):
+                return False
+            _tls_context()
+    except (OSError, RuntimeError, ssl.SSLError):
+        return False
     request = urllib.request.Request(f"{H0_ROUTER_URL}/ready", method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=2) as response:
+        with _open_upstream(request, timeout=2) as response:
             result = json.loads(response.read().decode("utf-8"))
             return response.status == 200 and result.get("ok") is True
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeDecodeError):
@@ -327,7 +468,7 @@ def _gateway_ready() -> bool:
 async def health_check():
     return StandardResponse(
         success=True,
-        data={"status": "healthy", "gateway_url": H0_ROUTER_URL},
+        data={"status": "healthy"},
         request_id="health_check",
         timestamp=datetime.now(),
     )
@@ -340,7 +481,24 @@ async def readiness_check():
         raise HTTPException(status_code=503, detail="H0 gateway is not ready")
     return StandardResponse(
         success=True,
-        data={"status": "ready", "gateway_url": H0_ROUTER_URL},
+        data={"status": "ready"},
         request_id="readiness_check",
         timestamp=datetime.now(),
     )
+
+
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+app.add_middleware(
+    RequestSafetyMiddleware,
+    max_body_bytes=_bounded_env_int("NEXUS_API_MAX_BODY_BYTES", 1_048_576, 1024, 16_777_216),
+    max_inflight_inferences=_bounded_env_int(
+        "NEXUS_API_MAX_INFLIGHT_INFERENCES", 8, 1, 128
+    ),
+)

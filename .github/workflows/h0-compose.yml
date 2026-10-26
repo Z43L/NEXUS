@@ -9,6 +9,7 @@ on:
       - 'NEXUS/.env.h0.example'
       - 'NEXUS/nexus-h1-node/**'
       - 'NEXUS/nexus/h0/**'
+      - 'NEXUS/nexus/api/**'
       - 'NEXUS/nexus-sdk-js/**'
       - 'NEXUS/nexus-sdk-python/**'
       - '.github/workflows/h0-compose.yml'
@@ -19,6 +20,7 @@ on:
       - 'NEXUS/.env.h0.example'
       - 'NEXUS/nexus-h1-node/**'
       - 'NEXUS/nexus/h0/**'
+      - 'NEXUS/nexus/api/**'
       - 'NEXUS/nexus-sdk-js/**'
       - 'NEXUS/nexus-sdk-python/**'
       - '.github/workflows/h0-compose.yml'
@@ -33,6 +35,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install H0 test dependency
         run: python3 -m pip install -r NEXUS/nexus/h0/requirements-h0.txt
+      - name: Install locked API test dependencies
+        run: python3 -m pip install --require-hashes -r NEXUS/nexus/api/requirements-h0.lock
+      - name: Run FastAPI security regressions
+        run: PYTHONPATH=NEXUS PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s NEXUS/nexus/api/tests -v
       - name: Run H0 protocol and security regressions
         working-directory: NEXUS/nexus/h0
         run: |
@@ -60,9 +66,9 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s nexus-h1-node -p 'test_*.py' -v
           ./nexus-h1-node/bootstrap-compose-h0.sh
           docker compose --env-file .env.h0 -f compose.h0.yml config --quiet
-      - name: Build H0 Router and H1 worker image
+      - name: Build H0 Router, H1 worker, and API images
         working-directory: NEXUS
-        run: docker compose --env-file .env.h0 -f compose.h0.yml build --pull router
+        run: docker compose --env-file .env.h0 -f compose.h0.yml build --pull router api
       - name: Start mock Atenhea and run container E2E
         working-directory: NEXUS
         run: |
@@ -85,31 +91,44 @@ jobs:
           else:
               raise SystemExit("mock Atenhea did not start")
           PY
-          docker compose --env-file .env.h0 -f compose.h0.yml up --detach --wait --wait-timeout 300 router worker
+          docker compose --env-file .env.h0 -f compose.h0.yml up --detach --wait --wait-timeout 300 api
           python3 - <<'PY'
           import json
-          import ssl
           from pathlib import Path
+          import time
+          from urllib.error import HTTPError, URLError
           from urllib.request import Request, urlopen
 
-          token = Path(".secrets/client.token").read_text().strip()
-          context = ssl.create_default_context(cafile=".secrets/ca.crt")
+          token = Path(".secrets/api.token").read_text().strip()
           body = json.dumps({
               "model": "athenea-e2b",
               "messages": [{"role": "user", "content": "compose end-to-end check"}],
               "max_tokens": 8,
               "timeout_s": 60,
           }).encode()
-          request = Request(
-              "https://localhost:18090/v1/chat/completions",
-              data=body,
-              headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-          )
-          with urlopen(request, context=context, timeout=90) as response:
+          url = "http://127.0.0.1:8000/v1/chat/completions"
+          for _ in range(60):
+              try:
+                  with urlopen("http://127.0.0.1:8000/ready", timeout=2) as response:
+                      if response.status == 200:
+                          break
+              except OSError:
+                  time.sleep(1)
+          else:
+              raise SystemExit("FastAPI facade did not become ready")
+          try:
+              with urlopen(Request(url, data=body, headers={"Content-Type": "application/json"}), timeout=5):
+                  raise SystemExit("FastAPI accepted an unauthenticated request")
+          except HTTPError as exc:
+              assert exc.code == 401, exc.code
+          request = Request(url, data=body, headers={
+              "Authorization": f"Bearer {token}", "Content-Type": "application/json",
+          })
+          with urlopen(request, timeout=90) as response:
               result = json.loads(response.read())
           assert result["choices"][0]["message"]["content"], result
           assert result["usage"]["completion_tokens"] > 0, result
-          print("Compose Router → H1 worker → mock Atenhea E2E: PASS")
+          print("Compose authenticated API → TLS Router → H1 worker → mock Atenhea E2E: PASS")
           PY
       - name: Stop Compose services
         if: always()

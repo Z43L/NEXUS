@@ -31,7 +31,7 @@ Objetivo: convertir el monorepo en un producto end-to-end reproducible, seguro y
 - [x] Exponer health/readiness y métricas Prometheus del router; documentar recuperación por lease.
 - [x] Documentar procedimiento de backup/restauración de SQLite y custodia separada de claves.
 - [x] Crear guía segura de configuración y verificación de credenciales en `NEXUS/nexus/h0/README_H0.md`.
-- [x] Añadir fachada FastAPI con auth opcional, credencial upstream separada, rate limit de instancia única y error envelopes preservados.
+- [x] Añadir fachada FastAPI con autenticación fail-closed por defecto, credencial upstream separada, rate limit de instancia única y error envelopes preservados.
 - [x] Añadir lock de dependencias, regresiones de API/SDK, timeout de transporte > deadline H0 y metadatos instalables del SDK Python.
 - [x] Añadir CI para pruebas H0, ambos SDKs, validación/build Compose y E2E en contenedores.
 - [x] Retirar los manifiestos CI/CD heredados de `NEXUS/.github/workflows/`: GitHub no los descubre dentro de ese subdirectorio y asumían rutas inexistentes, publicación de imágenes y despliegue en producción sin gates coherentes. Los workflows activos del repositorio son los dos de `.github/workflows/` en la raíz.
@@ -46,7 +46,7 @@ Objetivo: convertir el monorepo en un producto end-to-end reproducible, seguro y
 - [x] Ejecutar puerta H0 con Atenhea real y archivar evidencia agregada en `docs/evidence/h0-real-2026-10-25.json`.
 - [x] Probar el flujo remoto sobre loopback con TLS temporal: token de cliente, alta válida, rechazo de token/CA incorrectos y restricciones de bind/permisos.
 - [x] Añadir retención configurable (30 días por defecto) y purga idempotente de prompt/salida, conservando recibos y metadatos.
-- [x] Añadir Compose separado para Router H0 + worker H1, TLS/auth/enrolamiento, tokens locales aleatorios, persistencia y healthchecks; Atenhea se configura como engine externo explícito.
+- [x] Añadir Compose para API autenticada → Router TLS privado → worker H1, tokens cliente/servicio separados, enrolamiento, persistencia y healthchecks; Atenhea se configura como engine externo explícito.
 - [x] Corregir la CA ausente del healthcheck Router y hacer que el bootstrap tolere un directorio `data/` preexistente.
 - [ ] Ejecutar `docker compose config`, build y runtime de esa ruta en host con Docker/Compose. En este entorno faltan Docker/Podman; solo se validaron YAML, scripts y Python.
 
@@ -66,16 +66,19 @@ Con el motor Atenhea ya activo, se repitió `run_h0_local.sh` en modo `real`: el
 - [x] Compilar SDK TypeScript con `npm run build` (TypeScript strict, salida exit 0).
 - [x] Verificar UI loopback por HTTP → `/v1/models` y `/v1/chat/completions` dentro de la suite E2E.
 - [x] Convertir la API FastAPI heredada en fachada HTTP hacia H0, manteniendo `/cognitive/query` y `/cognitive/infer` como compatibilidad.
-- [x] Añadir `NEXUS/nexus/api/run_h0_api.sh` y dependencias mínimas con versiones directas fijadas; listener y upstream quedan limitados a loopback.
+- [x] Añadir `NEXUS/nexus/api/run_h0_api.sh` y dependencias mínimas con versiones directas fijadas; el launcher local liga API/Router a loopback y el Compose usa HTTPS verificado sobre la red privada.
 - [x] Generar lock transitivo pip-compatible con hashes (`requirements-h0.lock`) e instalarlo con `--require-hashes`.
 - [x] Arrancar FastAPI/Uvicorn reales y probar `/ready`, `/v1/models`, `/v1/chat/completions` y `/cognitive/infer` sobre la ruta API → Router → worker → mock.
 - [x] Ejecutar los launchers `run_h0_local.sh` + `run_h0_api.sh` juntos; comprobar UI/API loopback y chat atravesando el worker.
 - [x] Hacer que los SDKs Python/TypeScript usen FastAPI loopback por defecto y verificar auth `X-API-Key` en ambos. Ampliar el E2E para exigir 401 sin token y completar dos trabajos autenticados por SDK Python → FastAPI → Router → worker.
+- [x] Hacer que el Compose añada FastAPI como entrada autenticada en loopback, lea credenciales de archivos de secretos y hable con Router solo por HTTPS con CA fijada; eliminar el puerto del Router publicado al host.
+- [x] Validar en la API el upstream HTTP solo para loopback o HTTPS, rechazar URL con userinfo/paths y redirecciones, fallar cerrado sin token y ocultar el upstream de health/readiness.
+- [x] Separar completamente token de cliente y credencial server-to-server; nunca reenviar bearer del cliente al Router. Añadir límites de cuerpo y concurrencia en la fachada.
 - [ ] Alinear/arreglar dashboard Flask; no es aún una app empaquetada ni auth client.
 - [ ] Reemplazar el token compartido por claves de cliente con permisos/cuotas individuales; hoy FastAPI usa un token de instancia y cuotas locales por proceso, sin streaming.
 - [ ] Mantener el backend cognitivo heredado fuera de la ruta crítica hasta que pase pruebas funcionales.
 
-**Límite M3:** el SDK TypeScript compiló y ambos SDKs ahora apuntan por defecto al API local autenticable. FastAPI/Uvicorn pasó el smoke original y el nuevo E2E con 401 sin token y dos solicitudes autenticadas por el SDK Python hasta Router/worker/mock. La instalación del lock con hashes se verificó con `uv pip install --require-hashes`; el launcher API sigue ligado a loopback y conecta con un Router local. La UI HTML de H0 sigue siendo una demo de loopback que se conecta directamente al Router; el dashboard Flask permanece sin empaquetar. El Compose heredado no incluye Router/worker H0.
+**Límite M3:** ambos SDKs apuntan por defecto a FastAPI y la ruta Compose ahora está diseñada como API autenticada → Router TLS privado → worker. El E2E ejecutado localmente y la suite H0 verifican el API→Router HTTP local; el workflow actualizado verifica API→Router TLS dentro de Compose, pero aún no se ha ejecutado en Docker/GitHub Actions. El token compartido sirve para una instancia local, no equivale a identidad multiusuario. La UI HTML y el dashboard Flask no están empaquetados como BFF y no deben recibir el token de servicio; para usuarios remotos se necesita sesión/BFF.
 
 ### M4 — Contratos/economía y despliegue
 
