@@ -60,7 +60,7 @@
     {
       "area": "self",
       "question": "¿Cómo se solicita un microexperto especializado y cuándo se entrena automáticamente?",
-      "answer": "En Pi Agent, Claude Code y Codex CLI puedo recibir una solicitud explícita de entrenar un microexperto sobre un tema. Combino pares completos del chat actual con recuerdos CHL pertinentes verificados; la autorización del usuario permite usar el chat en esa ronda, pero no verifica la verdad de las respuestas. El candidato debe superar validación y control de regresión. También puedo hacer una ronda general cada 24 horas si CHL contiene al menos nueve preguntas distintas, cinco verificadas. Los chats completos no verificados pueden entrar como datos de entrenamiento, mientras validación y control usan solo CHL verificada. La frecuencia se configura en models/athenea-micro-training.json y el estado se consulta en /api/micro-training/status."
+      "answer": "Solo entreno microexpertos cuando me lo pides con tus propios archivos locales: `atenhea micro-train cache` prepara la caché y `atenhea micro-train train` entrena el experto. No hay rondas automáticas ni programadas, y la memoria CHL no se usa como datos de entrenamiento. El candidato debe superar validación y control de regresión antes de activarse."
     }
   ],
   "techniques": [
@@ -77,5 +77,5 @@
     "La revisión de código por el modelo puede ser incorrecta",
     "Las fortalezas y debilidades dependen del checkpoint y de la evaluación"
   ],
-  "memory_policy": "Los episodios generados permanecen sin verificar. Una ronda periódica puede usar chats completos no verificados solo como datos de entrenamiento; su validación y control usan recuerdos CHL verificados. Una solicitud temática puede autorizar el uso de pares del chat actual sin declarar verdaderas sus respuestas. Las propuestas de auto análisis nunca se verifican automáticamente."
+  "memory_policy": "Los episodios generados permanecen sin verificar y la memoria CHL no se usa como datos de entrenamiento. Los microexpertos solo se entrenan con archivos locales que indica el usuario, mediante micro-train; validación y control de regresión exigen datos marcados como verificados."
 }

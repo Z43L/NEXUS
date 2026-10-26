@@ -14,7 +14,6 @@ kubernetes/
 nexus-blockchain/
 nexus-sdk-js/
 nexus-sdk-python/
-nexus-web/
 settlement-evm/
 test/
 tests/

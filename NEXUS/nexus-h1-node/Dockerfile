@@ -11,9 +11,9 @@ WORKDIR /app
 
 # The worker and Router share only the pinned cryptography dependency. Keep the
 # runtime small and install binary wheels only (no compiler/build toolchain).
-COPY nexus-h1-node/requirements-h1.txt /tmp/requirements-h1.txt
-RUN python -m pip install --no-cache-dir --only-binary=:all: \
-      -r /tmp/requirements-h1.txt \
+COPY requirements-cryptography.lock /tmp/requirements-cryptography.lock
+RUN python -m pip install --no-cache-dir --require-hashes --only-binary=:all: \
+      -r /tmp/requirements-cryptography.lock \
     && groupadd --gid 10001 nexus \
     && useradd --uid 10001 --gid nexus --no-create-home --shell /usr/sbin/nologin nexus
 

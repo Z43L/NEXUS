@@ -1,0 +1,10 @@
+FROM python:3.12.15-slim-bookworm@sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY nexus/h0/mock_atenea.py /app/mock_atenea.py
+RUN groupadd --gid 10003 nexus-mock \
+    && useradd --uid 10003 --gid nexus-mock --no-create-home --shell /usr/sbin/nologin nexus-mock
+USER 10003:10003
+EXPOSE 11436
+ENTRYPOINT ["python", "/app/mock_atenea.py", "--host", "0.0.0.0", "--port", "11436"]

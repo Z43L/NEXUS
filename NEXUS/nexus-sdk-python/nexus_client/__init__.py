@@ -3,13 +3,44 @@
 from __future__ import annotations
 
 import asyncio
+from ipaddress import ip_address
 import json
 from typing import Any, Optional, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_HTTP_OPENER = build_opener(ProxyHandler({}), _NoRedirect())
+
+
+def _validate_base_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname or ""
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise ValueError("base_url must be a valid HTTP(S) origin") from None
+    if (parsed.scheme not in {"http", "https"} or not host
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or port == 0):
+        raise ValueError("base_url must be a valid HTTP(S) origin")
+    if parsed.scheme == "http":
+        try:
+            loopback = ip_address(host).is_loopback
+        except ValueError:
+            loopback = host.lower() == "localhost"
+        if not loopback:
+            raise ValueError("base_url must use HTTPS unless it targets loopback")
+    return value.rstrip("/")
 
 
 class NexusAPIError(RuntimeError):
@@ -32,7 +63,7 @@ class NexusClient:
     def __init__(self, api_key: Optional[str] = None,
                  base_url: str = DEFAULT_BASE_URL, timeout: float = 300):
         self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _validate_base_url(base_url)
         self.timeout = timeout
 
     async def __aenter__(self) -> "NexusClient":
@@ -81,7 +112,7 @@ class NexusClient:
 
     def _send(self, request: Request, timeout: float) -> dict[str, Any]:
         try:
-            with urlopen(request, timeout=timeout) as response:
+            with _HTTP_OPENER.open(request, timeout=timeout) as response:
                 status = response.status
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:

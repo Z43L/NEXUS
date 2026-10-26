@@ -11,10 +11,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
 import shutil
+import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -27,7 +30,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from episodic_memory import DEFAULT_MEMORY, EpisodicMemory
+from episodic_memory import DEFAULT_MEMORY, EpisodicMemory, user_memory_path
 from interaction_learning import (InteractionBuffer, extract_completion,
                                  extract_pair, extract_prompt)
 
@@ -56,6 +59,41 @@ ALLOWED_DATASETS = {
 }
 
 
+def load_api_key_file(path: Path) -> str:
+    """Read a private API key without putting it in argv or the environment."""
+    file_stat = path.stat()
+    if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode) or stat.S_IMODE(file_stat.st_mode) & 0o077:
+        raise ValueError("API key file must be a regular private file with mode 0600")
+    value = path.read_text(encoding="utf-8").strip()
+    if len(value) < 32:
+        raise ValueError("API key must contain at least 32 characters")
+    return value
+
+
+def create_listener_tls_context(host: str, api_key: str | None,
+                                cert_file: Path | None, key_file: Path | None):
+    """Require authenticated TLS for a listener bound beyond loopback."""
+    try:
+        local = host.lower() == "localhost" or ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        local = False
+    if (cert_file is None) != (key_file is None):
+        raise ValueError("TLS certificate and private key must be configured together")
+    if not local and (api_key is None or len(api_key) < 32):
+        raise ValueError("a non-loopback listener requires an API key")
+    if not local and cert_file is None:
+        raise ValueError("a non-loopback listener requires TLS certificate and key")
+    if cert_file is None:
+        return None
+    key_stat = key_file.stat()
+    if key_file.is_symlink() or not stat.S_ISREG(key_stat.st_mode) or stat.S_IMODE(key_stat.st_mode) & 0o077:
+        raise ValueError("TLS private key file must be a regular private file with mode 0600")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(certfile=str(cert_file), keyfile=str(key_file))
+    return context
+
+
 class Onram:
     def __init__(self, model_path: Path, llama_server: Path, host: str, port: int,
                  backend_port: int, bundle: Path, api_key: str | None = None,
@@ -69,6 +107,9 @@ class Onram:
             raise ValueError("Unknown backend")
         self.episodic = EpisodicMemory(chl_memory)
         self.episodic.call("recall", query="", top_k=1)
+        self.chl_base = Path(chl_memory).parent
+        self.user_episodic = {}
+        self.user_episodic_lock = threading.Lock()
         self.memory_error = None
         self.llama_args = list(llama_args or [])
         self.backend_kind = backend_kind
@@ -398,6 +439,26 @@ class Onram:
             self.evolution_lock.release()
             raise
 
+    def episodic_for_user(self, user_id) -> "EpisodicMemory | None":
+        """CHL memory owned by one NEXUS account, created on first use; None if unavailable."""
+        base = getattr(self, "chl_base", None)
+        if base is None:
+            return None
+        try:
+            path = user_memory_path(base, user_id)
+        except ValueError:
+            return None
+        with self.user_episodic_lock:
+            memory = self.user_episodic.get(path)
+            if memory is None:
+                try:
+                    memory = EpisodicMemory(path)
+                except RuntimeError as exc:
+                    print(f"[onram] account CHL unavailable: {exc}", flush=True)
+                    return None
+                self.user_episodic[path] = memory
+            return memory
+
     def augment_request(self, path: str, body: bytes | None) -> bytes | None:
         """Add recalled data to the last user text without changing tool blocks."""
         memory = getattr(self, "episodic", None)
@@ -408,6 +469,15 @@ class Onram:
                          "/api/chat", "/api/generate"}:
             return body
         data = json.loads(body)
+        # NEXUS worker traffic may represent different authenticated users.
+        # Until the engine supports tenant-partitioned CHL and world memory,
+        # never recall or retain that traffic in the operator-wide memory.
+        if isinstance(data, dict) and data.get("nexus_worker") is True:
+            data.pop("nexus_worker", None)
+            user = data.pop("nexus_user", None)
+            memory = self.episodic_for_user(user) if user is not None else None
+            if memory is None:
+                return json.dumps(data).encode("utf-8")
         query = extract_prompt(path, body)
         if not query:
             return body
@@ -445,6 +515,24 @@ class Onram:
 
     def record_interaction(self, path: str, request_body: bytes | None,
                            response_body: bytes, status: int = 200) -> None:
+        try:
+            request_data = json.loads(request_body or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            request_data = {}
+        if isinstance(request_data, dict) and request_data.get("nexus_worker") is True:
+            # NEXUS requests are recorded only in their account memory, never in the
+            # operator memory or the automatic-learning buffer.
+            memory = self.episodic_for_user(request_data.get("nexus_user"))
+            if memory is not None:
+                episode = extract_pair(path, request_body, response_body, status)
+                if episode:
+                    try:
+                        memory.remember(*episode, model=self.model_name)
+                        self.memory_error = None
+                    except Exception as exc:
+                        self.memory_error = str(exc)
+                        print(f"[onram] account CHL capture failed: {exc}", flush=True)
+            return
         memory = getattr(self, "episodic", None)
         if memory is not None:
             episode = extract_pair(path, request_body, response_body, status)
@@ -1033,9 +1121,6 @@ def handler_for(app: Onram):
                     return self._json(app.status())
                 if path == "/api/runtime/status" and getattr(app, "backend_kind", "llama.cpp") == "nram":
                     return self._json(app._backend_request("GET", "/onram/status", None))
-                if path == "/api/micro-training/status" and getattr(app, "backend_kind", "llama.cpp") == "nram":
-                    runtime = app._backend_request("GET", "/onram/status", None)
-                    return self._json(runtime.get("micro_training_schedule", {}))
                 if path == "/api/evolve/status":
                     return self._json(app.status()["evolution"])
                 if path == "/api/learning/status":
@@ -1183,10 +1268,6 @@ def handler_for(app: Onram):
                     if getattr(app, "backend_kind", "llama.cpp") != "nram":
                         return self._json({"error": "Direct online training requires --backend nram"}, 400)
                     return self._json(app._backend_request("POST", "/onram/train", body, timeout=3600))
-                if self.path == "/api/micro-training/train-topic":
-                    if getattr(app, "backend_kind", "llama.cpp") != "nram":
-                        return self._json({"error": "Topic micro-training requires --backend nram"}, 400)
-                    return self._json(app._backend_request("POST", "/onram/train-topic", body, timeout=3600))
                 if self.path == "/api/evolve":
                     return self._json(app.begin_evolution(body), 202)
                 if self.path == "/api/learning/feedback":
@@ -1234,14 +1315,22 @@ def main() -> None:
     parser.add_argument("--backend-port", type=int, default=11436)
     parser.add_argument("--ctx-size", type=int, default=0,
                         help="llama.cpp context size; 0 uses the GGUF's model default")
-    parser.add_argument("--api-key", default=os.environ.get("ONRAM_API_KEY"))
+    parser.add_argument("--api-key", default=os.environ.get("ONRAM_API_KEY"),
+                        help="API key (prefer --api-key-file for operator deployments)")
+    parser.add_argument("--api-key-file", type=Path,
+                        default=Path(os.environ["ONRAM_API_KEY_FILE"])
+                        if os.environ.get("ONRAM_API_KEY_FILE") else None)
+    parser.add_argument("--tls-cert-file", type=Path,
+                        help="TLS certificate for a non-loopback listener")
+    parser.add_argument("--tls-key-file", type=Path,
+                        help="0600 TLS private key for a non-loopback listener")
     parser.add_argument("--model-name", help="Stable model name exposed by /api/tags")
-    auto_learn_default = os.environ.get("ONRAM_AUTO_LEARN", "1").strip().lower() not in {
+    auto_learn_default = os.environ.get("ONRAM_AUTO_LEARN", "0").strip().lower() not in {
         "0", "false", "no", "off",
     }
     parser.add_argument("--auto-learn", action=argparse.BooleanOptionalAction,
                         default=auto_learn_default,
-                        help="Capture completed text turns and train a validated candidate every batch (enabled by default; use --no-auto-learn to disable)")
+                        help="Capture completed text turns and train a validated candidate every batch (disabled by default; enable with --auto-learn or ONRAM_AUTO_LEARN=1)")
     inference_debug_default = os.environ.get("ONRAM_INFERENCE_DEBUG", "1").strip().lower() not in {
         "0", "false", "no", "off",
     }
@@ -1252,8 +1341,15 @@ def main() -> None:
                         default=int(os.environ.get("ONRAM_LEARN_BATCH_SIZE", "24")),
                         help="New unique turns required before an automatic training attempt")
     args = parser.parse_args()
-    if args.host not in ("127.0.0.1", "localhost", "::1") and not args.api_key:
-        parser.error("binding to a non-local address requires --api-key or ONRAM_API_KEY")
+    if args.api_key and args.api_key_file:
+        parser.error("use either --api-key or --api-key-file, not both")
+    try:
+        api_key = load_api_key_file(args.api_key_file) if args.api_key_file else args.api_key
+        tls_context = create_listener_tls_context(
+            args.host, api_key, args.tls_cert_file, args.tls_key_file
+        )
+    except (OSError, ValueError, ssl.SSLError) as exc:
+        parser.error(f"invalid listener security configuration: {exc}")
     if args.ctx_size < 0:
         parser.error("--ctx-size must be 0 or greater")
     if args.learn_batch_size < 16:
@@ -1264,18 +1360,21 @@ def main() -> None:
     if model_name and ":" not in model_name:
         model_name += ":latest"
     app = Onram(args.model, args.llama_server, args.host, args.port, args.backend_port,
-                args.bundle, args.api_key, model_name, args.ctx_size,
+                args.bundle, api_key, model_name, args.ctx_size,
                 args.auto_learn, args.learn_batch_size, args.inference_debug,
                 args.backend, args.strata_dir, args.strata_config, args.strata_python, args.backend_arg, args.chl_memory)
     try:
         # Reserve the public port before loading any weights. Duplicate launches
         # fail immediately instead of starting another multi-GB model first.
         server = ThreadingHTTPServer((args.host, args.port), handler_for(app))
+        if tls_context:
+            server.socket = tls_context.wrap_socket(server.socket, server_side=True)
         app.start_backend()
     except BaseException:
         app.close()
         raise
-    print(f"onram listening at http://{args.host}:{args.port} with {app.model_path.name}", flush=True)
+    scheme = "https" if tls_context else "http"
+    print(f"onram listening at {scheme}://{args.host}:{args.port} with {app.model_path.name}", flush=True)
     if app.auto_learn:
         app._schedule_auto_evolution(retry_pending=True)
     try:

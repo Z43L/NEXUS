@@ -7,11 +7,28 @@ import ssl
 import sys
 import time
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import (
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
+
+from worker2 import read_atenea_api_key, validate_atenea_url
 
 
-def get_json(url: str, context: ssl.SSLContext | None = None) -> dict:
-    with urlopen(url, timeout=5, context=context) as response:
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def get_json(url: str, context: ssl.SSLContext | None = None,
+             headers: dict[str, str] | None = None) -> dict:
+    opener = build_opener(
+        ProxyHandler({}), _NoRedirect(), HTTPSHandler(context=context)
+    )
+    with opener.open(Request(url, headers=headers or {}), timeout=5) as response:
         data = json.loads(response.read().decode("utf-8"))
     if not isinstance(data, dict):
         raise ValueError("expected JSON object")
@@ -38,8 +55,10 @@ def main() -> int:
                 return 1
             if age_seconds < -5 or age_seconds > 30:
                 return 1
-            atenea = os.environ["ATENHEA_URL"].rstrip("/")
-            models = get_json(atenea + "/v1/models").get("data")
+            atenea = validate_atenea_url(os.environ["ATENHEA_URL"])
+            api_key = read_atenea_api_key(os.environ.get("ATENHEA_API_KEY_FILE"))
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            models = get_json(atenea + "/v1/models", headers=headers).get("data")
             return 0 if isinstance(models, list) and any(
                 isinstance(item, dict) and isinstance(item.get("id"), str)
                 and item["id"].strip() for item in models

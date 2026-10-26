@@ -15,7 +15,10 @@ import hashlib
 import ipaddress
 import json
 import math
+import os
+import re
 import sqlite3
+import socket
 import ssl
 import threading
 import time
@@ -24,6 +27,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 import nexus_common as nc
+import nram_registry as nr
 
 BASE = Path(__file__).resolve().parent
 _lock = threading.Lock()
@@ -39,6 +43,15 @@ MAX_JOB_MESSAGES = 256
 MAX_JOB_CHARS = 300_000
 MAX_JOB_ATTEMPTS = 3
 JOB_LEASE_SECONDS = 1800
+NODE_HEARTBEAT_TTL_SECONDS = int(os.environ.get("NEXUS_H0_NODE_HEARTBEAT_TTL_SECONDS", "30"))
+if not 10 <= NODE_HEARTBEAT_TTL_SECONDS <= 3600:
+    raise ValueError("NEXUS_H0_NODE_HEARTBEAT_TTL_SECONDS must be between 10 and 3600")
+
+
+def active_node_cutoff_iso(now: dt.datetime | None = None) -> str:
+    current = now or dt.datetime.now(dt.timezone.utc)
+    cutoff = current - dt.timedelta(seconds=NODE_HEARTBEAT_TTL_SECONDS)
+    return cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def models_match(requested: str, reported: str) -> bool:
@@ -48,6 +61,16 @@ def models_match(requested: str, reported: str) -> bool:
     return (requested == reported
             or (requested.endswith(":latest") and requested[:-len(":latest")] == reported)
             or (reported.endswith(":latest") and reported[:-len(":latest")] == requested))
+
+
+def job_access_allowed(owner_client_id: str | None, requester_client_id: str | None,
+                       is_admin: bool) -> bool:
+    """Enforce per-client job visibility while preserving trusted direct H0 access."""
+    if is_admin:
+        return True
+    if requester_client_id is None:
+        return owner_client_id is None
+    return owner_client_id == requester_client_id
 
 
 def db() -> sqlite3.Connection:
@@ -68,11 +91,16 @@ def init_db() -> None:
             payload TEXT, status TEXT, node_id TEXT, created_at TEXT,
             finished_at TEXT, error TEXT, result_text TEXT,
             lease_until TEXT, attempts INTEGER DEFAULT 0,
-            content_expires_at TEXT, content_purged INTEGER DEFAULT 0);
+            content_expires_at TEXT, content_purged INTEGER DEFAULT 0,
+            owner_client_id TEXT);
         CREATE TABLE IF NOT EXISTS receipts(
             job_id TEXT PRIMARY KEY, node_id TEXT, receipt TEXT, signature TEXT,
             input_tokens INTEGER, output_tokens INTEGER, price_micro INTEGER,
             verified INTEGER, discrepancy_pct REAL);
+        CREATE TABLE IF NOT EXISTS nram_assets(
+            nram_id TEXT PRIMARY KEY, author_id TEXT NOT NULL, name TEXT NOT NULL,
+            version TEXT NOT NULL, size_bytes INTEGER NOT NULL, manifest TEXT NOT NULL,
+            created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS node_nonces(
             node_id TEXT NOT NULL, nonce TEXT NOT NULL, timestamp INTEGER NOT NULL,
             PRIMARY KEY(node_id, nonce));
@@ -91,6 +119,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN content_expires_at TEXT")
         if "content_purged" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN content_purged INTEGER DEFAULT 0")
+        if "owner_client_id" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN owner_client_id TEXT")
         # Backfill old rows from their creation time; malformed legacy dates
         # expire immediately rather than extending their retention silently.
         rows = conn.execute("SELECT job_id, created_at FROM jobs WHERE content_expires_at IS NULL").fetchall()
@@ -163,6 +193,25 @@ def validate_bind_host(host: str) -> str:
     if not address.is_loopback and not any(address in network for network in private_ranges):
         raise ValueError("remote bind host must be a private or loopback IP, never a public interface")
     return str(address)
+
+
+def resolve_bind_host(host: str) -> str:
+    """Resolve the opt-in container bind to its assigned private IPv4 address."""
+    if host != "auto":
+        return validate_bind_host(host)
+    try:
+        candidates = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except OSError as exc:
+        raise ValueError("cannot resolve this container's IPv4 address") from exc
+    for candidate in candidates:
+        address = ipaddress.ip_address(candidate[4][0])
+        if address.is_loopback or address.is_link_local:
+            continue
+        try:
+            return validate_bind_host(str(address))
+        except ValueError:
+            continue
+    raise ValueError("container auto bind requires an assigned private IPv4 address")
 
 
 def new_job_id(conn) -> str:
@@ -240,7 +289,10 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("JSON body must be an object")
         return value
 
-    def _create_job(self, body: dict) -> str:
+    def _create_job(self, body: dict, owner_client_id: str | None = None) -> str:
+        if owner_client_id is not None and not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", owner_client_id):
+            raise ValueError("invalid client identity")
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages or len(messages) > MAX_JOB_MESSAGES:
             raise ValueError(f"messages must contain 1 to {MAX_JOB_MESSAGES} items")
@@ -251,10 +303,10 @@ class Handler(BaseHTTPRequestHandler):
         if sum(len(m["content"]) for m in messages) > MAX_JOB_CHARS:
             raise ValueError(f"combined message content exceeds {MAX_JOB_CHARS} characters")
         nram = body.get("nram", [])
-        if (not isinstance(nram, list)
-                or any(not isinstance(author, str) or not author for author in nram)
-                or len(set(nram)) != len(nram)):
-            raise ValueError("nram must be a list of unique non-empty author identifiers")
+        if (not isinstance(nram, list) or len(nram) > 1
+                or any(not isinstance(nram_id, str) or not nr.ID_RE.fullmatch(nram_id)
+                       for nram_id in nram)):
+            raise ValueError("nram must be a list of at most one published bundle id")
         model = body.get("model", "")
         if not isinstance(model, str) or len(model) > 120:
             raise ValueError("model must be a string of at most 120 characters")
@@ -278,6 +330,10 @@ class Handler(BaseHTTPRequestHandler):
             ).fetchone()[0]
             if active >= MAX_ACTIVE_JOBS:
                 raise OverflowError("job queue is at capacity")
+            for nram_id in nram:
+                if conn.execute("SELECT 1 FROM nram_assets WHERE nram_id=?",
+                                (nram_id,)).fetchone() is None:
+                    raise ValueError(f"unknown bundle id {nram_id}")
             job_id = new_job_id(conn)
             created_at = utc_now_iso()
             content_expires_at = (
@@ -286,10 +342,11 @@ class Handler(BaseHTTPRequestHandler):
             ).strftime("%Y-%m-%dT%H:%M:%SZ")
             conn.execute(
                 "INSERT INTO jobs(job_id, kind, model, nram, payload, status, created_at, "
-                "content_expires_at, content_purged) VALUES(?,?,?,?,?,?,?,?,0)",
+                "content_expires_at, content_purged, owner_client_id) "
+                "VALUES(?,?,?,?,?,?,?,?,0,?)",
                 (job_id, body.get("kind", "inference"), body.get("model", ""),
                 json.dumps(nram), json.dumps(body), "queued",
-                 created_at, content_expires_at))
+                 created_at, content_expires_at, owner_client_id))
         return job_id
 
     def _consume_node_signature(self, node_id: str, public_pem: str, body: dict) -> bool:
@@ -323,10 +380,11 @@ class Handler(BaseHTTPRequestHandler):
         if not _network_mode:
             return False
         if method == "GET":
-            return (path in ("/v1/models", "/metrics", "/ledger/summary")
+            return (path in ("/v1/models", "/metrics", "/ledger/summary", "/nram")
+                    or path.startswith("/nram/")
                     or (path.startswith("/jobs/") and path != "/jobs/next"))
         if method == "POST":
-            return path in ("/v1/chat/completions", "/jobs")
+            return path in ("/v1/chat/completions", "/jobs", "/nram")
         return False
 
     # -- GET -----------------------------------------------------------------
@@ -354,7 +412,10 @@ class Handler(BaseHTTPRequestHandler):
                 receipts = conn.execute("SELECT COUNT(*) AS n, SUM(input_tokens) AS input, "
                                         "SUM(output_tokens) AS output FROM receipts "
                                         "WHERE verified=1").fetchone()
-                nodes = conn.execute("SELECT COUNT(*) AS n FROM nodes").fetchone()["n"]
+                nodes = conn.execute(
+                    "SELECT COUNT(*) AS n FROM nodes WHERE last_heartbeat >= ?",
+                    (active_node_cutoff_iso(),),
+                ).fetchone()["n"]
             metrics = [
                 "# HELP nexus_h0_jobs Current jobs grouped by state.",
                 "# TYPE nexus_h0_jobs gauge",
@@ -377,12 +438,48 @@ class Handler(BaseHTTPRequestHandler):
                               content_type="text/plain; version=0.0.4; charset=utf-8")
         if path == "/v1/models":
             with db() as conn:
-                rows = conn.execute("SELECT models FROM nodes ORDER BY node_id").fetchall()
+                rows = conn.execute(
+                    "SELECT models FROM nodes WHERE last_heartbeat >= ? ORDER BY node_id",
+                    (active_node_cutoff_iso(),),
+                ).fetchall()
             models = sorted({model for row in rows for model in json.loads(row["models"] or "[]")})
             return self._json({"object": "list", "data": [
                 {"id": model, "object": "model", "owned_by": "nexus-network"}
                 for model in models
             ]})
+        if path == "/nram":
+            with db() as conn:
+                rows = conn.execute(
+                    "SELECT nram_id, author_id, name, version, size_bytes, created_at "
+                    "FROM nram_assets ORDER BY created_at, nram_id").fetchall()
+            return self._json({"object": "list", "data": [dict(row) for row in rows]})
+        if path.startswith("/nram/"):
+            parts = path.split("/")
+            nram_id = parts[2] if len(parts) > 2 else ""
+            if not nr.ID_RE.fullmatch(nram_id):
+                return self._json({"error": "invalid bundle id"}, 400)
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT nram_id, author_id, name, version, size_bytes, manifest, created_at "
+                    "FROM nram_assets WHERE nram_id=?", (nram_id,)).fetchone()
+            if row is None:
+                return self._json({"error": "not found"}, 404)
+            if len(parts) == 4 and parts[3] == "blob":
+                try:
+                    data = nr.read_bundle(_db_path.parent, nram_id)
+                except (OSError, nr.NramError):
+                    return self._json({"error": "bundle file is missing or corrupt"}, 500)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if len(parts) != 3:
+                return self._json({"error": "not found"}, 404)
+            info = dict(row)
+            info["manifest"] = json.loads(info["manifest"])
+            return self._json(info)
         if path == "/jobs/next":
             node_id = (qs.get("node_id") or [""])[0]
             with db() as conn:
@@ -425,6 +522,7 @@ class Handler(BaseHTTPRequestHandler):
                              (node_id, lease_until, row["job_id"]))
                 job = json.loads(row["payload"])
                 job["job_id"] = row["job_id"]
+                job["owner_client_id"] = row["owner_client_id"]
                 job["dispatch_jwt"] = nc.issue_job_jwt(
                     _router_private_key, node_id, row["job_id"], ttl_s=JOB_LEASE_SECONDS)
                 return self._json({"job": job})
@@ -433,6 +531,11 @@ class Handler(BaseHTTPRequestHandler):
             with db() as conn:
                 row = conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
                 if row is None:
+                    return self._json({"error": "unknown job"}, 404)
+                client_id = self.headers.get("X-Nexus-Client-ID")
+                is_admin = self.headers.get("X-Nexus-Client-Admin") == "1"
+                if not job_access_allowed(row["owner_client_id"], client_id, is_admin):
+                    # Hide both the existence and content of another client's job.
                     return self._json({"error": "unknown job"}, 404)
                 rec = conn.execute("SELECT * FROM receipts WHERE job_id=?", (job_id,)).fetchone()
                 out = {"job_id": job_id, "status": row["status"], "node_id": row["node_id"],
@@ -451,10 +554,18 @@ class Handler(BaseHTTPRequestHandler):
                 splits = {"node": 0, "nram_author": 0, "verification": 0, "burn": 0, "treasury": 0}
                 tot_in = tot_out = tot_price = 0
                 max_disc = 0.0
+                royalties: dict[str, int] = {}
                 for r in rows:
                     receipt = json.loads(r["receipt"])
                     for k in splits:
                         splits[k] += receipt["shares"].get(k, 0)
+                    for nram_id in receipt.get("nram_used") or []:
+                        author = conn.execute("SELECT author_id FROM nram_assets WHERE nram_id=?",
+                                              (nram_id,)).fetchone()
+                        if author is not None:
+                            royalties[author["author_id"]] = (
+                                royalties.get(author["author_id"], 0)
+                                + receipt["shares"].get("nram_author", 0))
                     tot_in += r["input_tokens"]
                     tot_out += r["output_tokens"]
                     tot_price += r["price_micro"]
@@ -467,6 +578,7 @@ class Handler(BaseHTTPRequestHandler):
                     "total_price_micro_usd": tot_price,
                     "total_price_usd": tot_price / 1_000_000,
                     "splits_micro_usd": splits,
+                    "royalties_micro_usd_by_author": royalties,
                     "max_discrepancy_pct": max_disc,
                 })
         return self._json({"error": "not found"}, 404)
@@ -480,6 +592,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "unauthorized"}, 401)
         with _lock, db() as conn:
             purge_expired_content(conn)
+        if path == "/nram":
+            return self._handle_nram_upload()
         try:
             body = self._body()
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -543,7 +657,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True})
         if path == "/jobs":
             try:
-                job_id = self._create_job(body)
+                job_id = self._create_job(body, self.headers.get("X-Nexus-Client-ID"))
             except OverflowError as exc:
                 return self._json({"error": "queue_full", "detail": str(exc)}, 429)
             except ValueError as exc:
@@ -552,6 +666,38 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/jobs/") and path.endswith("/result"):
             return self._handle_worker_result(path, body)
         return self._json({"error": "not found"}, 404)
+
+    def _handle_nram_upload(self):
+        """Publish one NRA-M v2 bundle as raw bytes; the id is its SHA-256."""
+        author = self.headers.get("X-Nexus-Client-ID") or ""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", author):
+            return self._json({"error": "invalid_request",
+                               "detail": "X-Nexus-Client-ID must name the publisher"}, 400)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return self._json({"error": "invalid_request", "detail": "invalid Content-Length"}, 400)
+        if length <= 0:
+            return self._json({"error": "invalid_request", "detail": "empty bundle"}, 400)
+        if length > nr.MAX_BUNDLE_BYTES:
+            return self._json({"error": "payload_too_large", "detail": "bundle exceeds 64 MiB"}, 413)
+        data = self.rfile.read(length)
+        if len(data) != length:
+            return self._json({"error": "invalid_request", "detail": "truncated upload"}, 400)
+        try:
+            info = nr.inspect_bundle(data)
+        except nr.NramError as exc:
+            return self._json({"error": "invalid_bundle", "detail": str(exc)}, 400)
+        nram_id = nr.bundle_id(data)
+        with _lock, db() as conn:
+            if conn.execute("SELECT 1 FROM nram_assets WHERE nram_id=?", (nram_id,)).fetchone():
+                return self._json({"error": "already_published", "nram_id": nram_id}, 409)
+            nr.store_bundle(_db_path.parent, nram_id, data)
+            conn.execute("INSERT INTO nram_assets VALUES(?,?,?,?,?,?,?)",
+                         (nram_id, author, info["name"], info["version"], info["size_bytes"],
+                          json.dumps(info["manifest"], sort_keys=True), nc.utc_now_iso()))
+        return self._json({"nram_id": nram_id, "author_id": author, "name": info["name"],
+                           "version": info["version"], "size_bytes": info["size_bytes"]}, 201)
 
     def _handle_chat_completion(self, body: dict):
         messages = body.get("messages")
@@ -592,7 +738,7 @@ class Handler(BaseHTTPRequestHandler):
                        "max_tokens": max_tokens, "stream": False},
         }
         try:
-            job_id = self._create_job(job_payload)
+            job_id = self._create_job(job_payload, self.headers.get("X-Nexus-Client-ID"))
         except OverflowError as exc:
             return self._json({"error": {"type": "queue_full", "message": str(exc)}}, 429)
         except ValueError as exc:
@@ -786,7 +932,7 @@ def main():
     ap.add_argument("--dir", default=str(BASE))
     ap.add_argument("--mode", choices=("local", "remote"), default="local")
     ap.add_argument("--host", default="127.0.0.1",
-                    help="remote mode only: a private or loopback IPv4 address")
+                    help="remote mode only: private/loopback IPv4, or 'auto' for a container's private IPv4")
     ap.add_argument("--tls-cert", help="TLS server certificate PEM path")
     ap.add_argument("--tls-key", help="TLS private key PEM path")
     ap.add_argument("--client-token-file", help="0600 file containing the chat/models bearer token")
@@ -806,7 +952,7 @@ def main():
             ap.error("remote mode requires --tls-cert, --tls-key, --client-token-file, "
                      "and --enrollment-token-file")
         try:
-            host = validate_bind_host(args.host)
+            host = resolve_bind_host(args.host)
             if ipaddress.ip_address(host).version != 4:
                 raise ValueError("remote mode currently supports IPv4 bind addresses only")
             _client_api_token = _read_secret_file(args.client_token_file, "client token")

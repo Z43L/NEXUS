@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / "nexus" / "h0"))
 
 import nexus_common as nc
-from batch_builder import ZERO_ADDRESS, verify_claim
+from batch_builder import ZERO_ADDRESS, SettlementContext, settlement_batch_commitment, verify_claim
 from receipt_to_batch import _amount_in_base_units, _load_config, _settlement_job_id, read_verified_jobs
 
 
@@ -140,6 +140,13 @@ class ReceiptBridgeTests(unittest.TestCase):
         self.assertEqual(batch["tokenPolicy"]["usdPerTokenDenominator"],
                          self.cfg["token"]["usdPerTokenDenominator"])
         self.assertEqual(batch["settlementContext"], SETTLEMENT_CONTEXT)
+        self.assertEqual(
+            batch["settlementBatchCommitment"],
+            "0x" + settlement_batch_commitment(
+                SettlementContext.from_mapping(batch["settlementContext"]),
+                batch["batchId"], batch["root"], batch["rootSum"],
+            ).hex(),
+        )
         claim_id = batch["claims"][0]["jobId"]
         self.assertEqual(batch["sourceReceipts"][claim_id]["routerJobId"], "job_000001")
         self.assertEqual(claim_id, _settlement_job_id(self.receipt, nc.sign_receipt(self.private_key, self.receipt)))

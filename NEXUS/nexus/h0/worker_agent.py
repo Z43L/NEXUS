@@ -33,9 +33,10 @@ def http_json(url: str, payload: dict | None = None, timeout=600) -> dict:
 
 
 class Worker:
-    def __init__(self, router: str, atenea: str, node_dir: Path):
+    def __init__(self, router: str, atenea: str, node_dir: Path, nram_capable: bool = False):
         self.router = router.rstrip("/")
         self.atenea = atenea.rstrip("/")
+        self.nram_capable = nram_capable
         self.priv, self.pub_pem, self.node_id = nc.load_or_create_node_key(node_dir)
         self.model_id = None
         self.models: list[str] = []
@@ -151,6 +152,15 @@ class Worker:
                                       "dispatch_jwt": job.get("dispatch_jwt", "")})
             print(f"[{job_id}] rejected: tools requested", flush=True)
             return
+        # H2: a receipt may only claim a .nram the engine really applied. The
+        # engine has no per-request adapter selection yet, so refuse instead of
+        # signing a receipt that would pay an author for unused weights.
+        if job.get("nram") and not self.nram_capable:
+            self.post_result(job_id, {"status": "rejected",
+                                      "error": "nram_unsupported_by_engine",
+                                      "dispatch_jwt": job.get("dispatch_jwt", "")})
+            print(f"[{job_id}] rejected: nram requested but engine cannot apply it", flush=True)
+            return
         started = time.time()
         started_iso = nc.utc_now_iso()
         model_id = nc.resolve_model(job.get("model", ""), self.models)
@@ -243,8 +253,11 @@ def main():
     ap.add_argument("--atenea", default="http://127.0.0.1:11436",
                     help="Atenhea ENGINE base URL (not the :11434 agent proxy)")
     ap.add_argument("--node-dir", default=str(BASE / "node"))
+    ap.add_argument("--nram-capable", action="store_true",
+                    help="declare that the engine applies .nram adapters per request")
     args = ap.parse_args()
-    Worker(args.router, args.atenea, Path(args.node_dir)).serve_forever()
+    Worker(args.router, args.atenea, Path(args.node_dir),
+           nram_capable=args.nram_capable).serve_forever()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,3 @@
+Source: https://github.com/Z43L/CHL-episodic-agent-memory
+Commit: 3d5d7700384b55c2c29c84d8a7becb91eaf210ef
+Vendored into this repository so that Atenhea runs from a single tree. Update by replacing this directory and this file together.

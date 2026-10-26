@@ -9,16 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
 import shutil
 import socket
+import ssl
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from http.client import HTTPConnection
 from urllib.parse import urlsplit
@@ -26,6 +29,10 @@ from urllib.request import Request, urlopen
 
 from batch_builder import keccak256
 from cryptography.hazmat.primitives import serialization
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 # Keep generated Python bytecode out of the source tree during this disposable run.
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -71,6 +78,75 @@ def contract_call(url: str, address: str, signature: str) -> bytes:
     return bytes.fromhex(result.removeprefix("0x"))
 
 
+def create_router_tls_credentials(directory: Path) -> dict[str, Path | str]:
+    """Create disposable CA/server credentials and separate Router secrets."""
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o700)
+    now = datetime.now(timezone.utc)
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "NEXUS E2E CA")])
+    ca_certificate = (
+        x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name)
+        .public_key(ca_key.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False,
+                                     key_encipherment=False, data_encipherment=False,
+                                     key_agreement=False, key_cert_sign=True,
+                                     crl_sign=True, encipher_only=None, decipher_only=None),
+                       critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+    server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    server_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    server_certificate = (
+        x509.CertificateBuilder().subject_name(server_name).issuer_name(ca_name)
+        .public_key(server_key.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([
+            x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+            x509.DNSName("localhost"),
+        ]), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    def write_private(name: str, value: bytes) -> Path:
+        path = directory / name
+        path.write_bytes(value)
+        path.chmod(0o600)
+        return path
+
+    ca_path = write_private("router-ca.crt", ca_certificate.public_bytes(
+        serialization.Encoding.PEM
+    ))
+    certificate_path = write_private("router.crt", server_certificate.public_bytes(
+        serialization.Encoding.PEM
+    ))
+    key_path = write_private("router.key", server_key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    ))
+    service_token = "service-" + os.urandom(32).hex()
+    enrollment_token = "enroll-" + os.urandom(32).hex()
+    service_token_path = write_private("router-client.token", (service_token + "\n").encode())
+    enrollment_token_path = write_private(
+        "router-enrollment.token", (enrollment_token + "\n").encode()
+    )
+    return {
+        "ca": ca_path,
+        "certificate": certificate_path,
+        "key": key_path,
+        "service_token": service_token,
+        "service_token_file": service_token_path,
+        "enrollment_token": enrollment_token,
+        "enrollment_token_file": enrollment_token_path,
+    }
+
+
 def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], list[subprocess.Popen]]:
     """Run FastAPI, the real H0 router, mock engine and signed worker."""
     sys.path.insert(0, str(H0))
@@ -87,24 +163,47 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
             sock.bind(("127.0.0.1", 0))
             return sock.getsockname()[1]
     mock_port, router_port, api_port = free_port(), free_port(), free_port()
-    router_url = f"http://127.0.0.1:{router_port}"
+    ui_port = free_port()
+    ui_public_port = 8080
+    router_url = f"https://127.0.0.1:{router_port}"
     api_url = f"http://127.0.0.1:{api_port}"
-    api_token = "nexus-e2e-" + os.urandom(24).hex()
+    router_credentials = create_router_tls_credentials(directory / "router-tls")
+    # Match the current Compose path: FastAPI authenticates against a private
+    # digest-only client registry, while the BFF keeps the one-time key.
+    sys.path.insert(0, str(ROOT.parent))
+    from nexus.api import manage_api_clients
+    registry_dir = directory / "api-secrets"
+    registry_dir.mkdir(mode=0o700)
+    registry_dir.chmod(0o700)
+    registry_path = registry_dir / "api_clients.json"
+    api_token = manage_api_clients.manage(
+        registry_path, "add", "e2e-ui", "inference,models:read,jobs:read", quota=60
+    )
+    observer_token = manage_api_clients.manage(
+        registry_path, "add", "e2e-observer", "jobs:read", quota=60
+    )
+    assert api_token and observer_token
+    registry_contents = registry_path.read_text(encoding="utf-8")
+    if (api_token in registry_contents or observer_token in registry_contents
+            or registry_path.stat().st_mode & 0o077):
+        raise RuntimeError("API client registry contains plaintext or is not private")
     logs = [directory / "mock.log", directory / "router.log", directory / "worker.log",
-            directory / "api.log"]
+            directory / "api.log", directory / "web.log"]
     streams = [path.open("w+") for path in logs]
     procs = [
         subprocess.Popen([sys.executable, str(H0 / "mock_atenea.py"), "--port", str(mock_port)],
                          cwd=H0, stdout=streams[0], stderr=subprocess.STDOUT),
-        subprocess.Popen([sys.executable, str(H0 / "router.py"), "--port", str(router_port),
-                          "--dir", str(directory)], cwd=H0, stdout=streams[1], stderr=subprocess.STDOUT),
+        subprocess.Popen([
+            sys.executable, str(H0 / "router.py"), "--mode", "remote",
+            "--host", "127.0.0.1", "--port", str(router_port), "--dir", str(directory),
+            "--tls-cert", str(router_credentials["certificate"]),
+            "--tls-key", str(router_credentials["key"]),
+            "--client-token-file", str(router_credentials["service_token_file"]),
+            "--enrollment-token-file", str(router_credentials["enrollment_token_file"]),
+        ], cwd=H0, stdout=streams[1], stderr=subprocess.STDOUT),
     ]
-    procs.append(subprocess.Popen([sys.executable, str(H0 / "worker_agent.py"),
-                                   "--router", router_url,
-                                   "--atenea", f"http://127.0.0.1:{mock_port}",
-                                   "--node-dir", str(key_dir)], cwd=H0,
-                                  stdout=streams[2], stderr=subprocess.STDOUT))
     try:
+        router_context = ssl.create_default_context(cafile=str(router_credentials["ca"]))
         for _ in range(200):
             if any(proc.poll() is not None for proc in procs):
                 for stream in streams:
@@ -113,13 +212,24 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
                 details = "\n".join(stream.read() for stream in streams)
                 raise RuntimeError("an H0 E2E process exited during startup:\n" + details)
             try:
-                with urlopen(router_url + "/ready", timeout=0.5) as response:
+                with urlopen(router_url + "/ready", timeout=0.5,
+                             context=router_context) as response:
                     if response.status == 200:
                         break
             except (URLError, TimeoutError, OSError):
                 time.sleep(0.1)
         else:
             raise RuntimeError("H0 Router did not become ready")
+        # Start the worker only after the Router is reachable, avoiding an
+        # immediate registration race on slower CI/host startup.
+        procs.append(subprocess.Popen([sys.executable, str(ROOT.parent / "nexus-h1-node" / "worker2.py"),
+                                       "--router", router_url,
+                                       "--atenea", f"http://127.0.0.1:{mock_port}",
+                                       "--node-dir", str(key_dir),
+                                       "--router-ca", str(router_credentials["ca"]),
+                                       "--enrollment-token-file",
+                                       str(router_credentials["enrollment_token_file"])], cwd=H0,
+                                      stdout=streams[2], stderr=subprocess.STDOUT))
         # Wait until the worker has registered its signing key.
         for _ in range(100):
             with sqlite3.connect(directory / "nexus_h0.db") as conn:
@@ -131,9 +241,20 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
         api_env = {
             **os.environ,
             "NEXUS_H0_ROUTER_URL": router_url,
-            "NEXUS_API_TOKEN": api_token,
-            "NEXUS_API_RATE_LIMIT_PER_MINUTE": "60",
+            "NEXUS_H0_ROUTER_CA_FILE": str(router_credentials["ca"]),
+            "NEXUS_H0_CLIENT_TOKEN_FILE": str(router_credentials["service_token_file"]),
+            "NEXUS_API_CLIENTS_FILE": str(registry_path),
         }
+        # The gateway and BFF carry credentials and prompts; prove the full
+        # integration bypasses hostile ambient proxy configuration.
+        proxy_env = "http://127.0.0.1:1"
+        for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+                     "ALL_PROXY", "all_proxy"):
+            api_env[name] = proxy_env
+        api_env["NO_PROXY"] = api_env["no_proxy"] = ""
+        api_env.pop("NEXUS_API_TOKEN", None)
+        api_env.pop("NEXUS_API_TOKEN_FILE", None)
+        api_env.pop("NEXUS_H0_CLIENT_TOKEN", None)
         procs.append(subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "nexus.api.core.api_server:app",
              "--host", "127.0.0.1", "--port", str(api_port)],
@@ -152,6 +273,62 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
                 time.sleep(0.1)
         else:
             raise RuntimeError("FastAPI facade did not become ready")
+
+        web_env = {
+            **os.environ,
+            "NEXUS_H0_API_URL": api_url,
+            "NEXUS_API_TOKEN": api_token,
+            "NEXUS_H0_UI_PORT": str(ui_port),
+            # Model a Compose port mapping where the public Host port differs
+            # from the ephemeral port used by this local fixture.
+            "NEXUS_H0_UI_PUBLIC_PORT": str(ui_public_port),
+        }
+        for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+                     "ALL_PROXY", "all_proxy"):
+            web_env[name] = proxy_env
+        web_env["NO_PROXY"] = web_env["no_proxy"] = ""
+        procs.append(subprocess.Popen(
+            [sys.executable, str(ROOT.parent / "nexus-web" / "h0_local.py")],
+            cwd=ROOT.parent, env=web_env, stdout=streams[4], stderr=subprocess.STDOUT,
+        ))
+        ui_url = f"http://127.0.0.1:{ui_port}"
+        ui_host = f"127.0.0.1:{ui_public_port}"
+
+        def ui_request(path: str, body: bytes | None = None,
+                       content_type: str | None = None) -> Request:
+            headers = {"Host": ui_host}
+            if content_type:
+                headers["Content-Type"] = content_type
+            return Request(ui_url + path, data=body, headers=headers)
+
+        for _ in range(100):
+            if procs[-1].poll() is not None:
+                streams[4].flush()
+                streams[4].seek(0)
+                raise RuntimeError("same-origin UI exited during startup:\n" + streams[4].read())
+            try:
+                with urlopen(ui_request("/"), timeout=0.5) as response:
+                    page = response.read()
+                    if response.status == 200:
+                        break
+            except (URLError, TimeoutError, OSError):
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("same-origin UI did not become ready")
+        if api_token.encode() in page:
+            raise RuntimeError("same-origin UI exposed its server-side API token")
+        with urlopen(ui_request("/v1/models"), timeout=5) as response:
+            models = json.loads(response.read())
+        if not models.get("data"):
+            raise RuntimeError("same-origin UI could not retrieve models through FastAPI")
+        try:
+            with urlopen(Request(ui_url + "/v1/models", headers={
+                "Host": ui_host, "Origin": f"http://evil.example:{ui_public_port}",
+            }), timeout=5):
+                raise RuntimeError("same-origin UI accepted a foreign browser Origin")
+        except HTTPError as exc:
+            if exc.code != 403:
+                raise RuntimeError(f"same-origin UI foreign Origin returned HTTP {exc.code}") from exc
 
         # The public client path must reject an absent token before the Router
         # creates a job. Then use the Python SDK through the authenticated API.
@@ -180,11 +357,45 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
         if oversized_status != 413:
             raise RuntimeError(f"FastAPI oversized request returned HTTP {oversized_status}")
 
+        # Exercise the browser-facing same-origin proxy with no client credential.
+        ui_payload = json.dumps({
+            "model": "athenea-e2b", "messages": [{"role": "user", "content": "E2E settlement job one"}],
+            "max_tokens": 3,
+        }).encode()
+        with urlopen(ui_request("/v1/chat/completions", ui_payload, "application/json"),
+                     timeout=310) as response:
+            ui_completion = json.loads(response.read())
+        ui_job_id = ui_completion.get("id")
+        if not isinstance(ui_job_id, str) or not ui_job_id.startswith("job_"):
+            raise RuntimeError("same-origin UI returned no Router job ID")
+        with urlopen(ui_request("/jobs/" + ui_job_id), timeout=5) as response:
+            ui_job = json.loads(response.read())
+        if ui_job.get("id", ui_job.get("job_id")) != ui_job_id:
+            raise RuntimeError("same-origin UI status route did not return the requested job")
+        try:
+            with urlopen(Request(api_url + "/jobs/" + ui_job_id,
+                                 headers={"Authorization": f"Bearer {observer_token}"}),
+                         timeout=5):
+                raise RuntimeError("an unrelated API client could read another client's job")
+        except HTTPError as exc:
+            if exc.code != 404:
+                raise RuntimeError(
+                    f"cross-client job lookup returned HTTP {exc.code}, expected 404"
+                ) from exc
+
         sys.path.insert(0, str(ROOT.parent / "nexus-sdk-python"))
-        from nexus_client import NexusClient
-        client = NexusClient(api_key=api_token, base_url=api_url, timeout=310)
-        for text in ("E2E settlement job one", "E2E settlement job two"):
-            completion = asyncio.run(client.chat(text, model="athenea-e2b", max_tokens=3, timeout_s=300))
+        proxy_names = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+                       "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")
+        old_proxy_env = {name: os.environ.get(name) for name in proxy_names}
+        try:
+            for name in proxy_names[:6]:
+                os.environ[name] = "http://127.0.0.1:1"
+            os.environ["NO_PROXY"] = os.environ["no_proxy"] = ""
+            from nexus_client import NexusClient
+            client = NexusClient(api_key=api_token, base_url=api_url, timeout=310)
+            completion = asyncio.run(client.chat(
+                "E2E settlement job two", model="athenea-e2b", max_tokens=3, timeout_s=300
+            ))
             job_id = completion.get("id")
             if not isinstance(job_id, str) or not job_id.startswith("job_"):
                 raise RuntimeError(f"Authenticated API returned no Router job ID: {completion}")
@@ -194,6 +405,12 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
             if job_row != ("done",) or receipt_row != (1,):
                 row = (job_row, receipt_row)
                 raise RuntimeError(f"FastAPI -> Router -> worker job was not verified: {job_id} {row}")
+        finally:
+            for name, value in old_proxy_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
         db_path = directory / "nexus_h0.db"
     except Exception:
         for proc in reversed(procs):
@@ -409,6 +626,7 @@ def main() -> int:
                 "NEXUS_SETTLEMENT_TREASURY": "0x0000000000000000000000000000000000001001",
                 "NEXUS_SETTLEMENT_VERIFICATION_POOL": "0x0000000000000000000000000000000000001002",
                 "NEXUS_SETTLEMENT_EXPECTED_POLICY_HASH": policy_hash,
+                "NEXUS_SETTLEMENT_EXPECTED_BATCH_COMMITMENT": batch["settlementBatchCommitment"],
                 "NEXUS_SETTLEMENT_PAYER_PRIVATE_KEY": ANVIL_TEST_KEY,
                 "NEXUS_SETTLEMENT_SIGNER_PRIVATE_KEY": ANVIL_SIGNER_KEY,
                 "NEXUS_SETTLEMENT_CLAIM_DEADLINE": str(deadline),
@@ -440,6 +658,18 @@ def main() -> int:
             ):
                 raise RuntimeError("batch publisher did not reject an unapproved settlement policy hash:\n"
                                    + policy_preflight.stdout + policy_preflight.stderr)
+            tampered_batch = {**batch, "root": "0x" + "11" * 32}
+            commitment_preflight = subprocess.run(
+                [forge, "script", publish_script, "--rpc-url", rpc_url, "--non-interactive",
+                 "--sig", "run(string)", json.dumps(tampered_batch), "-vvv"],
+                cwd=ROOT, env=publish_env, check=False, capture_output=True, text=True,
+            )
+            if (commitment_preflight.returncode == 0
+                    or "NEXUS_SETTLEMENT_BATCH_COMMITMENT_MISMATCH" not in (
+                        commitment_preflight.stdout + commitment_preflight.stderr
+                    )):
+                raise RuntimeError("batch publisher did not reject a substituted Merkle root:\n"
+                                   + commitment_preflight.stdout + commitment_preflight.stderr)
             bad_context = {**publish_env, "NEXUS_SETTLEMENT_TOKEN": operational_escrow}
             context_preflight = subprocess.run(
                 [forge, "script", publish_script, "--rpc-url", rpc_url, "--non-interactive",

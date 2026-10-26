@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import os
 import asyncio
+import datetime as dt
 import importlib.util
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -31,8 +33,21 @@ assert H1_COMMON_SPEC and H1_COMMON_SPEC.loader
 h1_common = importlib.util.module_from_spec(H1_COMMON_SPEC)
 H1_COMMON_SPEC.loader.exec_module(h1_common)
 
-MOCK_PORT = 11437
-ROUTER_PORT = 18081
+def free_ports(count: int) -> tuple[int, ...]:
+    """Choose distinct currently unused loopback ports for isolated processes."""
+    ports: set[int] = set()
+    while len(ports) < count:
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            ports.add(listener.getsockname()[1])
+    return tuple(ports)
+
+
+def free_port() -> int:
+    return free_ports(1)[0]
+
+
+MOCK_PORT, ROUTER_PORT = free_ports(2)
 ROUTER = f"http://127.0.0.1:{ROUTER_PORT}"
 
 
@@ -167,6 +182,24 @@ def main() -> int:
 
         models_status, models = http_json(ROUTER + "/v1/models")
         assert models_status == 200 and any(m["id"] == "athenea-e2b" for m in models["data"]), models
+        stale_heartbeat = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+            seconds=router_module.NODE_HEARTBEAT_TTL_SECONDS + 60
+        )).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with sqlite3.connect(tmp / "nexus_h0.db") as conn:
+            conn.execute(
+                "INSERT INTO nodes(node_id,pubkey_pem,models,nram,region,last_heartbeat) "
+                "VALUES(?,?,?,?,?,?)",
+                ("node_stale_test", "unused", '["stale-only-model"]', "[]", "test",
+                 stale_heartbeat),
+            )
+        models_status, models = http_json(ROUTER + "/v1/models")
+        assert models_status == 200 and not any(
+            model["id"] == "stale-only-model" for model in models["data"]
+        ), models
+        with urllib.request.urlopen(ROUTER + "/metrics") as metrics_resp:
+            metrics = metrics_resp.read().decode()
+        assert f"nexus_h0_nodes_registered 1" in metrics, metrics
+        print("stale worker heartbeats are excluded from model discovery and active-node metrics: PASS")
 
         subprocess.run([py, str(BASE / "gen_jobs.py")], check=True, capture_output=True)
         report_path = tmp / "report.json"
@@ -202,7 +235,7 @@ def main() -> int:
 
         # The browser UI is served same-origin and proxies only the local H0
         # model and chat endpoints.
-        ui_port = 18084
+        ui_port = free_port()
         ui_url = f"http://127.0.0.1:{ui_port}"
         ui_env = dict(os.environ, NEXUS_H0_ROUTER_URL=ROUTER,
                       NEXUS_H0_UI_PORT=str(ui_port))
@@ -357,7 +390,7 @@ def main() -> int:
 
         # --- Phase 2: engine without the chat counting endpoint -------------
         # Mirrors David's local Atenhea: only /v1/messages/count_tokens exists.
-        mock2_port, router2_port = 11438, 18082
+        mock2_port, router2_port = free_ports(2)
         router2 = f"http://127.0.0.1:{router2_port}"
         tmp2 = Path(tempfile.mkdtemp(prefix="nexus-h0-test2-"))
         env = dict(os.environ, MOCK_DISABLE_CHAT_COUNT="1")
@@ -393,7 +426,7 @@ def main() -> int:
 
         # Two H1 workers use node-signed requests and router-issued JWTs;
         # staggered mock inference forces the scheduler to distribute work.
-        mock3_port, router3_port = 11439, 18083
+        mock3_port, router3_port = free_ports(2)
         router3 = f"http://127.0.0.1:{router3_port}"
         tmp3 = Path(tempfile.mkdtemp(prefix="nexus-h0-test3-"))
         # Atenhea commonly publishes a :latest model ID while H0 job templates

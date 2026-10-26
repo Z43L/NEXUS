@@ -50,13 +50,31 @@ function errorMessage(payload: any): string {
   return String(detail || 'NEXUS request failed');
 }
 
+function validateBaseURL(value: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new TypeError('baseURL must be a valid HTTP(S) origin');
+  }
+  const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname.toLowerCase());
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password
+      || !['', '/'].includes(parsed.pathname) || parsed.search || parsed.hash
+      || (parsed.protocol === 'http:' && !loopback)) {
+    throw new TypeError('baseURL must be a plain HTTPS origin unless it targets loopback');
+  }
+  return value.replace(/\/$/, '');
+}
+
 export class NexusClient {
   private readonly client: AxiosInstance;
 
   constructor(config: NexusSDKConfig = {}) {
     this.client = axios.create({
-      baseURL: (config.baseURL || 'http://127.0.0.1:8000').replace(/\/$/, ''),
+      baseURL: validateBaseURL(config.baseURL || 'http://127.0.0.1:8000'),
       timeout: config.timeout ?? 300_000,
+      maxRedirects: 0,
+      proxy: false,
       headers: {
         Accept: 'application/json',
         ...(config.apiKey ? { 'X-API-Key': config.apiKey } : {}),

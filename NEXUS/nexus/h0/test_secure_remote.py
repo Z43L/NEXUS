@@ -137,7 +137,65 @@ def test_migration_and_purge() -> None:
     print("legacy schema migration + idempotent content purge: PASS")
 
 
+def test_purge_scrubs_live_database_file() -> None:
+    with tempfile.TemporaryDirectory(prefix="nexus-secure-delete-") as folder:
+        path = Path(folder) / "retention.db"
+        previous_db = router._db_path
+        router._db_path = path
+        prompt_marker = "UNIQUE_PROMPT_RETENTION_MARKER_" + "p" * 96
+        output_marker = "UNIQUE_OUTPUT_RETENTION_MARKER_" + "o" * 96
+        try:
+            router.init_db()
+            conn = router.db()
+            try:
+                assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+                assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+                conn.execute(
+                    "INSERT INTO jobs(job_id, created_at, payload, result_text, status, "
+                    "content_expires_at) VALUES(?,?,?,?,?,?)",
+                    ("retention", "2020-01-01T00:00:00Z", prompt_marker,
+                     output_marker, "done", "2000-01-01T00:00:00Z"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            assert prompt_marker.encode() in path.read_bytes()
+            assert output_marker.encode() in path.read_bytes()
+
+            conn = router.db()
+            try:
+                assert router.purge_expired_content(conn, "2026-10-25T00:00:00Z") == 1
+                conn.commit()
+            finally:
+                conn.close()
+
+            database_bytes = path.read_bytes()
+            assert prompt_marker.encode() not in database_bytes
+            assert output_marker.encode() not in database_bytes
+            assert not Path(str(path) + "-journal").exists()
+        finally:
+            router._db_path = previous_db
+    print("live SQLite file scrub on content expiry: PASS")
+
+
 def test_secure_remote() -> None:
+    from unittest.mock import patch
+
+    with patch.object(router.socket, "getaddrinfo", return_value=[
+        (router.socket.AF_INET, router.socket.SOCK_STREAM, 6, "", ("172.18.0.2", 0)),
+    ]):
+        assert router.resolve_bind_host("auto") == "172.18.0.2"
+    for unsafe_address in ("127.0.0.1", "169.254.1.2", "8.8.8.8"):
+        with patch.object(router.socket, "getaddrinfo", return_value=[
+            (router.socket.AF_INET, router.socket.SOCK_STREAM, 6, "", (unsafe_address, 0)),
+        ]):
+            try:
+                router.resolve_bind_host("auto")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"container auto bind accepted unsafe address {unsafe_address}")
+
     with tempfile.TemporaryDirectory(prefix="nexus-remote-") as folder:
         tmp = Path(folder)
         try:
@@ -147,6 +205,24 @@ def test_secure_remote() -> None:
             pass
         else:
             raise AssertionError("worker allowed plaintext Router traffic off loopback")
+        try:
+            worker2.Worker("http://127.0.0.1:18080", "http://192.168.1.20:11436",
+                           tmp / "insecure-engine-node", "")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("worker allowed plaintext Atenhea traffic to a remote host")
+        try:
+            worker2.Worker("http://127.0.0.1:18080", "http://host.docker.internal:11436",
+                           tmp / "desktop-engine-node", "")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("worker allowed plaintext Atenhea traffic to host.docker.internal")
+        engine_key = tmp / "engine.key"
+        write_secret(engine_key, "engine-" + os.urandom(16).hex())
+        worker2.Worker("http://127.0.0.1:18080", "https://engine.example:11436",
+                       tmp / "tls-engine-node", "", atenea_api_key_file=str(engine_key))
         ca_key, ca_cert, ca_path = make_ca(tmp, "NEXUS-test-CA")
         wrong_ca_key, wrong_ca_cert, wrong_ca_path = make_ca(tmp, "NEXUS-wrong-CA")
         cert_path, key_path = make_server_cert(tmp, ca_key, ca_cert)
@@ -303,5 +379,6 @@ def test_secure_remote() -> None:
 
 if __name__ == "__main__":
     test_migration_and_purge()
+    test_purge_scrubs_live_database_file()
     test_secure_remote()
     print("ALL SECURE REMOTE TESTS PASS")

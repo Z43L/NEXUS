@@ -1,0 +1,32 @@
+{
+  "date": "2026-10-26",
+  "scope": "Local H0 receipt bridge to Anvil settlement E2E",
+  "runtime": {
+    "python": "3.12.15",
+    "foundry": "1.8.6",
+    "solidity": "0.8.24",
+    "chain_id": 31337,
+    "rpc_binding": "127.0.0.1",
+    "network": "disposable local Anvil; no public chain"
+  },
+  "checks": {
+    "python_settlement_tests": "31/31 pass",
+    "foundry_tests": "21/21 pass",
+    "forge_fmt_check": "pass",
+    "router_worker_api_ui_mock_to_sqlite_bridge": "pass",
+    "contract_deployment_guard": "pass",
+    "local_token_and_escrow_deployment": "pass",
+    "negative_preflight_cases": "pass",
+    "batch_publication": "pass",
+    "claim_many": "pass",
+    "claims": 2,
+    "root_sum": 20000,
+    "result": "NEXUS BRIDGE -> ANVIL E2E PASS"
+  },
+  "limitations": [
+    "Uses a local mock token, synthetic prices, and disposable test identities; it does not demonstrate real economic settlement.",
+    "This E2E did not include NRAM royalty attribution; that behavior is covered by separate contract and bridge tests.",
+    "No Base Sepolia or other public testnet transaction was sent.",
+    "The gateway signer still attests off-chain verification; independent signer and contract audits remain required before testnet."
+  ]
+}

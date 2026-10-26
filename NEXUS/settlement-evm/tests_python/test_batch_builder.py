@@ -12,6 +12,7 @@ from batch_builder import (
     build_batch,
     encode_job_leaf,
     keccak256,
+    settlement_batch_commitment,
     verify_claim,
 )
 
@@ -42,6 +43,24 @@ class KeccakTests(unittest.TestCase):
         self.assertEqual(encoded[224:256].hex(), "00" * 12 + job["author"][2:])
         self.assertEqual(encoded[256:].hex(), job["amount"].to_bytes(32, "big").hex())
         self.assertEqual("0x" + keccak256(encoded).hex(), job["leafHash"])
+
+    def test_batch_commitment_binds_context_root_and_sum(self):
+        batch = VECTORS["batch"]
+        context = SettlementContext.from_mapping(CONTEXT)
+        commitment = settlement_batch_commitment(
+            context, batch["batchId"], batch["root"], batch["rootSum"]
+        )
+        self.assertEqual(len(commitment), 32)
+        self.assertNotEqual(commitment, settlement_batch_commitment(
+            SettlementContext(context.chain_id + 1, context.escrow_address, context.token_address),
+            batch["batchId"], batch["root"], batch["rootSum"],
+        ))
+        self.assertNotEqual(commitment, settlement_batch_commitment(
+            context, batch["batchId"], "0x" + "11" * 32, batch["rootSum"]
+        ))
+        self.assertNotEqual(commitment, settlement_batch_commitment(
+            context, batch["batchId"], batch["root"], batch["rootSum"] + 1
+        ))
 
 
 class BatchBuilderTests(unittest.TestCase):

@@ -15,7 +15,10 @@ import argparse
 import hashlib
 import ipaddress
 import json
+import os
+import re
 import ssl
+import stat
 import threading
 import time
 import urllib.request
@@ -29,19 +32,91 @@ import jwt_auth
 BASE = Path(__file__).resolve().parent
 
 
-def http_json(url: str, payload: dict | None = None, timeout=600) -> dict:
+def validate_atenea_url(value: str) -> str:
+    """Allow HTTP only for loopback or an explicitly named test service."""
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:
+        raise ValueError("Atenhea URL is malformed") from None
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host.lower() == "localhost"
+    allowed_service = os.environ.get("NEXUS_H1_ALLOW_HTTP_SERVICE_NAME", "").strip().lower()
+    if allowed_service and not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", allowed_service):
+        raise ValueError("NEXUS_H1_ALLOW_HTTP_SERVICE_NAME must be one DNS service label")
+    if allowed_service and allowed_service != "mock-atenea":
+        raise ValueError("NEXUS_H1_ALLOW_HTTP_SERVICE_NAME is reserved for the private mock service")
+    if (parsed.scheme not in {"http", "https"} or not host
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path not in {"", "/"} or parsed.query or parsed.fragment
+            or port == 0):
+        raise ValueError("Atenhea URL must be a plain HTTP(S) origin")
+    if (parsed.scheme == "http" and not loopback and host.lower() != allowed_service):
+        raise ValueError("Atenhea HTTP requires loopback or an explicitly allowed Compose test service")
+    return value.rstrip("/")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_ENGINE_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _NoRedirect(),
+    urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+)
+
+
+def http_json(url: str, payload: dict | None = None, timeout=600,
+              headers: dict[str, str] | None = None) -> dict:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
     req = urllib.request.Request(url, data=data, method="GET" if payload is None else "POST",
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                                 headers=request_headers)
+    with _ENGINE_OPENER.open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def read_atenea_api_key(path: str | None) -> str | None:
+    if path is None:
+        return None
+    key_path = Path(path)
+    try:
+        key_stat = key_path.stat()
+        if key_path.is_symlink() or not stat.S_ISREG(key_stat.st_mode) or key_stat.st_mode & 0o077:
+            raise ValueError("Atenhea API key file permissions must be 0600")
+        value = key_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError("cannot read Atenhea API key file") from exc
+    if len(value) < 32:
+        raise ValueError("Atenhea API key must contain at least 32 characters")
+    return value
 
 
 class Worker:
     def __init__(self, router: str, atenea: str, node_dir: Path, wallet: str,
-                 router_ca: str | None = None, enrollment_token_file: str | None = None):
+                 router_ca: str | None = None, enrollment_token_file: str | None = None,
+                 atenea_api_key_file: str | None = None):
         self.router = router.rstrip("/")
-        self.atenea = atenea.rstrip("/")
+        self.atenea = validate_atenea_url(atenea)
+        self.atenea_api_key = self._read_atenea_api_key(atenea_api_key_file)
+        host = urlsplit(self.atenea).hostname or ""
+        # Only a loopback engine shares this process' trust boundary. Docker's
+        # host gateway and named services cross a container boundary and must
+        # authenticate even when they use an explicitly permitted HTTP route.
+        is_local_engine = host.lower() == "localhost"
+        try:
+            is_local_engine = is_local_engine or ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            pass
+        if not is_local_engine and self.atenea_api_key is None:
+            raise ValueError("remote Atenhea requires an API key file")
         self.wallet = wallet
         parsed_router = urlsplit(self.router)
         if (not parsed_router.hostname or parsed_router.username or parsed_router.password
@@ -63,6 +138,10 @@ class Worker:
                 raise ValueError("HTTP Router is allowed only on loopback without remote security options")
         else:
             raise ValueError("Router URL must use HTTPS remotely or HTTP on loopback locally")
+        self.router_opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect(),
+            urllib.request.HTTPSHandler(context=self.router_ssl_context),
+        )
         self.priv, self.pub_pem, self.node_id = nc.load_or_create_node_key(node_dir)
         self.ready_file = node_dir / ".worker-ready"
         # A previous container run may have left its marker in the persistent
@@ -73,6 +152,15 @@ class Worker:
         self.models: list[str] = []
         self.scaffolding_tokens = 0
         self.router_pub_pem = ""
+
+    @staticmethod
+    def _read_atenea_api_key(path: str | None) -> str | None:
+        return read_atenea_api_key(path)
+
+    def _atenea_headers(self) -> dict[str, str]:
+        if self.atenea_api_key is None:
+            return {}
+        return {"Authorization": f"Bearer {self.atenea_api_key}"}
 
     @staticmethod
     def _read_enrollment_token(path: str) -> str:
@@ -95,19 +183,20 @@ class Worker:
         headers["X-Nexus-Node-ID"] = self.node_id
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(self.router + path, data=data, method=method, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout,
-                                    context=self.router_ssl_context) as resp:
+        with self.router_opener.open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def atenea_models(self) -> list[str]:
-        out = http_json(self.atenea + "/v1/models", timeout=15)
+        out = http_json(self.atenea + "/v1/models", timeout=15,
+                        headers=self._atenea_headers())
         return [m.get("id", "") for m in out.get("data", []) if m.get("id")]
 
     def count_input_tokens(self, messages: list[dict]) -> int | None:
         for path in ("/v1/chat/completions/input_tokens", "/v1/messages/count_tokens"):
             try:
                 out = http_json(self.atenea + path,
-                                {"model": self.model_id, "messages": messages}, timeout=120)
+                                {"model": self.model_id, "messages": messages}, timeout=120,
+                                headers=self._atenea_headers())
                 return int(out["input_tokens"])
             except urllib.error.HTTPError as exc:
                 if exc.code != 404:
@@ -122,7 +211,7 @@ class Worker:
         resp = http_json(self.atenea + "/v1/chat/completions", {
             "model": self.model_id, "messages": probe,
             "temperature": 0.0, "max_tokens": 1, "stream": False,
-        }, timeout=1200)
+        }, timeout=1200, headers=self._atenea_headers())
         eng_prompt = int((resp.get("usage") or {}).get("prompt_tokens", counted))
         return max(0, eng_prompt - counted)
 
@@ -136,7 +225,11 @@ class Worker:
             "stream": False,
             "nexus_worker": True,
         }
-        return http_json(self.atenea + "/v1/chat/completions", payload, timeout=1200)
+        owner = job.get("owner_client_id")
+        if owner is not None:
+            payload["nexus_user"] = owner
+        return http_json(self.atenea + "/v1/chat/completions", payload, timeout=1200,
+                         headers=self._atenea_headers())
 
     def register(self, models: list[str], nram: list[str]) -> None:
         out = self.router_json("/nodes/register", {
@@ -272,11 +365,14 @@ def main():
     ap.add_argument("--router-ca", help="CA PEM used to verify an HTTPS Router")
     ap.add_argument("--enrollment-token-file",
                     help="0600 file containing the one-time node enrollment token")
+    ap.add_argument("--atenea-api-key-file",
+                    help="0600 file containing the worker credential for Atenhea")
     args = ap.parse_args()
     try:
         worker = Worker(args.router, args.atenea, Path(args.node_dir), args.wallet,
                         router_ca=args.router_ca,
-                        enrollment_token_file=args.enrollment_token_file)
+                        enrollment_token_file=args.enrollment_token_file,
+                        atenea_api_key_file=args.atenea_api_key_file)
     except (ValueError, OSError, ssl.SSLError) as exc:
         ap.error(f"invalid Router security configuration: {exc}")
     worker.serve_forever()

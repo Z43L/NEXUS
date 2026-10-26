@@ -67,6 +67,16 @@ contract PublishSettlementBatch {
             "NEXUS_SETTLEMENT_POLICY_HASH_MISMATCH"
         );
         _checkBatchContext(json, expectedChainId, plan.escrow, plan.token);
+        bytes32 commitment =
+            keccak256(abi.encode(expectedChainId, plan.escrow, plan.token, plan.batchId, plan.root, plan.rootSum));
+        require(
+            commitment == vm.envBytes32("NEXUS_SETTLEMENT_EXPECTED_BATCH_COMMITMENT"),
+            "NEXUS_SETTLEMENT_BATCH_COMMITMENT_MISMATCH"
+        );
+        require(
+            vm.parseJsonBytes32(json, ".settlementBatchCommitment") == commitment,
+            "NEXUS_SETTLEMENT_BATCH_ARTIFACT_COMMITMENT_MISMATCH"
+        );
 
         InferenceEscrow escrow = InferenceEscrow(plan.escrow);
         IERC20Settlement token = IERC20Settlement(plan.token);

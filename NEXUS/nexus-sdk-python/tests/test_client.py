@@ -25,7 +25,7 @@ class _Response:
 class NexusClientTests(unittest.TestCase):
     def test_default_model_allows_router_auto_selection(self):
         client = NexusClient()
-        with patch("nexus_client.urlopen", return_value=_Response()) as open_url:
+        with patch("nexus_client._HTTP_OPENER.open", return_value=_Response()) as open_url:
             asyncio.run(client.chat("hello"))
         payload = json.loads(open_url.call_args.args[0].data.decode("utf-8"))
         self.assertEqual(payload["model"], "")
@@ -33,20 +33,20 @@ class NexusClientTests(unittest.TestCase):
 
     def test_client_token_is_sent_to_the_facade_as_api_key(self):
         client = NexusClient(api_key="client-token")
-        with patch("nexus_client.urlopen", return_value=_Response()) as open_url:
+        with patch("nexus_client._HTTP_OPENER.open", return_value=_Response()) as open_url:
             asyncio.run(client.chat("hello"))
         self.assertEqual(open_url.call_args.args[0].full_url, "http://127.0.0.1:8000/v1/chat/completions")
         self.assertEqual(open_url.call_args.args[0].get_header("X-api-key"), "client-token")
 
     def test_request_deadline_covers_router_deadline(self):
         client = NexusClient(timeout=30)
-        with patch("nexus_client.urlopen", return_value=_Response()) as open_url:
+        with patch("nexus_client._HTTP_OPENER.open", return_value=_Response()) as open_url:
             asyncio.run(client.chat("slow job", timeout_s=1800))
         self.assertEqual(open_url.call_args.kwargs["timeout"], 1810)
 
     def test_client_timeout_can_extend_router_deadline(self):
         client = NexusClient(timeout=2000)
-        with patch("nexus_client.urlopen", return_value=_Response()) as open_url:
+        with patch("nexus_client._HTTP_OPENER.open", return_value=_Response()) as open_url:
             asyncio.run(client.chat("slow job", timeout_s=1800))
         self.assertEqual(open_url.call_args.kwargs["timeout"], 2000)
 
@@ -60,12 +60,26 @@ class NexusClientTests(unittest.TestCase):
         }}}
         http_error = HTTPError("http://localhost", 504, "timeout", {},
                                io.BytesIO(json.dumps(payload).encode()))
-        with patch("nexus_client.urlopen", side_effect=http_error):
+        with patch("nexus_client._HTTP_OPENER.open", side_effect=http_error):
             with self.assertRaises(NexusAPIError) as caught:
                 NexusClient()._send(Request("http://localhost"), 1)
         self.assertEqual(str(caught.exception), "still pending")
         self.assertEqual(caught.exception.status_code, 504)
         self.assertEqual(caught.exception.payload["detail"]["error"]["job_id"], "job_123")
+
+    def test_remote_http_base_urls_are_rejected_but_verified_https_is_allowed(self):
+        with self.assertRaises(ValueError):
+            NexusClient(api_key="secret", base_url="http://api.example.test")
+        self.assertEqual(NexusClient(base_url="http://localhost:8000").base_url,
+                         "http://localhost:8000")
+        self.assertEqual(NexusClient(base_url="https://api.example.test/").base_url,
+                         "https://api.example.test")
+
+    def test_base_url_rejects_credentials_and_query_parameters(self):
+        for value in ("https://user:pass@example.test", "https://api.example.test/?x=1",
+                      "file:///tmp/api"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                NexusClient(base_url=value)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,38 @@
+images:
+  routerWorker: ""
+  api: ""
+  web: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+secrets:
+  router: nexus-router
+  worker: nexus-worker
+  api: nexus-api
+  web: nexus-web
+atenea:
+  url: ""
+  allowHttpServiceName: ""
+worker:
+  replicas: 1
+  wallet: ""
+router:
+  heartbeatTtlSeconds: 30
+  storage:
+    size: 10Gi
+    storageClassName: ""
+api:
+  replicas: 1
+  maxBodyBytes: "1048576"
+  maxInflightInferences: "8"
+  sessionTtlSeconds: "3600"
+  authAllowedOrigins: ""
+web:
+  replicas: 2
+  publicPort: 8080
+  allowedHosts: ""
+  allowedOrigins: ""
+resources:
+  router: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1", memory: 1Gi } }
+  worker: { requests: { cpu: 250m, memory: 512Mi }, limits: { cpu: "2", memory: 2Gi } }
+  api: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1", memory: 1Gi } }
+  web: { requests: { cpu: 50m, memory: 64Mi }, limits: { cpu: 500m, memory: 256Mi } }

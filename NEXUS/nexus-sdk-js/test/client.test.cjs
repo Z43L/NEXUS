@@ -28,6 +28,21 @@ test('defaults to the FastAPI facade and sends the configured client token', asy
   await client.chat('hello');
   assert.equal(lastConfig.baseURL, 'http://127.0.0.1:8000');
   assert.equal(lastConfig.headers['X-API-Key'], 'client-token');
+  assert.equal(lastConfig.maxRedirects, 0);
+  assert.equal(lastConfig.proxy, false);
+});
+
+test('rejects remote plaintext API endpoints', () => {
+  assert.throws(() => new NexusClient({
+    apiKey: 'client-token', baseURL: 'http://api.example.test',
+  }), TypeError);
+  assert.throws(() => new NexusClient({
+    baseURL: 'https://user:password@api.example.test',
+  }), TypeError);
+  assert.throws(() => new NexusClient({
+    baseURL: 'https://api.example.test/v1',
+  }), TypeError);
+  assert.doesNotThrow(() => new NexusClient({ baseURL: 'https://api.example.test' }));
 });
 
 test('per-request HTTP deadline exceeds Router job deadline', async () => {

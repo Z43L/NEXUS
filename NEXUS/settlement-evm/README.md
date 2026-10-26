@@ -70,12 +70,15 @@ an explicit synthetic token price and wallet mapping; all generated files are
 removed with the temporary directory after the run.
 
 ```sh
-python3 -m pip install -r ../nexus/h0/requirements-h0.txt
+python3 -m pip install --require-hashes --only-binary=:all: -r ../nexus/h0/requirements-h0.txt
+python3 -m pip install --require-hashes -r ../nexus/api/requirements-h0.lock
 python3 e2e_local.py
 ```
 
-The first line installs the same pinned `cryptography` dependency used by the
-H0 receipt verifier. Use the same Python environment for both commands.
+The first line installs the pinned `cryptography` dependency used by the H0
+receipt verifier. The second installs the pinned FastAPI/Uvicorn runtime used
+by the API fixture and Python SDK. Use the same Python environment for all
+three commands; Python 3.12 is the CI reference runtime.
 
 Foundry binaries are detected from `PATH`; optionally set `FORGE_BIN` and
 `ANVIL_BIN` to explicit executable paths. This harness never contacts a public
@@ -133,11 +136,16 @@ The expected policy hash is the
 `settlementPolicyHash` value from the separately reviewed bridge artifact; keep
 that value and the batch artifact under change control. The bridge includes the
 configured deposit cap, token decimals, rational USD/token policy and source
-receipt index. Simulate before broadcasting:
+receipt index. Review and set `NEXUS_SETTLEMENT_EXPECTED_BATCH_COMMITMENT` to the
+artifact's `settlementBatchCommitment` value independently of the broadcast
+command. This commitment binds chain ID, escrow, token, batch ID, Merkle root,
+and root sum; the publisher recomputes it and rejects a substituted batch even
+when the policy configuration is unchanged. Simulate before broadcasting:
 
 ```sh
 : "${SETTLEMENT_RPC_URL:?Set the intended RPC URL}"
 : "${NEXUS_SETTLEMENT_BATCH_JSON:?Set the reviewed batch JSON path}"
+: "${NEXUS_SETTLEMENT_EXPECTED_BATCH_COMMITMENT:?Set the independently reviewed batch commitment}"
 BATCH_JSON="$(cat "$NEXUS_SETTLEMENT_BATCH_JSON")"
 forge script script/PublishSettlementBatch.s.sol:PublishSettlementBatch \
   --rpc-url "$SETTLEMENT_RPC_URL" --sig 'run(string)' "$BATCH_JSON"

@@ -59,6 +59,14 @@ plazo con `--content-retention-days` (1–3650). Las bases existentes se migran
 calculando la expiración desde `created_at`; el contenido antiguo que ya pasó
 el plazo se elimina al iniciar.
 
+El Router abre SQLite con `secure_delete=ON` y usa el modo de journal
+predeterminado `DELETE`. Una regresión confirma que marcadores únicos de
+prompt/salida ya no aparecen en el archivo activo tras expirar y confirmar la
+transacción, y que el rollback journal desaparece. Esto no expira backups
+creados por operadores, snapshots del host, restos del filesystem, cachés del
+engine externo ni logs; esos medios necesitan su propia política de retención
+y borrado antes de uso compartido.
+
 ## API de inferencia local
 
 El router implementa `POST /v1/chat/completions` para peticiones de texto no
@@ -68,7 +76,11 @@ Chat Completions y contiene `choices[0].message.content` y `usage`. Streaming,
 tools y mensajes multimodales no forman parte de H0. Las peticiones largas
 pueden devolver `504` con el identificador del trabajo, que continúa
 consultable en `GET /jobs/{job_id}`.
-`GET /v1/models` enumera los modelos que anuncian los workers registrados.
+`GET /v1/models` enumera los modelos que anuncian workers con heartbeat
+reciente. El TTL se configura con `NEXUS_H0_NODE_HEARTBEAT_TTL_SECONDS` (30 s
+por defecto, rango 10–3600 s; workers envían heartbeat cada 5 s). Los nodos
+desconectados dejan de anunciar capacidad al expirar el TTL; se conservan su
+identidad y sus recibos históricos.
 Cada worker selecciona el modelo pedido entre los IDs anunciados (admite el
 alias `:latest`); si no está disponible, rechaza el job. El Router comprueba
 que el modelo firmado en el recibo corresponde al solicitado antes de aceptar
@@ -127,11 +139,12 @@ launcher fija el directorio dedicado en modo 0700. Para una ruta personalizada
 imprime una advertencia y respeta sus permisos existentes; asegúrate de que sea
 privada y dedicada antes de usarla. No cambia permisos recursivamente. Respalda
 las claves aparte del ledger.
-El launcher instala [`requirements-h0.txt`](requirements-h0.txt), que fija
-`cryptography==50.0.2`. Es un pin directo reproducible, sin hashes ni lock
-transitivo de `cffi`/`pycparser`; una instalación nueva necesita acceso al
-índice de paquetes. Si se define `NEXUS_PYTHON`, ese Python debe tener la misma
-versión instalada.
+El launcher instala [`requirements-h0.txt`](requirements-h0.txt), que incluye
+el lock compartido `NEXUS/requirements-cryptography.lock`: fija
+`cryptography==50.0.2` y sus dependencias `cffi`/`pycparser`, exige hashes
+SHA-256 y wheels binarias para Linux glibc x86_64/aarch64 y macOS arm64. Una
+instalación nueva necesita acceso al índice de paquetes. Si se define
+`NEXUS_PYTHON`, ese Python debe tener la misma versión instalada.
 La puerta real limitada ejecutada en este entorno está resumida en
 `docs/evidence/h0-real-2026-10-25.json` desde la raíz del repositorio.
 
@@ -168,7 +181,7 @@ y puede tardar (el informe registra tokens/s reales del E2B).
 ## Probar sin Mac (en cualquier máquina)
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install -r requirements-h0.txt
+python3 -m venv .venv && .venv/bin/pip install --require-hashes --only-binary=:all: -r requirements-h0.txt
 .venv/bin/python test_h0.py
 .venv/bin/python test_secure_remote.py
 ```
@@ -183,19 +196,30 @@ un socket en la red privada ni prueba un despliegue remoto.
 
 ## Copia y restauración del ledger
 
-Detén Router y workers antes de copiar el ledger para obtener una copia SQLite
-consistente. Usa la API de backup de SQLite:
+El helper usa la API de backup de SQLite para obtener un snapshot consistente,
+purga contenido ya expirado en la copia, ejecuta `VACUUM` y elimina backups
+administrados con más de 30 días. Exige un directorio de destino privado con
+modo `0700`; los archivos de copia quedan en `0600`. Guarda el destino en
+almacenamiento cifrado y programa esta orden según el RPO operativo:
 
 ```sh
-cd NEXUS/nexus/h0
-sqlite3 nexus_h0.db ".backup 'nexus_h0.db.backup'"
+python3 NEXUS/nexus/h0/backup_h0.py \
+  --database /ruta/privada/h0-router/nexus_h0.db \
+  --backup-dir /volumen-cifrado/nexus-h0 \
+  --retention-days 30
 ```
 
-Para restaurar, conserva aparte el archivo actual y coloca la copia en su lugar
-con Router detenido:
+Solo elimina archivos gestionados llamados `nexus_h0_YYYYMMDDTHHMMSSZ.db`; no
+toca copias manuales ni symlinks. El snapshot conserva recibos/metadatos pero
+borra prompts y respuestas cuya retención ya venció. Esto no cubre versiones
+externas del volumen, snapshots del proveedor ni otros medios fuera de ese
+directorio.
+
+Para restaurar, detén Router, conserva aparte el archivo actual y coloca una
+copia elegida en su lugar:
 
 ```sh
-cp nexus_h0.db.backup nexus_h0.db
+cp /volumen-cifrado/nexus-h0/nexus_h0_YYYYMMDDTHHMMSSZ.db /ruta/privada/h0-router/nexus_h0.db
 ```
 
 El ledger incluye historial de trabajos y recibos, pero no las claves privadas

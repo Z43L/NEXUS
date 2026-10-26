@@ -1,0 +1,223 @@
+{
+  "date": "2026-10-26",
+  "scope": "Compose H0 container build and local runtime E2E",
+  "host": {
+    "os": "macOS 25.5",
+    "architecture": "arm64",
+    "runtime": "Colima 0.10.3",
+    "container_engine": "Docker Engine 29.5.2",
+    "compose": "Docker Compose 5.6.1"
+  },
+  "build": {
+    "base_image": "python:3.12.15-slim-bookworm",
+    "base_image_digest": "sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70",
+    "services": [
+      "router",
+      "api",
+      "web",
+      "mock-atenea"
+    ],
+    "result": "pass",
+    "notes": [
+      "Build used Docker's classic builder because buildx was unavailable.",
+      "The initial clean Router image build exposed missing hashed cffi and pycparser dependencies; the lock was corrected and the clean build then passed."
+    ]
+  },
+  "dependency_lock": {
+    "packages": [
+      "cryptography==50.0.2",
+      "cffi==2.1.1",
+      "pycparser==2.23"
+    ],
+    "pip_require_hashes_binary_wheel_checks": [
+      "Linux glibc x86_64 CPython 3.12: pass",
+      "Linux glibc aarch64 CPython 3.12: pass",
+      "macOS arm64 CPython 3.12: pass"
+    ]
+  },
+  "runtime": {
+    "compose_file": "NEXUS/compose.h0.yml",
+    "project_name": "nexus-e2e",
+    "network": "nexus-e2e_h0-private",
+    "test_engine": "Dos recorridos sobre el mismo Compose privado: perfil mock autocontenido y Atenhea real local vía host.docker.internal:11436; el engine no publicó puertos en el bridge.",
+    "test_override": "none; el mismo manifiesto Compose arranca el mock interno y los servicios de producto",
+    "published_ports": [
+      "127.0.0.1:18000 -> API 8000",
+      "127.0.0.1:18080 -> UI 8080"
+    ],
+    "service_health": {
+      "router": "healthy",
+      "worker": "healthy",
+      "mock-atenea": "healthy",
+      "api": "healthy",
+      "web": "healthy"
+    },
+    "result": "pass",
+    "http_allowlist": "NEXUS_H1_ALLOW_HTTP_SERVICE_NAME=mock-atenea, coincidencia exacta para el hostname del servicio",
+    "profile": "e2e",
+    "host_ports_bind_to_loopback": true,
+    "real_engine_e2e": {
+      "model": "athenea-e2b:latest",
+      "worker_health": "healthy",
+      "authenticated_api_chat": "pass",
+      "api_completion_tokens": 12,
+      "same_origin_ui_chat": "pass",
+      "ui_job_id": "job_000006",
+      "ui_job_status": "done",
+      "unauthenticated_api": 401,
+      "ui_token_absent_from_html": "pass"
+    },
+    "mock_engine_e2e": {
+      "profile": "e2e",
+      "http_allowlist": "NEXUS_H1_ALLOW_HTTP_SERVICE_NAME=mock-atenea (exact hostname match)",
+      "job_id": "job_000004",
+      "job_status": "done",
+      "unauthenticated_api": 401,
+      "ui_token_absent_from_html": "pass"
+    },
+    "certificate_rotation": {
+      "method": "nexus-h1-node/rotate-compose-router-cert.sh against live Colima Compose project",
+      "compose_project": "nexus-e2e",
+      "result": "pass",
+      "router_recreated": "pass",
+      "router_worker_api_ui_health": "healthy",
+      "certificate_changed_from_backup": "pass",
+      "ca_chain_validation": "pass",
+      "dns_san_router": "pass",
+      "backup_key_mode": "0600",
+      "real_api_chat_after_rotation": "pass",
+      "real_api_completion_tokens_after_rotation": 8
+    },
+    "host_worker_e2e": {
+      "worker_location": "host process in a network namespace separate from the Colima Compose services",
+      "router_access": "temporary published port 127.0.0.1:18443 with CA-verified TLS",
+      "enrollment": "pass with dedicated host node identity and enrollment secret",
+      "container_worker_paused_for_job": "pass",
+      "real_inference_job_id": "job_000008",
+      "receipt_node_id": "node_731dc96042aecfeb",
+      "model": "athenea-e2b:latest",
+      "receipt_verified_and_job_done": "pass",
+      "temporary_router_port_removed": "pass",
+      "physical_multi_host_validation": "not performed",
+      "final_compose_worker_restored": "healthy",
+      "router_final_published_port": "none"
+    },
+    "strict_pki_compatibility": {
+      "initial_finding": "OpenSSL 4/Python 3.15 rejected the original Router leaf certificate because it lacked Authority Key Identifier.",
+      "bootstrap_fix": "new CA includes Subject Key Identifier and Authority Key Identifier; new Router leaf includes both identifiers",
+      "rotation_fix": "new leaf includes identifiers and strict verify supports legacy private CAs that already have SKI",
+      "offline_h1_suite": "16/16 pass",
+      "system_openssl4_tls_handshake": "pass; unauthenticated metrics request returned HTTP 401 after TLS handshake",
+      "runtime_materials": "local test CA certificate reissued under the same offline private key; protected backups retained",
+      "legacy_ca_rotation_fixture": "strict leaf verifies against a legacy test CA with SKI but no AKI"
+    },
+    "final_topology": {
+      "router_published_port": "none",
+      "worker_published_port": "none",
+      "api_binding": "127.0.0.1:18000",
+      "ui_binding": "127.0.0.1:18080",
+      "mock_engine_port": "not published",
+      "health": "all services healthy"
+    },
+    "updated_router_worker_image": {
+      "image": "nexus-h0-router-worker:local",
+      "image_id": "sha256:c3c7fc1c8abdd26a81feebb8de065e9458a9958fe9658498b6f4113238f75a02",
+      "built_after_stale_heartbeat_filter": "pass",
+      "live_router_ttl_seconds": 30
+    }
+  },
+  "smoke_checks": {
+    "readiness": "pass",
+    "unauthenticated_api": 401,
+    "authenticated_model_discovery": "pass",
+    "authenticated_real_api_chat": "pass",
+    "real_api_completion_tokens": 12,
+    "ui_token_absent_from_html": "pass",
+    "same_origin_real_ui_model_discovery": "pass",
+    "same_origin_real_ui_chat": "pass",
+    "real_ui_job_status": "done",
+    "real_ui_job_id": "job_000006",
+    "deterministic_mock_profile": "pass (job_000004 done)",
+    "post_pki_final_authenticated_real_api_chat": "pass",
+    "post_pki_final_same_origin_real_ui_chat": "pass",
+    "post_pki_final_job_id": "job_000012",
+    "post_pki_final_job_status": "done",
+    "post_pki_final_unauthenticated_api": 401,
+    "post_pki_final_ui_token_absent_from_html": "pass",
+    "heartbeat_ttl_effective_seconds": 30,
+    "stale_node_excluded_from_models_and_metrics": "pass",
+    "final_real_api_chat": "pass",
+    "final_real_ui_chat": "pass",
+    "final_job_id": "job_000014",
+    "final_job_status": "done",
+    "final_unauthenticated_api": 401,
+    "final_ui_token_absent_from_html": "pass",
+    "rebuilt_router_image_real_api_chat": "pass",
+    "rebuilt_router_image_real_ui_chat": "pass",
+    "rebuilt_router_image_job_id": "job_000016",
+    "rebuilt_router_image_job_status": "done",
+    "rebuilt_router_image_unauthenticated_api": 401,
+    "rebuilt_router_image_ui_token_absent_from_html": "pass",
+    "live_router_stale_model_excluded": "pass"
+  },
+  "limitations": [
+    "The real engine test used the locally available model advertised as athenea-e2b:latest; no model artifact hash, weights provenance, full-output quality evaluation, or performance benchmark was verified in this Compose run.",
+    "Both Compose runs were local on Colima; GitHub Actions was not dispatched or observed.",
+    "The CA used for this local rehearsal is stored under /private/tmp and is not durable; production use requires protecting an offline CA key in durable encrypted storage and managing its backup/recovery lifecycle.",
+    "The separate worker test ran as a host process reaching a Colima container through loopback; it does not prove connectivity or failure recovery between two physical hosts or independent networks."
+  ],
+  "h0_protocol_regression": {
+    "suite": "NEXUS/nexus/h0/test_h0.py",
+    "result": "ALL H0 TESTS PASS",
+    "jobs_done": 100,
+    "receipts_verified": 100,
+    "max_discrepancy_pct": 0,
+    "stale_node_model_exclusion": "pass",
+    "stale_node_active_metric_exclusion": "pass",
+    "heartbeat_ttl_default_seconds": 30,
+    "heartbeat_ttl_config_range_seconds": [
+      10,
+      3600
+    ],
+    "router_ttl_environment": "NEXUS_H0_NODE_HEARTBEAT_TTL_SECONDS=30 in live Compose container",
+    "live_router_stale_model_check": "pass; synthetic stale model entry removed after check"
+  },
+  "isolated_mock_e2e_2026_10_26": {
+    "compose_project": "nexus-e2e-isolated",
+    "base_manifest": "NEXUS/compose.h0.yml",
+    "override": "temporary Compose override; separate Docker volumes initialized inside Colima",
+    "ports": {
+      "api": "127.0.0.1:18000",
+      "web": "127.0.0.1:18080",
+      "router": "not published",
+      "worker": "not published",
+      "mock_engine": "not published"
+    },
+    "services_healthy": [
+      "router",
+      "worker",
+      "mock-atenea",
+      "api",
+      "web"
+    ],
+    "checks": {
+      "readiness": "pass",
+      "unauthenticated_model_listing": 401,
+      "unauthenticated_inference": 401,
+      "authenticated_model_discovery": "pass (athenea-e2b:latest; :latest alias accepted)",
+      "authenticated_api_chat": "pass",
+      "same_origin_ui_model_discovery": "pass",
+      "same_origin_ui_chat": "pass",
+      "ui_token_absent_from_html": "pass",
+      "job_id": "job_000018",
+      "job_status": "done",
+      "receipt_verified": true
+    },
+    "result": "pass",
+    "notes": [
+      "Built router-worker, API, web, and mock images from current source.",
+      "Isolated state used temporary Docker named volumes; no project ledger volume was mounted.",
+      "The first bind-mount attempt failed because Colima presented host ownership as root; the isolated named-volume retry passed."
+    ]
+  }
+}

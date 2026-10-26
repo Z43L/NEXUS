@@ -15,7 +15,7 @@ if [ ! -x "$PY" ]; then
   python3 -m venv .venv
 fi
 if ! "$PY" -c 'import cryptography; assert cryptography.__version__ == "50.0.2"' 2>/dev/null; then
-  .venv/bin/pip install --quiet -r "$SCRIPT_DIR/requirements-h0.txt"
+  .venv/bin/pip install --quiet --require-hashes --only-binary=:all: -r "$SCRIPT_DIR/requirements-h0.txt"
 fi
 
 # 2) Atenhea engine: the worker talks to the ENGINE at :11436 (not the :11434

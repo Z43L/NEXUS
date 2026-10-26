@@ -41,3 +41,6 @@ then start `nexus/api/run_h0_api.sh` with `NEXUS_API_TOKEN` configured; the
 facade checks this client token and applies local quotas. Set `base_url` to
 `http://127.0.0.1:18080` only for trusted local development that intentionally
 bypasses the facade. Never embed a shared API token into browser code.
+For non-loopback endpoints, the SDK requires HTTPS. It ignores ambient proxy
+environment variables and refuses redirects so API keys and prompts are not
+sent to an unexpected intermediary or authority.

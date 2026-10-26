@@ -375,15 +375,13 @@ curl -N http://127.0.0.1:11434/v1/chat/completions \
 | `GET /api/health` | Estado del proxy, aprendizaje y memoria. |
 | `GET /api/ps`, `GET /api/tags` | Modelo activo y formato nativo. |
 | `POST /api/train` | Entrenamiento supervisado de una microextensión. |
-| `POST /api/micro-training/train-topic` | Entrenamiento temático con el chat enviado y recuerdos CHL verificados. |
-| `GET /api/micro-training/status` | Cadencia y resultado de la última ronda automática. |
 | `GET /api/evolve/status` | Estado del flujo de evolución heredado; no es el estado completo de microentrenamiento. |
 
 Las respuestas SSE usan identificadores estables, eventos de finalización y comentarios de mantenimiento de conexión. Cancelar una generación libera el motor cuando termina el paso en curso. Una operación de GPU atascada puede requerir recuperar el servidor.
 
 El historial de Responses mantenido por el motor es limitado y está en memoria. Un reinicio lo pierde; CHL es un almacenamiento separado y no sustituye un identificador `previous_response_id` desconocido.
 
-El servidor se limita a loopback por defecto. Si configuras `--api-key`, los clientes deben enviar esa credencial; el lanzador la toma de `ONRAM_API_KEY`. No se necesita una clave de OpenAI para ejecutar el E2B local.
+El servidor se limita a loopback por defecto. Si configuras `--api-key`, los clientes deben enviar esa credencial; el lanzador la toma de `ONRAM_API_KEY`. Para evitar secretos en argumentos, usa `ONRAM_API_KEY_FILE` con un archivo 0600 de al menos 32 caracteres. Un bind no-loopback exige API key y `--tls-cert-file` + `--tls-key-file`; el listener TLS exige TLS 1.2 o posterior y la clave privada debe ser 0600. No pongas este servicio remoto detrás de HTTP sin un proxy TLS autenticado. No se necesita una clave de OpenAI para ejecutar el E2B local.
 
 ## Memoria episódica y mapa de hechos
 
@@ -392,6 +390,8 @@ El servidor se limita a loopback por defecto. Si configuras `--api-key`, los cli
 La ruta predeterminada es `models/athenea.memory`, resuelta desde el proyecto. El puente recupera hasta cuatro episodios y utiliza un presupuesto de contexto de aproximadamente 4.000 caracteres, compartido con hechos relevantes del mapa explícito. Este presupuesto no equivale a tokens ni garantiza que una conversación completa quepa en el contexto.
 
 Los turnos de texto completados se guardan como episodios **no verificados**, incluso con el antiguo aprendizaje automático desactivado. Las llamadas de herramientas, errores y respuestas parciales no se convierten en pares de entrenamiento por esta captura.
+
+Las solicitudes de worker NEXUS se marcan con `nexus_worker`. El motor no recupera ni guarda esas conversaciones en la memoria episódica o en el buffer de aprendizaje compartido del operador: NEXUS acepta varias cuentas y aún no implementa memorias CHL/World particionadas por cuenta. Las llamadas locales del operador siguen usando la memoria configurada. No retires este aislamiento ni actives una memoria compartida para trabajos multiusuario hasta implementar y probar partición por principal autenticado.
 
 Consulta recuerdos o incorpora una respuesta que hayas revisado:
 
@@ -436,22 +436,9 @@ Hay tres operaciones distintas:
 2. **Entrenar microexpertos:** ajustar una extensión pequeña sobre activaciones del E2B congelado.
 3. **Entrenar LoRA:** crear y evaluar candidatos de adaptadores sobre el modelo base.
 
-Conversar, guardar un episodio o abrir Pi no dispara una ronda con cada petición. El runtime nativo ofrece una herramienta interna `atenhea_train_microexpert` en Pi Agent, Claude Code y Codex CLI. Cuando el usuario pide entrenar sobre un tema concreto, el modelo puede solicitar esa operación durante la inferencia. Combina pares completos del chat actual con recuerdos CHL pertinentes verificados. La autorización explícita permite usar el chat como material de esa ronda, pero no certifica que las respuestas del asistente sean hechos correctos. Por ejemplo: «Entrena un microexperto sobre redes eléctricas usando este chat y la memoria CHL».
+El modelo solo cambia cuando el usuario lo entrena explícitamente con sus propios datos locales. No hay rondas automáticas ni programadas: conversar, guardar un episodio o abrir un agente no entrena nada. Los recuerdos CHL no se usan como datos de entrenamiento, ni de forma directa ni a través de la validación.
 
-Además, el runtime inicia una revisión automática **cada 24 horas**. La ronda general requiere al menos nueve preguntas distintas en CHL, incluidas cinco con recuerdos verificados. Puede usar pares completos de chat no verificados como datos de entrenamiento; la validación y el control de regresión salen exclusivamente de recuerdos verificados. Si faltan datos, registra el motivo y vuelve a comprobarlo en el siguiente intervalo. La ronda selecciona el siguiente experto y aplica la misma validación y control antes de promoverlo.
-
-Configura el intervalo en `models/athenea-micro-training.json`:
-
-```json
-{
-  "enabled": true,
-  "interval_hours": 24
-}
-```
-
-`interval_hours` admite de 1 a 720 horas. `{"enabled": false}` desactiva las rondas automáticas, pero mantiene disponibles las solicitudes desde el agente. Reinicia el runtime después de cambiar este archivo. Consulta `GET /api/micro-training/status` o `micro_training_schedule` en `/api/runtime/status`. `base_weights_frozen: true` significa que los pesos base no reciben gradientes; no significa que la inferencia esté detenida.
-
-Las microextensiones no convierten el E2B completo en un modelo MoE disperso: reducen los parámetros que se entrenan, pero no eliminan el cálculo del modelo base. En Metal se calculan residuos enmascarados de tamaño fijo para evitar sincronizaciones problemáticas.
+Para crear un microexperto desde un archivo de tu equipo, usa los comandos `atenhea micro-train cache` y `atenhea micro-train train` descritos más abajo. El archivo de entrenamiento y el de validación son tuyos y se procesan en local.
 
 ### Microentrenamiento con el servidor cargado
 
@@ -509,7 +496,7 @@ Si acepta el candidato, copia sus tensores a la extensión activa y guarda el ar
 
 Consulta `last_training` y `micro_version` en `/api/runtime/status`. El aprendizaje heredado puede figurar como desactivado mientras este endpoint nativo sigue disponible.
 
-El entrenamiento por tema se pide al agente en lenguaje normal. Para clientes HTTP también existe `POST /api/micro-training/train-topic` con `{"topic":"redes eléctricas","messages":[...]}`. La selección combina el tema, los pares completos del historial enviado y los recuerdos CHL verificados. Los pares del chat se registran como autorizados para ese entrenamiento, no como hechos verificados. Si encuentra menos de tres pares distintos, devuelve `insufficient_topic_data` y conserva los pesos.
+El entrenamiento solo usa los archivos que indicas. No se selecciona contenido de conversaciones ni de la memoria CHL.
 
 ### Entrenamiento de microexpertos fuera del servidor
 
@@ -642,7 +629,7 @@ Los comandos heredados `nram`, `nram-eval`, `nram-sweep`, `nram-memory`, `nram-a
 | `native_runtime.py`, `native_protocol.py` | Inferencia nativa, streaming y adaptación de protocolos. |
 | `prefix_cache.py`, `native_placement.py` | Reutilización exacta del prefijo KV y colocación CPU/MPS del E2B. |
 | `nram_container.py`, `nram_generic.py`, `nram_convert.py` | Contenedor, adaptadores y conversión desde el checkpoint. |
-| `micro_extensions.py`, `micro_training.py`, `micro_training_control.py` | Microexpertos, entrenamiento cacheado y solicitudes temáticas o rondas programadas. |
+| `micro_extensions.py`, `micro_training.py` | Microexpertos y entrenamiento cacheado desde archivos locales. `micro_training_control.py` ya no se importa y puede eliminarse. |
 | `episodic_memory.py`, `integrations/chl_bridge.cjs` | Puente de memoria CHL. |
 | `world_memory.py` | Registros explícitos de hechos y eventos. |
 | `prefix_cache.py`, `native_placement.py` | Caché exacta y colocación de embeddings para reducir el procesamiento repetido y la memoria GPU. |

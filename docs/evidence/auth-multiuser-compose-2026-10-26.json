@@ -1,0 +1,39 @@
+{
+  "date": "2026-10-26",
+  "scope": "Local Compose multi-account authentication E2E",
+  "runtime": {
+    "platform": "macOS ARM64 with Colima",
+    "compose_project": "nexus-verify-1026",
+    "services_healthy": ["router", "worker", "api", "web", "valkey", "mock-atenea"],
+    "published_bindings": ["127.0.0.1:8000", "127.0.0.1:8080"],
+    "router_and_worker_host_ports": "none",
+    "mock_engine_host_port": "none"
+  },
+  "checks": {
+    "api_without_credential": "401",
+    "api_token_absent_from_html": "pass",
+    "anonymous_browser_product_request": "401",
+    "two_independent_user_logins": "pass",
+    "session_cookie_http_only": "pass",
+    "session_discovery": "pass",
+    "model_discovery": "pass",
+    "same_origin_chat": "pass",
+    "completed_job_id": "job_000002",
+    "completed_job_status": "done",
+    "cross_user_job_read": "404",
+    "logout": "pass",
+    "logged_out_product_request": "401",
+    "worker_engine_healthcheck": "authenticated GET /v1/models over private mock service"
+  },
+  "unit_tests": {
+    "api_security_sessions_users_and_distributed_quota": "37/37 pass",
+    "browser_bff": "5/5 pass",
+    "h1_worker_security_bootstrap_health_and_rotation": "18/18 pass",
+    "atenea_memory_privacy_and_listener_security": "8/8 pass"
+  },
+  "result": "pass",
+  "limitations": [
+    "Mock inference engine; this test does not measure model quality or performance.",
+    "Local Compose only; it does not validate GitHub Actions, Kubernetes, or connectivity between physical hosts."
+  ]
+}

@@ -28,3 +28,6 @@ facade validates this client token and applies local quotas. Set `baseURL` to
 `http://127.0.0.1:18080` only for trusted local development that intentionally
 bypasses the facade. Never embed a shared API token into a browser bundle. For a browser UI, see
 [`NEXUS/nexus-web/README_H0.md`](../nexus-web/README_H0.md).
+The SDK rejects HTTP for non-loopback `baseURL` values. In Node.js, it disables
+ambient proxy settings and redirects so credentials and prompts stay on the
+configured API authority.

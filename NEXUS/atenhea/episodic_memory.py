@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -13,6 +14,14 @@ import subprocess
 ROOT = Path(__file__).resolve().parent
 DEFAULT_MEMORY = ROOT / 'models' / 'athenea.memory'
 CHL_COMMIT = '3d5d7700384b55c2c29c84d8a7becb91eaf210ef'
+USER_ID_PATTERN = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}')
+
+
+def user_memory_path(base: Path, user_id: str) -> Path:
+    """CHL file owned by one NEXUS account; rejects anything that is not a plain identifier."""
+    if not isinstance(user_id, str) or not USER_ID_PATTERN.fullmatch(user_id):
+        raise ValueError('invalid account identifier for CHL memory')
+    return Path(base) / 'users' / user_id / 'athenea.memory'
 
 
 class EpisodicMemory:

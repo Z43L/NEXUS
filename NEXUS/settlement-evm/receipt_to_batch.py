@@ -20,7 +20,12 @@ from typing import Mapping
 
 from cryptography.hazmat.primitives import serialization
 
-from batch_builder import SettlementContext, build_batch, keccak256
+from batch_builder import (
+    SettlementContext,
+    build_batch,
+    keccak256,
+    settlement_batch_commitment,
+)
 
 H0_DIR = Path(__file__).resolve().parents[1] / "nexus" / "h0"
 if str(H0_DIR) not in sys.path:
@@ -276,6 +281,9 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, json.JSONDecodeError, TypeError, ValueError, InvalidOperation) as exc:
         parser.error(str(exc))
     output = batch.as_contract_batch()
+    output["settlementBatchCommitment"] = "0x" + settlement_batch_commitment(
+        batch.settlement_context, batch.batch_id, batch.root, batch.root_sum
+    ).hex()
     # The Merkle leaf binds addresses and chain ID, while decimals are contract
     # configuration. Carry the policy value so the on-chain publisher can
     # reject a batch generated under a different unit scale.

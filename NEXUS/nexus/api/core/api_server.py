@@ -14,7 +14,10 @@ import json
 import hashlib
 import hmac
 import os
+from pathlib import Path
+import re
 import ssl
+import stat
 import threading
 import time
 import urllib.error
@@ -56,6 +59,8 @@ H0_ROUTER_URL = _validate_router_url(
 _RATE_WINDOW_SECONDS = 60
 _rate_lock = threading.Lock()
 _rate_buckets: Dict[str, tuple[int, int]] = {}
+_CLIENT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+_CLIENT_SCOPES = {"inference", "models:read", "jobs:read", "auth:session", "admin"}
 
 app = FastAPI(
     title="NEXUS API",
@@ -108,31 +113,169 @@ def _client_authorization(request: Request) -> Optional[str]:
     return api_key or None
 
 
-def _enforce_client_auth(request: Request) -> None:
+def _load_api_clients() -> list[dict]:
+    """Load a private registry containing token digests, never plaintext keys."""
+    registry_path = os.environ.get("NEXUS_API_CLIENTS_FILE", "")
+    if not registry_path:
+        return []
+    path = Path(registry_path)
+    try:
+        if path.is_symlink():
+            raise ValueError("API client registry must not be a symlink")
+        if stat.S_IMODE(path.stat().st_mode) & 0o077:
+            raise ValueError("API client registry permissions must be 0600")
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError("API client registry is unavailable or invalid") from exc
+    if (not isinstance(data, dict) or data.get("version") != 1
+            or not isinstance(data.get("clients"), list) or len(data["clients"]) > 1000):
+        raise RuntimeError("API client registry schema is invalid")
+    clients = []
+    ids, hashes = set(), set()
+    for client in data["clients"]:
+        if not isinstance(client, dict):
+            raise RuntimeError("API client registry entry is invalid")
+        client_id = client.get("client_id")
+        token_hash = client.get("token_sha256")
+        scopes = client.get("scopes")
+        quota = client.get("rate_limit_per_minute")
+        if (not isinstance(client_id, str) or not _CLIENT_ID.fullmatch(client_id)
+                or not isinstance(token_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", token_hash)
+                or not isinstance(scopes, list) or not scopes
+                or any(not isinstance(scope, str) or scope not in _CLIENT_SCOPES for scope in scopes)
+                or len(set(scopes)) != len(scopes)
+                or isinstance(quota, bool) or not isinstance(quota, int)
+                or not 1 <= quota <= 10000
+                or client_id in ids or token_hash in hashes):
+            raise RuntimeError("API client registry entry is invalid")
+        ids.add(client_id)
+        hashes.add(token_hash)
+        clients.append({
+            "client_id": client_id,
+            "token_sha256": token_hash,
+            "scopes": frozenset(scopes),
+            "rate_limit_per_minute": quota,
+        })
+    return clients
+
+
+def _required_scope(request: Request) -> str:
+    method = request.method.upper()
+    path = request.url.path
+    if method == "POST" and path in {
+        "/v1/chat/completions", "/cognitive/query", "/cognitive/infer"
+    }:
+        return "inference"
+    if method == "GET" and path == "/v1/models":
+        return "models:read"
+    if method == "GET" and path.startswith("/jobs/"):
+        return "jobs:read"
+    if path.startswith("/auth/"):
+        return "auth:session"
+    return "admin"
+
+
+def _authenticate_client(request: Request, *, ignore_session: bool = False) -> dict:
+    # A browser session takes precedence over the BFF's service credential, so
+    # job ownership and quotas remain attached to the human account.
+    cookies = getattr(request, "cookies", {})
+    cookie_name = _session_cookie_name()
+    if not ignore_session and cookies.get(cookie_name) and os.environ.get("NEXUS_API_USERS_FILE"):
+        try:
+            session = _resolve_user_session(cookies[cookie_name])
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail="Session service unavailable") from exc
+        if session is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired session",
+                                headers={"WWW-Authenticate": "Bearer"})
+        scope = _required_scope(request)
+        if "admin" not in session["scopes"] and scope not in session["scopes"]:
+            raise HTTPException(status_code=403, detail="User lacks required scope")
+        return session
+    registry_path = os.environ.get("NEXUS_API_CLIENTS_FILE", "")
+    if registry_path:
+        try:
+            clients = _load_api_clients()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail="API client registry is unavailable") from exc
+        if not clients:
+            raise HTTPException(status_code=503, detail="API client authentication is not configured")
+        supplied = _client_authorization(request)
+        if supplied is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or missing API token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        supplied_hash = hashlib.sha256(supplied.encode()).hexdigest()
+        matched = None
+        for client in clients:
+            if hmac.compare_digest(supplied_hash, client["token_sha256"]):
+                matched = client
+        if matched is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or missing API token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        scope = _required_scope(request)
+        if "admin" not in matched["scopes"] and scope not in matched["scopes"]:
+            raise HTTPException(status_code=403, detail="API client lacks required scope")
+        return matched
+
     expected = _secret_value("NEXUS_API_TOKEN")
     if not expected:
         raise HTTPException(status_code=503, detail="API client authentication is not configured")
     supplied = _client_authorization(request)
-    if supplied is None or not hmac.compare_digest(supplied.encode(), expected.encode()):
+    if supplied is None:
         raise HTTPException(
             status_code=401,
             detail="Invalid or missing API token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    if not hmac.compare_digest(supplied.encode(), expected.encode()):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return {
+        "client_id": "shared",
+        "scopes": frozenset({"admin"}),
+        "rate_limit_per_minute": _default_rate_limit(),
+    }
 
 
-def _consume_rate_limit(request: Request) -> tuple[int, int, int, bool]:
-    """Process-local fixed-window limiter for inference endpoints."""
+def _enforce_client_auth(request: Request, *, ignore_session: bool = False) -> None:
+    _authenticate_client(request, ignore_session=ignore_session)
+
+
+def _default_rate_limit() -> int:
     try:
         limit = int(os.environ.get("NEXUS_API_RATE_LIMIT_PER_MINUTE", "60"))
     except ValueError:
         limit = 60
-    limit = min(max(limit, 1), 10000)
+    return min(max(limit, 1), 10000)
+
+
+def _consume_rate_limit(request: Request) -> tuple[int, int, int, bool]:
+    """Process-local fixed-window limiter isolated by API client identity."""
+    principal = _authenticate_client(request)
+    limit = principal["rate_limit_per_minute"]
+    try:
+        redis = _redis_client()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail="Rate limit service unavailable") from exc
+    if redis is not None:
+        from nexus.api.auth.distributed_rate_limit import consume
+        identity = hashlib.sha256(principal["client_id"].encode()).hexdigest()
+        try:
+            return consume(redis, f"nexus:quota:v1:{identity}", limit)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="Rate limit service unavailable") from exc
     now = int(time.time())
     window = now // _RATE_WINDOW_SECONDS
-    credential = _client_authorization(request) or ""
-    identity = hashlib.sha256(credential.encode()).hexdigest()
-    key = f"{identity}:{window}"
+    key = f"{principal['client_id']}:{window}"
     with _rate_lock:
         # Keep memory bounded when clients create many distinct identities.
         expired = [
@@ -201,6 +344,182 @@ def _secret_value(name: str) -> str:
         raise RuntimeError(f"Configured secret file for {name} is unavailable") from exc
 
 
+def _redis_tls_options(url: str, require_tls: bool) -> dict:
+    """Validate the shared datastore URL and require certificate validation."""
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise RuntimeError("shared session and quota store URL is malformed") from None
+    database = parsed.path[1:] if parsed.path.startswith("/") else "invalid"
+    if (parsed.scheme not in {"redis", "rediss"} or not host
+            or parsed.username is None or parsed.password is None
+            or (parsed.path not in {"", "/"} and not database.isdecimal())
+            or parsed.query or parsed.fragment or port == 0):
+        raise RuntimeError("shared session and quota store URL is invalid")
+    if require_tls and parsed.scheme != "rediss":
+        raise RuntimeError("shared session and quota store requires verified TLS")
+    return {"ssl_cert_reqs": "required"} if parsed.scheme == "rediss" else {}
+
+
+@lru_cache(maxsize=1)
+def _redis_client():
+    """Return the shared Redis/Valkey client when sessions are configured."""
+    url = _secret_value("NEXUS_REDIS_URL")
+    if not url:
+        if os.environ.get("NEXUS_API_USERS_FILE") or os.environ.get("NEXUS_API_REQUIRE_DISTRIBUTED_RATE_LIMIT") == "1":
+            raise RuntimeError("shared session and quota store is not configured")
+        return None
+    try:
+        from redis import Redis
+        require_tls = os.environ.get("NEXUS_API_REDIS_REQUIRE_TLS") == "1"
+        tls_options = _redis_tls_options(url, require_tls)
+        return Redis.from_url(url, decode_responses=True, socket_connect_timeout=2,
+                              socket_timeout=2, health_check_interval=30, **tls_options)
+    except Exception as exc:
+        raise RuntimeError("shared session and quota store is unavailable") from exc
+
+
+def _resolve_user_session(token: str) -> dict | None:
+    from nexus.api.auth.user_sessions import load_user_registry, resolve_session
+    redis = _redis_client()
+    if redis is None:
+        raise RuntimeError("shared session and quota store is not configured")
+    session = resolve_session(redis, token)
+    if session is None:
+        return None
+    registry_path = os.environ.get("NEXUS_API_USERS_FILE", "")
+    user = load_user_registry(registry_path).get(session["user_id"])
+    if (user is None or user["client_id"] != session["client_id"]
+            or user["scopes"] != session["scopes"]
+            or user["rate_limit_per_minute"] != session["rate_limit_per_minute"]
+            or user["password_scrypt"]["hash"] != session["auth_fingerprint"]):
+        return None
+    return session
+
+
+def _session_cookie_name() -> str:
+    return ("nexus_session" if os.environ.get("NEXUS_AUTH_COOKIE_SECURE", "1") == "0"
+            else "__Host-nexus_session")
+
+
+def _auth_origin_allowed(request: Request) -> bool:
+    origin = request.headers.get("origin", "")
+    configured = {item.strip().rstrip("/") for item in
+                  os.environ.get("NEXUS_AUTH_ALLOWED_ORIGINS", "").split(",") if item.strip()}
+    return bool(origin and configured and origin.rstrip("/") in configured)
+
+
+@app.get("/auth/session")
+async def get_auth_session(request: Request):
+    """Return the active browser identity without exposing session material."""
+    _authenticate_client(request, ignore_session=True)
+    if not os.environ.get("NEXUS_API_USERS_FILE"):
+        response = JSONResponse({"authenticated": False})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    token = request.cookies.get(_session_cookie_name())
+    if not token:
+        response = JSONResponse({"authenticated": False})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    try:
+        session = _resolve_user_session(token)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail="Session service unavailable") from exc
+    if session is None:
+        response = JSONResponse({"authenticated": False})
+    else:
+        response = JSONResponse({"authenticated": True, "username": session["user_id"]})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/auth/login")
+async def login(payload: Dict[str, Any], request: Request):
+    """Create an opaque, shared browser session for a provisioned account."""
+    if not _auth_origin_allowed(request):
+        raise HTTPException(status_code=403, detail="Invalid origin")
+    _authenticate_client(request, ignore_session=True)
+    registry_path = os.environ.get("NEXUS_API_USERS_FILE", "")
+    if not registry_path:
+        raise HTTPException(status_code=503, detail="User authentication is not configured")
+    from nexus.api.auth.user_sessions import (
+        RegistryError, SessionStoreError, create_session, load_user_registry, verify_password,
+    )
+    from nexus.api.auth.distributed_rate_limit import RateLimitBackendError, consume
+    username, password = payload.get("username"), payload.get("password")
+    try:
+        users = load_user_registry(registry_path)
+    except RegistryError as exc:
+        raise HTTPException(status_code=503, detail="User authentication is unavailable") from exc
+    user = users.get(username) if isinstance(username, str) else None
+    account_id = user["user_id"] if user else "<unknown>"
+    try:
+        redis = _redis_client()
+        remote = getattr(getattr(request, "client", None), "host", "unknown") or "unknown"
+        source_key = hashlib.sha256(remote.encode("utf-8", errors="replace")).hexdigest()
+        account_key = hashlib.sha256(account_id.encode("utf-8")).hexdigest()
+        ip_limit, ip_remaining, ip_reset, ip_allowed = consume(
+            redis, f"nexus:login-ip:v1:{source_key}", 120
+        )
+        account_limit, account_remaining, account_reset, account_allowed = consume(
+            redis, f"nexus:login-account:v1:{account_key}", 10
+        )
+    except (RuntimeError, RateLimitBackendError) as exc:
+        raise HTTPException(status_code=503, detail="Authentication service unavailable") from exc
+    if not ip_allowed or not account_allowed:
+        limit = min(ip_limit, account_limit)
+        remaining = min(ip_remaining, account_remaining)
+        reset = max(ip_reset, account_reset)
+        raise HTTPException(status_code=429, detail="Too many login attempts",
+                            headers={"Retry-After": str(max(1, reset - int(time.time()))),
+                                     "X-RateLimit-Limit": str(limit),
+                                     "X-RateLimit-Remaining": str(remaining),
+                                     "X-RateLimit-Reset": str(reset)})
+    if not await asyncio.to_thread(verify_password, password, user):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    try:
+        previous = request.cookies.get(_session_cookie_name())
+        if previous:
+            from nexus.api.auth.user_sessions import revoke_session
+            revoke_session(redis, previous)
+        token = create_session(redis, user,
+                               ttl_seconds=_bounded_env_int("NEXUS_AUTH_SESSION_TTL_SECONDS", 3600,
+                                                            300, 2_592_000))
+    except (RuntimeError, SessionStoreError) as exc:
+        raise HTTPException(status_code=503, detail="Session service unavailable") from exc
+    secure = os.environ.get("NEXUS_AUTH_COOKIE_SECURE", "1") != "0"
+    response = JSONResponse({"authenticated": True, "username": user["user_id"]})
+    response.set_cookie(_session_cookie_name(), token, max_age=_bounded_env_int(
+        "NEXUS_AUTH_SESSION_TTL_SECONDS", 3600, 300, 2_592_000), httponly=True,
+        secure=secure, samesite="lax", path="/")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/auth/logout")
+async def logout(request: Request):
+    """Revoke the shared session and expire the host-only browser cookie."""
+    if not _auth_origin_allowed(request):
+        raise HTTPException(status_code=403, detail="Invalid origin")
+    _authenticate_client(request, ignore_session=True)
+    token = request.cookies.get(_session_cookie_name())
+    if token and os.environ.get("NEXUS_API_USERS_FILE"):
+        from nexus.api.auth.user_sessions import revoke_session
+        try:
+            revoke_session(_redis_client(), token)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail="Session service unavailable") from exc
+    secure = os.environ.get("NEXUS_AUTH_COOKIE_SECURE", "1") != "0"
+    response = JSONResponse({"authenticated": False})
+    response.delete_cookie(_session_cookie_name(), path="/", httponly=True,
+                           secure=secure, samesite="lax")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -216,7 +535,8 @@ def _open_upstream(request: urllib.request.Request, timeout: int):
     # Router endpoints never need redirects. Refusing them prevents credentials
     # from being forwarded to a different authority after an upstream response.
     opener = urllib.request.build_opener(
-        _NoRedirect(), urllib.request.HTTPSHandler(context=_tls_context())
+        urllib.request.ProxyHandler({}), _NoRedirect(),
+        urllib.request.HTTPSHandler(context=_tls_context())
     )
     return opener.open(request, timeout=timeout)
 
@@ -252,7 +572,9 @@ class RequestSafetyMiddleware:
         path = scope.get("path", "")
         if method != "OPTIONS" and path not in {"/health", "/ready"}:
             try:
-                _enforce_client_auth(Request(scope, receive=receive))
+                _enforce_client_auth(
+                    Request(scope, receive=receive), ignore_session=path.startswith("/auth/")
+                )
             except HTTPException as exc:
                 auth_headers = []
                 if exc.headers:
@@ -326,11 +648,16 @@ def _bounded_timeout(value: Any, field: str) -> int:
     return min(max(timeout, 1), 1800)
 
 
-def _post_gateway(payload: Dict[str, Any], timeout: int) -> Dict[str, Any]:
+def _post_gateway(payload: Dict[str, Any], timeout: int,
+                  client: Optional[dict] = None) -> Dict[str, Any]:
     headers = {"Content-Type": "application/json"}
     upstream_token = _upstream_auth()
     if upstream_token:
         headers["Authorization"] = f"Bearer {upstream_token}"
+    if client:
+        headers["X-Nexus-Client-ID"] = client["client_id"]
+        if "admin" in client["scopes"]:
+            headers["X-Nexus-Client-Admin"] = "1"
     request = urllib.request.Request(
         f"{H0_ROUTER_URL}/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -357,11 +684,15 @@ def _post_gateway(payload: Dict[str, Any], timeout: int) -> Dict[str, Any]:
     return result
 
 
-def _get_gateway(path: str) -> Dict[str, Any]:
+def _get_gateway(path: str, client: Optional[dict] = None) -> Dict[str, Any]:
     headers = {}
     upstream_token = _upstream_auth()
     if upstream_token:
         headers["Authorization"] = f"Bearer {upstream_token}"
+    if client:
+        headers["X-Nexus-Client-ID"] = client["client_id"]
+        if "admin" in client["scopes"]:
+            headers["X-Nexus-Client-Admin"] = "1"
     request = urllib.request.Request(f"{H0_ROUTER_URL}{path}", headers=headers, method="GET")
     try:
         with _open_upstream(request, timeout=5) as response:
@@ -375,7 +706,8 @@ def _get_gateway(path: str) -> Dict[str, Any]:
         raise HTTPException(status_code=502, detail="H0 gateway returned invalid JSON") from exc
 
 
-async def _complete(messages: list, parameters: Optional[Dict[str, Any]], timeout: int):
+async def _complete(messages: list, parameters: Optional[Dict[str, Any]], timeout: int,
+                    client: Optional[dict] = None):
     params = parameters or {}
     payload = {
         "model": params.get("model", ""),
@@ -384,7 +716,7 @@ async def _complete(messages: list, parameters: Optional[Dict[str, Any]], timeou
         "max_tokens": params.get("max_tokens", 256),
         "timeout_s": timeout,
     }
-    return await asyncio.to_thread(_post_gateway, payload, timeout + 5)
+    return await asyncio.to_thread(_post_gateway, payload, timeout + 5, client)
 
 
 @app.post("/v1/chat/completions")
@@ -400,12 +732,23 @@ async def chat_completions(payload: Dict[str, Any], request: Request):
     timeout = _bounded_timeout(payload.get("timeout_s", 300), "timeout_s")
     forwarded = dict(payload)
     forwarded["timeout_s"] = timeout
-    return await asyncio.to_thread(_post_gateway, forwarded, timeout + 5)
+    client = _authenticate_client(request)
+    return await asyncio.to_thread(_post_gateway, forwarded, timeout + 5, client)
 
 
 @app.get("/v1/models")
 async def list_models(request: Request):
-    return await asyncio.to_thread(_get_gateway, "/v1/models")
+    client = _authenticate_client(request)
+    return await asyncio.to_thread(_get_gateway, "/v1/models", client)
+
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str, request: Request):
+    """Return the status/result for a native H0 job identifier."""
+    if not re.fullmatch(r"job_[0-9]{1,12}", job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    client = _authenticate_client(request)
+    return await asyncio.to_thread(_get_gateway, f"/jobs/{job_id}", client)
 
 
 @app.post("/cognitive/query", response_model=StandardResponse, tags=["Cognitive Functions"])
@@ -418,7 +761,8 @@ async def query_knowledge(payload: Dict[str, Any], request: Request):
         if not isinstance(context, dict):
             raise HTTPException(status_code=422, detail="context must be an object")
         query += "\n\nContext:\n" + json.dumps(context, ensure_ascii=False)
-    result = await _complete([{"role": "user", "content": query}], None, 300)
+    result = await _complete([{"role": "user", "content": query}], None, 300,
+                             _authenticate_client(request))
     return StandardResponse(
         success=True,
         data={"results": result},
@@ -436,7 +780,8 @@ async def perform_inference(payload: Dict[str, Any], request: Request):
     parameters = payload.get("parameters") or {}
     if not isinstance(parameters, dict):
         raise HTTPException(status_code=422, detail="parameters must be an object")
-    result = await _complete([{"role": "user", "content": task}], parameters, timeout)
+    result = await _complete([{"role": "user", "content": task}], parameters, timeout,
+                             _authenticate_client(request))
     return StandardResponse(
         success=True,
         data={"inference_result": result},
@@ -447,8 +792,19 @@ async def perform_inference(payload: Dict[str, Any], request: Request):
 
 def _gateway_ready() -> bool:
     try:
-        if not _secret_value("NEXUS_API_TOKEN"):
+        if os.environ.get("NEXUS_API_CLIENTS_FILE"):
+            if not _load_api_clients():
+                return False
+        elif not _secret_value("NEXUS_API_TOKEN"):
             return False
+        if os.environ.get("NEXUS_API_USERS_FILE"):
+            from nexus.api.auth.user_sessions import load_user_registry
+            load_user_registry(os.environ["NEXUS_API_USERS_FILE"])
+        if (os.environ.get("NEXUS_API_USERS_FILE")
+                or os.environ.get("NEXUS_API_REQUIRE_DISTRIBUTED_RATE_LIMIT") == "1"):
+            redis = _redis_client()
+            if redis is None or not redis.ping():
+                return False
         if urlsplit(H0_ROUTER_URL).scheme == "https":
             if not _secret_value("NEXUS_H0_CLIENT_TOKEN"):
                 return False

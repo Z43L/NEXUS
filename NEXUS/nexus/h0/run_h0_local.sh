@@ -85,7 +85,7 @@ else
     python3 -m venv .venv
   fi
   "$PY" -c 'import cryptography; assert cryptography.__version__ == "50.0.2"' 2>/dev/null || \
-    .venv/bin/pip install --quiet -r "$SCRIPT_DIR/requirements-h0.txt"
+    .venv/bin/pip install --quiet --require-hashes --only-binary=:all: -r "$SCRIPT_DIR/requirements-h0.txt"
 fi
 
 models_ready() {

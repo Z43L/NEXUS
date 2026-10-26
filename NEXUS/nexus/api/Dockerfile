@@ -14,6 +14,7 @@ RUN python -m pip install --no-cache-dir --only-binary=:all: --require-hashes \
     && useradd --uid 10002 --gid nexus-api --no-create-home --shell /usr/sbin/nologin nexus-api
 
 COPY nexus/api/core /app/nexus/api/core
+COPY nexus/api/auth /app/nexus/api/auth
 USER 10002:10002
 EXPOSE 8000
 ENTRYPOINT ["python", "-m", "uvicorn", "nexus.api.core.api_server:app"]

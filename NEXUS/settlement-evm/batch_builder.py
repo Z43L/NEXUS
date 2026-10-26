@@ -216,6 +216,23 @@ class BatchProof:
         }
 
 
+def settlement_batch_commitment(context: SettlementContext, batch_id: str,
+                                root: str, root_sum: int) -> bytes:
+    """Commit to the exact context and Merkle root an operator approved.
+
+    This matches Solidity ``keccak256(abi.encode(uint256,address,address,
+    bytes32,bytes32,uint256))`` used by the batch publisher.
+    """
+    return keccak256(
+        _word_uint(_uint256(context.chain_id, "settlementContext.chainId"))
+        + _address(context.escrow_address, "settlementContext.escrowAddress").rjust(32, b"\x00")
+        + _address(context.token_address, "settlementContext.tokenAddress").rjust(32, b"\x00")
+        + _bytes32(batch_id, "batchId")
+        + _bytes32(root, "root")
+        + _word_uint(_uint256(root_sum, "rootSum"))
+    )
+
+
 @dataclass(frozen=True)
 class _Node:
     digest: bytes

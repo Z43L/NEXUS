@@ -21,7 +21,7 @@ else
     python3 -m venv .venv
   fi
   "$PY" -c 'import cryptography; assert cryptography.__version__ == "50.0.2"' 2>/dev/null || \
-    .venv/bin/pip install --quiet -r requirements-h1.txt
+    .venv/bin/pip install --quiet --require-hashes --only-binary=:all: -r requirements-h1.txt
 fi
 ROUTER_URL="${ROUTER_URL:-http://127.0.0.1:18080}"
 WALLET="${WALLET:-0x945e579Df27859a9F65BD68FBa5cD37F64e1Ec5B}"

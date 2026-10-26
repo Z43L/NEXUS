@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  labels: {{- include "nexus.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: {{- include "nexus.selector" . | nindent 4 }}
+    app.kubernetes.io/component: api
+  ports: [{ name: http, port: 8000, targetPort: http }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels: {{- include "nexus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels: {{- include "nexus.selector" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels: {{- include "nexus.selector" . | nindent 8 }}
+        app.kubernetes.io/component: api
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 10002, runAsGroup: 10002, fsGroup: 10002, seccompProfile: { type: RuntimeDefault } }
+      {{- include "nexus.imagePullSecrets" . | nindent 6 }}
+      initContainers:
+        - name: prepare-secrets
+          image: {{ required "images.api is required" .Values.images.api | quote }}
+          command: ["python", "-c"]
+          args: ["import os,shutil; os.makedirs('/run/secrets',mode=0o700,exist_ok=True); [(shutil.copyfile('/source/'+a,'/run/secrets/'+b),os.chmod('/run/secrets/'+b,0o600)) for a,b in [('ca.crt','router_ca'),('client.token','client_token'),('api_clients.json','api_clients'),('api_users.json','api_users'),('redis.url','redis_url')]]"]
+          securityContext: { runAsNonRoot: true, runAsUser: 10002, runAsGroup: 10002, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: source, mountPath: /source, readOnly: true }
+            - { name: runtime-secrets, mountPath: /run/secrets }
+      containers:
+        - name: api
+          image: {{ .Values.images.api | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args: ["--host", "0.0.0.0", "--port", "8000", "--no-server-header"]
+          env:
+            - { name: NEXUS_H0_ROUTER_URL, value: "https://router:18080" }
+            - { name: NEXUS_H0_ROUTER_CA_FILE, value: /run/secrets/router_ca }
+            - { name: NEXUS_H0_CLIENT_TOKEN_FILE, value: /run/secrets/client_token }
+            - { name: NEXUS_API_CLIENTS_FILE, value: /run/secrets/api_clients }
+            - { name: NEXUS_API_USERS_FILE, value: /run/secrets/api_users }
+            - { name: NEXUS_REDIS_URL_FILE, value: /run/secrets/redis_url }
+            - { name: NEXUS_API_REDIS_REQUIRE_TLS, value: "1" }
+            - { name: NEXUS_API_REQUIRE_DISTRIBUTED_RATE_LIMIT, value: "1" }
+            - { name: NEXUS_AUTH_ALLOWED_ORIGINS, value: {{ required "api.authAllowedOrigins must be set to the HTTPS UI origin" .Values.api.authAllowedOrigins | quote }} }
+            - { name: NEXUS_AUTH_COOKIE_SECURE, value: "1" }
+            - { name: NEXUS_AUTH_SESSION_TTL_SECONDS, value: {{ .Values.api.sessionTtlSeconds | quote }} }
+            - { name: NEXUS_API_MAX_BODY_BYTES, value: {{ .Values.api.maxBodyBytes | quote }} }
+            - { name: NEXUS_API_MAX_INFLIGHT_INFERENCES, value: {{ .Values.api.maxInflightInferences | quote }} }
+          ports: [{ name: http, containerPort: 8000 }]
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          resources: {{- toYaml .Values.resources.api | nindent 12 }}
+          volumeMounts:
+            - { name: runtime-secrets, mountPath: /run/secrets, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          readinessProbe: { httpGet: { path: /ready, port: http }, periodSeconds: 10, timeoutSeconds: 8 }
+          livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 20 }
+      volumes:
+        - name: source
+          secret: { secretName: {{ .Values.secrets.api | quote }}, defaultMode: 0440 }
+        - { name: runtime-secrets, emptyDir: { medium: Memory } }
+        - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 32Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  labels: {{- include "nexus.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: {{- include "nexus.selector" . | nindent 4 }}
+    app.kubernetes.io/component: web
+  ports: [{ name: http, port: 8080, targetPort: http }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels: {{- include "nexus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  replicas: {{ .Values.web.replicas }}
+  selector:
+    matchLabels: {{- include "nexus.selector" . | nindent 6 }}
+      app.kubernetes.io/component: web
+  template:
+    metadata:
+      labels: {{- include "nexus.selector" . | nindent 8 }}
+        app.kubernetes.io/component: web
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
+      {{- include "nexus.imagePullSecrets" . | nindent 6 }}
+      initContainers:
+        - name: prepare-secrets
+          image: {{ required "images.web is required" .Values.images.web | quote }}
+          command: ["python", "-c"]
+          args: ["import os,shutil; os.makedirs('/run/secrets',mode=0o700,exist_ok=True); shutil.copyfile('/source/api.token','/run/secrets/api_token'); os.chmod('/run/secrets/api_token',0o600)"]
+          securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: source, mountPath: /source, readOnly: true }
+            - { name: runtime-secrets, mountPath: /run/secrets }
+      containers:
+        - name: web
+          image: {{ .Values.images.web | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            - { name: NEXUS_H0_API_URL, value: "http://api:8000" }
+            - { name: NEXUS_H0_API_ALLOW_HTTP_SERVICE_NAME, value: "1" }
+            - { name: NEXUS_API_TOKEN_FILE, value: /run/secrets/api_token }
+            - { name: NEXUS_H0_UI_BIND_HOST, value: 0.0.0.0 }
+            - { name: NEXUS_H0_UI_PORT, value: "8080" }
+            - { name: NEXUS_H0_UI_PUBLIC_PORT, value: {{ .Values.web.publicPort | quote }} }
+            - { name: NEXUS_H0_UI_ALLOWED_HOSTS, value: {{ required "web.allowedHosts must list the exact ingress hostname(s)" .Values.web.allowedHosts | quote }} }
+            - { name: NEXUS_H0_UI_ALLOWED_ORIGINS, value: {{ required "web.allowedOrigins must list the exact HTTPS browser origin(s)" .Values.web.allowedOrigins | quote }} }
+          ports: [{ name: http, containerPort: 8080 }]
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          resources: {{- toYaml .Values.resources.web | nindent 12 }}
+          volumeMounts:
+            - { name: runtime-secrets, mountPath: /run/secrets, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /, port: http, httpHeaders: [{ name: Host, value: {{ index (splitList "," .Values.web.allowedHosts) 0 | trim | quote }} }] }
+            periodSeconds: 10
+          livenessProbe: { tcpSocket: { port: http }, periodSeconds: 20 }
+      volumes:
+        - name: source
+          secret: { secretName: {{ .Values.secrets.web | quote }}, defaultMode: 0440 }
+        - { name: runtime-secrets, emptyDir: { medium: Memory } }
+        - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 32Mi } }
