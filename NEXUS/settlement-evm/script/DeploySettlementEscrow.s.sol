@@ -6,7 +6,6 @@ import {InferenceEscrow, IERC20Settlement} from "../src/InferenceEscrow.sol";
 interface VmSettlementDeploy {
     function envUint(string calldata name) external view returns (uint256);
     function envAddress(string calldata name) external view returns (address);
-    function addr(uint256 privateKey) external pure returns (address);
     function startBroadcast(uint256 privateKey) external;
     function stopBroadcast() external;
 }
@@ -18,24 +17,12 @@ contract DeploySettlementEscrow {
     VmSettlementDeploy private constant vm =
         VmSettlementDeploy(address(uint160(uint256(keccak256("hevm cheat code")))));
 
-    event SettlementEscrowDeployed(
-        address indexed escrow,
-        address indexed token,
-        address indexed owner,
-        address batchSigner,
-        address treasury,
-        address verificationPool,
-        uint8 tokenDecimals,
-        uint64 maxClaimWindow,
-        uint256 chainId
-    );
-
     function run() external returns (address escrowAddress) {
         uint256 expectedChainId = vm.envUint("NEXUS_SETTLEMENT_EXPECTED_CHAIN_ID");
         require(expectedChainId > 0 && block.chainid == expectedChainId, "NEXUS_SETTLEMENT_CHAIN_MISMATCH");
 
         uint256 privateKey = vm.envUint("NEXUS_SETTLEMENT_DEPLOYER_PRIVATE_KEY");
-        address deployer = vm.addr(privateKey);
+        address owner = vm.envAddress("NEXUS_SETTLEMENT_OWNER");
         address tokenAddress = vm.envAddress("NEXUS_SETTLEMENT_TOKEN");
         uint256 decimalsValue = vm.envUint("NEXUS_SETTLEMENT_TOKEN_DECIMALS");
         uint256 claimWindowValue = vm.envUint("NEXUS_SETTLEMENT_MAX_CLAIM_WINDOW");
@@ -51,24 +38,19 @@ contract DeploySettlementEscrow {
 
         vm.startBroadcast(privateKey);
         InferenceEscrow escrow = new InferenceEscrow(
-            IERC20Settlement(tokenAddress), signer, treasury, verificationPool, decimals, uint64(claimWindowValue)
-        );
-        require(escrow.owner() == deployer, "NEXUS_SETTLEMENT_OWNER_MISMATCH");
-        require(address(escrow.token()) == tokenAddress, "NEXUS_SETTLEMENT_TOKEN_MISMATCH");
-        require(escrow.batchSigner() == signer, "NEXUS_SETTLEMENT_SIGNER_MISMATCH");
-        require(escrow.maxClaimWindow() == claimWindowValue, "NEXUS_SETTLEMENT_WINDOW_MISMATCH");
-        escrowAddress = address(escrow);
-        emit SettlementEscrowDeployed(
-            escrowAddress,
-            tokenAddress,
-            deployer,
+            IERC20Settlement(tokenAddress),
+            owner,
             signer,
             treasury,
             verificationPool,
             decimals,
-            uint64(claimWindowValue),
-            block.chainid
+            uint64(claimWindowValue)
         );
+        require(escrow.owner() == owner, "NEXUS_SETTLEMENT_OWNER_MISMATCH");
+        require(address(escrow.token()) == tokenAddress, "NEXUS_SETTLEMENT_TOKEN_MISMATCH");
+        require(escrow.batchSigner() == signer, "NEXUS_SETTLEMENT_SIGNER_MISMATCH");
+        require(escrow.maxClaimWindow() == claimWindowValue, "NEXUS_SETTLEMENT_WINDOW_MISMATCH");
+        escrowAddress = address(escrow);
         vm.stopBroadcast();
     }
 }

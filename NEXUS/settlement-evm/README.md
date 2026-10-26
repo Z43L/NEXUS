@@ -85,15 +85,17 @@ The project pins Solidity 0.8.24, has no external Solidity dependencies, and inc
 `script/DeploySettlementEscrow.s.sol` is the non-fixture deployment path. It
 requires an explicit expected chain ID, checks the connected chain, token code
 and token decimals, deploys only `InferenceEscrow` (never a token), and verifies
-the resulting owner, signer, token and claim window. The deployer key becomes
-the contract owner; use an appropriately controlled key and record the emitted
-deployment event. The script does not send transactions without Foundry's
+the configured owner, signer, token and claim window. The configured owner may
+be a multisig and is immutable, so choose and verify it before deployment. The
+deployer key authorizes only deployment. Record the emitted deployment event.
+The script does not send transactions without Foundry's
 `--broadcast` flag. Start with a simulation:
 
 ```sh
 : "${SETTLEMENT_RPC_URL:?Set the RPC URL for the intended chain}"
 : "${NEXUS_SETTLEMENT_EXPECTED_CHAIN_ID:?Set the independently verified chain ID}"
 : "${NEXUS_SETTLEMENT_DEPLOYER_PRIVATE_KEY:?Load the deployment key securely}"
+: "${NEXUS_SETTLEMENT_OWNER:?Set the immutable owner or multisig address}"
 : "${NEXUS_SETTLEMENT_TOKEN:?Set the reviewed ERC-20 address}"
 : "${NEXUS_SETTLEMENT_TOKEN_DECIMALS:?Set the reviewed token decimals}"
 : "${NEXUS_SETTLEMENT_BATCH_SIGNER:?Set the gateway signer address}"
@@ -124,7 +126,8 @@ Amounts are raw ERC-20 base units, never decimal token values. The builder rejec
 `receipt_to_batch.py` is a read-only local bridge from the H0 Router SQLite
 ledger to the batch builder. It selects only rows with the Router database's
 `verified=1` flag, then rechecks the Ed25519 signature against the registered
-node key, node identity, completed job association, requested-versus-reported NRAM
+node key and an independently supplied SHA-256 fingerprint in the settlement
+policy. It also checks node identity, completed job association, requested-versus-reported NRAM
 authors, H0 token pricing, H0 share calculation, and the Router's reported
 metering discrepancy. Any inconsistency
 aborts the whole batch. Unverified receipts are omitted; if none remain, it
@@ -151,6 +154,9 @@ settlement):
   "nodeWallets": {
     "node_<exact H0 node id>": "0x<40 hex characters>"
   },
+  "nodePublicKeyFingerprints": {
+    "node_<exact H0 node id>": "<64 hex SHA-256 chars of DER SubjectPublicKeyInfo>"
+  },
   "authorWallets": {
     "<exact NRAM author identifier>": "0x<40 hex characters>"
   }
@@ -168,7 +174,28 @@ numerator)`. A non-integral result is rejected instead of rounded. Each
 receipt's `nram_used` must be empty (zero author) or contain exactly one
 identifier with an explicit `authorWallets` mapping. Multiple authors are
 ambiguous for the contract's single `author` field and cause a hard failure.
-Every verified node must have an explicit `nodeWallets` mapping. The final
+Every node must have both a wallet mapping and a SHA-256 fingerprint of its
+registered Ed25519 public key in `nodePublicKeyFingerprints`. Generate the pin
+from the enrolled public PEM (for example, the worker's `node_pub.pem`) and
+store/review this policy separately from the Router database:
+
+```sh
+python3 - /path/to/node_pub.pem <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+from cryptography.hazmat.primitives import serialization
+
+key = serialization.load_pem_public_key(Path(sys.argv[1]).read_bytes())
+der = key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+print(hashlib.sha256(der).hexdigest())
+PY
+```
+
+A public-key replacement in SQLite then fails closed. The pin
+does not independently prove the semantic correctness of a worker-signed
+receipt or protect a policy changed by the same privileged operator. Every
+verified node must have an explicit `nodeWallets` mapping. The final
 deposit cap, duplicate job IDs, token amount range and contract Merkle-sum
 format are checked by `batch_builder.py`.
 

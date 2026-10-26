@@ -72,7 +72,9 @@ contract InferenceEscrowTest {
 
     function setUp() public {
         token = new MockToken();
-        escrow = new InferenceEscrow(IERC20Settlement(address(token)), SIGNER, TREASURY, VALIDATORS, 6, 30 days);
+        escrow = new InferenceEscrow(
+            IERC20Settlement(address(token)), address(this), SIGNER, TREASURY, VALIDATORS, 6, 30 days
+        );
         token.mint(CLIENT, AMOUNT * 2);
         vm.prank(CLIENT);
         token.approve(address(escrow), type(uint256).max);
@@ -104,8 +106,9 @@ contract InferenceEscrowTest {
     }
 
     function testLeafProofIsBoundToEscrowInstance() public {
-        InferenceEscrow otherEscrow =
-            new InferenceEscrow(IERC20Settlement(address(token)), SIGNER, TREASURY, VALIDATORS, 6, 30 days);
+        InferenceEscrow otherEscrow = new InferenceEscrow(
+            IERC20Settlement(address(token)), address(this), SIGNER, TREASURY, VALIDATORS, 6, 30 days
+        );
         vm.prank(CLIENT);
         token.approve(address(otherEscrow), type(uint256).max);
 
@@ -125,8 +128,9 @@ contract InferenceEscrowTest {
 
     function testLeafProofIsBoundToTokenAddress() public {
         MockToken otherToken = new MockToken();
-        InferenceEscrow otherEscrow =
-            new InferenceEscrow(IERC20Settlement(address(otherToken)), SIGNER, TREASURY, VALIDATORS, 6, 30 days);
+        InferenceEscrow otherEscrow = new InferenceEscrow(
+            IERC20Settlement(address(otherToken)), address(this), SIGNER, TREASURY, VALIDATORS, 6, 30 days
+        );
         otherToken.mint(CLIENT, AMOUNT);
         vm.prank(CLIENT);
         otherToken.approve(address(otherEscrow), AMOUNT);
@@ -147,7 +151,7 @@ contract InferenceEscrowTest {
 
     function testConstructorRejectsWrongExpectedTokenDecimals() public {
         vm.expectRevert(abi.encodeWithSignature("Error(string)", "token decimals mismatch"));
-        new InferenceEscrow(IERC20Settlement(address(token)), SIGNER, TREASURY, VALIDATORS, 18, 30 days);
+        new InferenceEscrow(IERC20Settlement(address(token)), address(this), SIGNER, TREASURY, VALIDATORS, 18, 30 days);
     }
 
     function testNoAuthorRoutesRoyaltyToNode() public {
@@ -243,6 +247,21 @@ contract InferenceEscrowTest {
         (bool ok,) = address(escrow)
             .call(abi.encodeCall(escrow.publishBatch, (BATCH, JOB, AMOUNT, uint64(block.timestamp + 1 days))));
         require(!ok, "unauthorized publisher accepted");
+    }
+
+    function testOwnerControlsBatchSigner() public {
+        address nextSigner = address(0x2001);
+        escrow.setBatchSigner(nextSigner);
+        require(escrow.batchSigner() == nextSigner, "owner signer rotation failed");
+
+        vm.prank(CLIENT);
+        (bool ok,) = address(escrow).call(abi.encodeCall(escrow.setBatchSigner, (SIGNER)));
+        require(!ok, "non-owner changed batch signer");
+    }
+
+    function testConstructorRejectsZeroOwner() public {
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "zero recipient"));
+        new InferenceEscrow(IERC20Settlement(address(token)), address(0), SIGNER, TREASURY, VALIDATORS, 6, 30 days);
     }
 
     function testRootSumCannotExceedFundedBudget() public {

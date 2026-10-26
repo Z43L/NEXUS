@@ -60,6 +60,15 @@ contract InferenceEscrow {
     event BatchRefunded(bytes32 indexed batchId, address indexed payer, uint256 amount);
     event UnpublishedBatchCancelled(bytes32 indexed batchId, address indexed payer, uint256 amount);
     event BatchSignerChanged(address indexed signer);
+    event EscrowConfigured(
+        address indexed owner,
+        address indexed token,
+        address indexed batchSigner,
+        address treasury,
+        address verificationPool,
+        uint8 tokenDecimals,
+        uint64 maxClaimWindow
+    );
 
     modifier nonReentrant() {
         require(!entered, "reentrant call");
@@ -70,6 +79,7 @@ contract InferenceEscrow {
 
     constructor(
         IERC20Settlement token_,
+        address owner_,
         address signer_,
         address treasury_,
         address verificationPool_,
@@ -78,16 +88,22 @@ contract InferenceEscrow {
     ) {
         require(address(token_) != address(0) && address(token_).code.length > 0, "token must be contract");
         require(token_.decimals() == expectedTokenDecimals_, "token decimals mismatch");
-        require(signer_ != address(0) && treasury_ != address(0) && verificationPool_ != address(0), "zero recipient");
+        require(
+            owner_ != address(0) && signer_ != address(0) && treasury_ != address(0) && verificationPool_ != address(0),
+            "zero recipient"
+        );
         require(treasury_ != address(this) && verificationPool_ != address(this), "escrow cannot receive fees");
         require(maxClaimWindow_ > 0, "zero claim window");
         token = token_;
         tokenDecimals = expectedTokenDecimals_;
-        owner = msg.sender;
+        owner = owner_;
         batchSigner = signer_;
         treasury = treasury_;
         verificationPool = verificationPool_;
         maxClaimWindow = maxClaimWindow_;
+        emit EscrowConfigured(
+            owner_, address(token_), signer_, treasury_, verificationPool_, expectedTokenDecimals_, maxClaimWindow_
+        );
     }
 
     function setBatchSigner(address signer_) external {

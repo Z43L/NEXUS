@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import argparse
 from decimal import InvalidOperation
+import hashlib
+import hmac
 import json
 import math
 from pathlib import Path
 import sqlite3
 import sys
 from typing import Mapping
+
+from cryptography.hazmat.primitives import serialization
 
 from batch_builder import SettlementContext, build_batch, keccak256
 
@@ -33,7 +37,10 @@ def _integer(value, label: str, *, minimum: int = 0) -> int:
 def _load_config(document: object) -> dict:
     if not isinstance(document, Mapping):
         raise ValueError("config must be a JSON object")
-    required = {"settlementContext", "batchId", "depositAmount", "token", "nodeWallets", "authorWallets"}
+    required = {
+        "settlementContext", "batchId", "depositAmount", "token", "nodeWallets",
+        "nodePublicKeyFingerprints", "authorWallets",
+    }
     missing = required - set(document)
     if missing:
         raise ValueError("config missing fields: " + ", ".join(sorted(missing)))
@@ -51,9 +58,12 @@ def _load_config(document: object) -> dict:
         raise ValueError("token.decimals must be <= 36")
     numerator = _integer(token["usdPerTokenNumerator"], "token.usdPerTokenNumerator", minimum=1)
     denominator = _integer(token["usdPerTokenDenominator"], "token.usdPerTokenDenominator", minimum=1)
-    for key in ("nodeWallets", "authorWallets"):
+    for key in ("nodeWallets", "nodePublicKeyFingerprints", "authorWallets"):
         if not isinstance(document[key], Mapping):
             raise ValueError(f"{key} must be an object keyed by exact H0 identity")
+    missing_pins = set(document["nodeWallets"]) - set(document["nodePublicKeyFingerprints"])
+    if missing_pins:
+        raise ValueError("nodePublicKeyFingerprints missing node IDs: " + ", ".join(sorted(missing_pins)))
     # Centralized builder validates batch id, deposit and EVM addresses. Validate
     # mappings up front too, including unused entries, so typos cannot hide.
     from batch_builder import _address
@@ -61,6 +71,12 @@ def _load_config(document: object) -> dict:
         if not isinstance(identity, str) or not identity.startswith("node_"):
             raise ValueError("nodeWallets keys must be exact node_id values")
         _address(wallet, f"nodeWallets[{identity}]")
+    for identity, fingerprint in document["nodePublicKeyFingerprints"].items():
+        if not isinstance(identity, str) or not identity.startswith("node_"):
+            raise ValueError("nodePublicKeyFingerprints keys must be exact node_id values")
+        if (not isinstance(fingerprint, str) or len(fingerprint) != 64
+                or any(char not in "0123456789abcdefABCDEF" for char in fingerprint)):
+            raise ValueError(f"nodePublicKeyFingerprints[{identity}] must be a 32-byte SHA-256 hex digest")
     for identity, wallet in document["authorWallets"].items():
         if not isinstance(identity, str) or not identity:
             raise ValueError("authorWallets keys must be non-empty exact NRAM identifiers")
@@ -104,6 +120,19 @@ def _settlement_job_id(receipt: Mapping, signature_hex: str) -> str:
         raise ValueError("receipt signature must be a 64-byte Ed25519 signature")
     preimage = b"NEXUS_H0_RECEIPT_V1\x00" + nc.canonical_json(dict(receipt)) + signature
     return "0x" + keccak256(preimage).hex()
+
+
+def _public_key_fingerprint(public_pem: object) -> str:
+    if not isinstance(public_pem, str) or not public_pem:
+        raise ValueError("missing registered node public key")
+    try:
+        public_key = serialization.load_pem_public_key(public_pem.encode("ascii"))
+        public_der = public_key.public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+    except (ValueError, TypeError, UnicodeEncodeError) as exc:
+        raise ValueError("invalid registered node public key") from exc
+    return hashlib.sha256(public_der).hexdigest()
 
 
 def _verify_receipt(receipt: object, signature: object, public_pem: object,
@@ -179,6 +208,7 @@ def read_verified_jobs(db_path: str | Path, config: Mapping) -> list[dict]:
             conn.close()
     jobs = []
     node_wallets = config["nodeWallets"]
+    node_key_fingerprints = config["nodePublicKeyFingerprints"]
     author_wallets = config["authorWallets"]
     for row in rows:
         # Filter by the authoritative Router DB flag, not receipt fields supplied
@@ -189,6 +219,11 @@ def read_verified_jobs(db_path: str | Path, config: Mapping) -> list[dict]:
         node_id = row["node_id"]
         if row["status"] != "done" or row["job_node_id"] != node_id:
             raise ValueError(f"{job_id}: Router job/receipt state is inconsistent")
+        expected_fingerprint = node_key_fingerprints.get(node_id)
+        if expected_fingerprint is None:
+            raise ValueError(f"{job_id}: no externally pinned public-key fingerprint for node_id {node_id}")
+        if not hmac.compare_digest(_public_key_fingerprint(row["pubkey_pem"]), expected_fingerprint.lower()):
+            raise ValueError(f"{job_id}: registered node public key does not match the settlement policy pin")
         receipt = _verify_receipt(json.loads(row["receipt"]), row["signature"],
                                   row["pubkey_pem"], job_id, node_id,
                                   row["discrepancy_pct"])

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import sqlite3
 import subprocess
@@ -7,6 +8,8 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+
+from cryptography.hazmat.primitives import serialization
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -27,6 +30,14 @@ SETTLEMENT_CONTEXT = {
 }
 
 
+def fingerprint(public_pem):
+    public_key = serialization.load_pem_public_key(public_pem.encode("ascii"))
+    public_der = public_key.public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    return hashlib.sha256(public_der).hexdigest()
+
+
 def config(**overrides):
     value = {
         "settlementContext": SETTLEMENT_CONTEXT,
@@ -39,6 +50,7 @@ def config(**overrides):
             "usdPerTokenDenominator": 1,
         },
         "nodeWallets": {},
+        "nodePublicKeyFingerprints": {},
         "authorWallets": {},
     }
     value.update(overrides)
@@ -55,7 +67,8 @@ class ReceiptBridgeTests(unittest.TestCase):
         self._create_db()
         self.receipt = self._receipt("job_000001", [])
         self._insert(self.receipt)
-        self.cfg = config(nodeWallets={self.node_id: NODE_ADDRESS})
+        self.cfg = config(nodeWallets={self.node_id: NODE_ADDRESS},
+                          nodePublicKeyFingerprints={self.node_id: fingerprint(self.public_pem)})
 
     def _create_db(self):
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
@@ -142,11 +155,13 @@ class ReceiptBridgeTests(unittest.TestCase):
         receipt = self._receipt("0x" + "03" * 32, [author_id])
         self._insert(receipt)
         cfg = config(nodeWallets={self.node_id: NODE_ADDRESS},
+                     nodePublicKeyFingerprints={self.node_id: fingerprint(self.public_pem)},
                      authorWallets={author_id: AUTHOR_ADDRESS})
         mapped = read_verified_jobs(self.db_path, cfg)
         evm_id = _settlement_job_id(receipt, nc.sign_receipt(self.private_key, receipt))
         self.assertEqual(next(x for x in mapped if x["jobId"] == evm_id)["author"], AUTHOR_ADDRESS)
         no_author_cfg = config(nodeWallets={self.node_id: NODE_ADDRESS},
+                               nodePublicKeyFingerprints={self.node_id: fingerprint(self.public_pem)},
                                authorWallets={author_id: AUTHOR_ADDRESS})
         no_author = read_verified_jobs(self.db_path, no_author_cfg)
         receipt_evm_id = _settlement_job_id(self.receipt, nc.sign_receipt(self.private_key, self.receipt))
@@ -154,7 +169,8 @@ class ReceiptBridgeTests(unittest.TestCase):
 
     def test_rejects_missing_node_mapping_or_author_mapping(self):
         with self.assertRaisesRegex(ValueError, "no explicit wallet mapping for node_id"):
-            read_verified_jobs(self.db_path, config())
+            read_verified_jobs(self.db_path, config(
+                nodePublicKeyFingerprints={self.node_id: fingerprint(self.public_pem)}))
         receipt = self._receipt("0x" + "04" * 32, ["author-x"])
         self._insert(receipt)
         with self.assertRaisesRegex(ValueError, "no explicit wallet mapping for author"):
@@ -164,6 +180,7 @@ class ReceiptBridgeTests(unittest.TestCase):
         receipt = self._receipt("0x" + "05" * 32, ["author-a", "author-b"])
         self._insert(receipt)
         cfg = config(nodeWallets={self.node_id: NODE_ADDRESS},
+                     nodePublicKeyFingerprints={self.node_id: fingerprint(self.public_pem)},
                      authorWallets={"author-a": AUTHOR_ADDRESS, "author-b": AUTHOR_ADDRESS})
         with self.assertRaisesRegex(ValueError, "author mapping is ambiguous"):
             read_verified_jobs(self.db_path, cfg)
@@ -184,12 +201,31 @@ class ReceiptBridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "do not match the persisted Router job"):
             read_verified_jobs(self.db_path, self.cfg)
 
-    def test_rejects_node_database_mapping_inconsistency(self):
+    def test_rejects_node_database_key_replacement_against_policy_pin(self):
         other_key, other_pem, other_id = nc.load_or_create_node_key(Path(self.temp.name) / "other")
         del other_key
-        with self.assertRaisesRegex(ValueError, "registered node identity mismatch"):
+        with self.assertRaisesRegex(ValueError, "does not match the settlement policy pin"):
             self._insert(self.receipt, public_pem=other_pem)
             read_verified_jobs(self.db_path, self.cfg)
+
+    def test_rejects_registered_key_bound_to_wrong_node_id(self):
+        fake_node_id = "node_" + "00" * 8
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute("UPDATE jobs SET node_id=? WHERE job_id=?",
+                         (fake_node_id, self.receipt["job_id"]))
+            conn.execute("UPDATE receipts SET node_id=? WHERE job_id=?",
+                         (fake_node_id, self.receipt["job_id"]))
+            conn.execute("INSERT INTO nodes VALUES(?, ?)", (fake_node_id, self.public_pem))
+        cfg = config(nodeWallets={fake_node_id: NODE_ADDRESS},
+                     nodePublicKeyFingerprints={fake_node_id: fingerprint(self.public_pem)})
+        with self.assertRaisesRegex(ValueError, "registered node identity mismatch"):
+            read_verified_jobs(self.db_path, cfg)
+
+    def test_rejects_public_key_not_pinned_by_settlement_policy(self):
+        altered = config(nodeWallets={self.node_id: NODE_ADDRESS},
+                         nodePublicKeyFingerprints={self.node_id: "00" * 32})
+        with self.assertRaisesRegex(ValueError, "does not match the settlement policy pin"):
+            read_verified_jobs(self.db_path, altered)
 
     def test_rejects_unverified_state_inconsistent_or_bad_discrepancy(self):
         with self.assertRaisesRegex(ValueError, "job/receipt state is inconsistent"):
@@ -204,7 +240,8 @@ class ReceiptBridgeTests(unittest.TestCase):
             _cfg = config(token={"symbol": "TKN", "decimals": 0,
                                  "usdPerTokenNumerator": 3,
                                  "usdPerTokenDenominator": 1},
-                          nodeWallets={self.node_id: NODE_ADDRESS})
+                          nodeWallets={self.node_id: NODE_ADDRESS},
+                          nodePublicKeyFingerprints={self.node_id: fingerprint(self.public_pem)})
             read_verified_jobs(self.db_path, _cfg)
         with self.assertRaisesRegex(ValueError, "decimals"):
             config(token={"symbol": "TKN", "decimals": 37,
@@ -268,7 +305,8 @@ class ReceiptBridgeTests(unittest.TestCase):
         self._insert(self.receipt, verified=0)
         with self.assertRaisesRegex(ValueError, "no explicitly verified"):
             read_verified_jobs(self.db_path, self.cfg)
-        too_small = config(depositAmount=6, nodeWallets={self.node_id: NODE_ADDRESS})
+        too_small = config(depositAmount=6, nodeWallets={self.node_id: NODE_ADDRESS},
+                           nodePublicKeyFingerprints={self.node_id: fingerprint(self.public_pem)})
         self._insert(self.receipt, verified=1)
         with self.assertRaisesRegex(ValueError, "exceeds deposit"):
             __import__("batch_builder").build_batch(

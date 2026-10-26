@@ -8,6 +8,7 @@ The RPC binds only to 127.0.0.1; this harness refuses non-loopback RPC URLs.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -20,6 +21,7 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from batch_builder import keccak256
+from cryptography.hazmat.primitives import serialization
 
 # Keep generated Python bytecode out of the source tree during this disposable run.
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -68,7 +70,12 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
     sys.path.insert(0, str(H0))
     import nexus_common as nc
     key_dir = directory / "node-key"
-    _, _, node_id = nc.load_or_create_node_key(key_dir)
+    _, public_pem, node_id = nc.load_or_create_node_key(key_dir)
+    public_key = serialization.load_pem_public_key(public_pem.encode("ascii"))
+    public_der = public_key.public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    public_key_fingerprint = hashlib.sha256(public_der).hexdigest()
     def free_port() -> int:
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -153,6 +160,7 @@ def start_h0_fixture(directory: Path) -> tuple[Path, Path, dict[str, object], li
         "token": {"symbol": "NEXUS-TEST", "decimals": 6,
                   "usdPerTokenNumerator": 1, "usdPerTokenDenominator": 10_000},
         "nodeWallets": {node_id: NODE_ONE},
+        "nodePublicKeyFingerprints": {node_id: public_key_fingerprint},
         "authorWallets": {"author_e2e_test": AUTHOR},
     }
     config_path = directory / "test-policy.json"
@@ -240,6 +248,7 @@ def main() -> int:
                 **env,
                 "NEXUS_SETTLEMENT_EXPECTED_CHAIN_ID": str(CHAIN_ID),
                 "NEXUS_SETTLEMENT_DEPLOYER_PRIVATE_KEY": ANVIL_TEST_KEY,
+                "NEXUS_SETTLEMENT_OWNER": "0x0000000000000000000000000000000000001003",
                 "NEXUS_SETTLEMENT_TOKEN": deployments["MockSettlementToken"],
                 "NEXUS_SETTLEMENT_TOKEN_DECIMALS": "6",
                 "NEXUS_SETTLEMENT_BATCH_SIGNER": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
@@ -282,7 +291,23 @@ def main() -> int:
             operational_escrow = operational_deployment["InferenceEscrow"]
             if rpc(rpc_url, "eth_getCode", [operational_escrow, "latest"]) == "0x":
                 raise RuntimeError("deployment script did not create an escrow contract")
-            expected_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+            deploy_record_path = (
+                broadcast_root / "DeploySettlementEscrow.s.sol" / str(CHAIN_ID) / "run-latest.json"
+            )
+            deploy_record = json.loads(deploy_record_path.read_text(encoding="utf-8"))
+            deployment_tx = next((tx for tx in deploy_record.get("transactions", [])
+                                  if tx.get("contractName") == "InferenceEscrow"), None)
+            if not deployment_tx or not deployment_tx.get("hash"):
+                raise RuntimeError("Foundry deployment record has no escrow creation transaction hash")
+            deployment_receipt = rpc(rpc_url, "eth_getTransactionReceipt", [deployment_tx["hash"]])
+            configured_topic = "0x" + keccak256(
+                b"EscrowConfigured(address,address,address,address,address,uint8,uint64)"
+            ).hex()
+            if not any(log.get("address", "").lower() == operational_escrow.lower()
+                       and log.get("topics", [""])[0].lower() == configured_topic.lower()
+                       for log in deployment_receipt.get("logs", [])):
+                raise RuntimeError("on-chain escrow creation receipt has no EscrowConfigured event")
+            expected_address = deploy_env["NEXUS_SETTLEMENT_OWNER"]
             expected_token = bytes.fromhex(deploy_env["NEXUS_SETTLEMENT_TOKEN"][2:]).rjust(32, b"\x00")
             expected_signer = bytes.fromhex(deploy_env["NEXUS_SETTLEMENT_BATCH_SIGNER"][2:]).rjust(32, b"\x00")
             actual_config = {
