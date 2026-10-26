@@ -19,3 +19,11 @@ NEXUS/.env.h0
 NEXUS/.secrets/
 NEXUS/data/
 .DS_Store
+
+# Local tooling and scratch environments
+.pytest_cache/
+.venv/
+venv/
+*.pyc
+NEXUS/atenhea/third_party/chl/build/
+NEXUS/atenhea/third_party/chl/node_modules/
