@@ -55,7 +55,11 @@ and signed worker as separate processes. It submits two jobs through the Router,
 waits for the Router to verify the worker's Ed25519 receipts, invokes
 `receipt_to_batch.py` against the resulting Router database, starts a disposable
 Anvil node bound exclusively to `127.0.0.1`, deploys a test-only mock ERC-20 and
-the escrow, funds and publishes the exact bridge-produced root, then calls
+the escrow, then runs `PublishSettlementBatch.s.sol` with a payer key separate
+from the configured gateway signer. It checks the batch context, approved
+policy hash, token decimals, payout addresses, signer identity, payer balance,
+funding cap, unique batch and claim deadline before broadcasting approve/fund
+from the payer and publish from the signer. A separate call then runs
 `claimMany`. It checks exact aggregate node and author balances, verification,
 burn-sink and treasury balances, and zero remaining escrow. The test policy uses
 an explicit synthetic token price and wallet mapping; all generated files are
@@ -110,6 +114,38 @@ recipients should an operator explicitly add `--broadcast` to that command.
 This is a deployment primitive, not an endorsement or automatic Base Sepolia
 release: token policy,
 signer custody, wallet mappings, funding and root review remain operator gates.
+
+### Preflight, fund and publish a bridge batch
+
+`script/PublishSettlementBatch.s.sol` accepts the reviewed batch JSON as a
+`run(string)` argument. Set `NEXUS_SETTLEMENT_EXPECTED_CHAIN_ID`,
+`NEXUS_SETTLEMENT_ESCROW`, `NEXUS_SETTLEMENT_TOKEN`,
+`NEXUS_SETTLEMENT_TREASURY`, `NEXUS_SETTLEMENT_VERIFICATION_POOL`,
+`NEXUS_SETTLEMENT_EXPECTED_POLICY_HASH`, `NEXUS_SETTLEMENT_PAYER_PRIVATE_KEY`,
+`NEXUS_SETTLEMENT_SIGNER_PRIVATE_KEY`, and
+`NEXUS_SETTLEMENT_CLAIM_DEADLINE`, and `NEXUS_SETTLEMENT_MIN_GAS_BALANCE`
+(minimum native token balance in wei required on both transaction signers).
+The expected policy hash is the
+`settlementPolicyHash` value from the separately reviewed bridge artifact; keep
+that value and the batch artifact under change control. The bridge includes the
+configured deposit cap, token decimals, rational USD/token policy and source
+receipt index. Simulate before broadcasting:
+
+```sh
+: "${SETTLEMENT_RPC_URL:?Set the intended RPC URL}"
+: "${NEXUS_SETTLEMENT_BATCH_JSON:?Set the reviewed batch JSON path}"
+BATCH_JSON="$(cat "$NEXUS_SETTLEMENT_BATCH_JSON")"
+forge script script/PublishSettlementBatch.s.sol:PublishSettlementBatch \
+  --rpc-url "$SETTLEMENT_RPC_URL" --sig 'run(string)' "$BATCH_JSON"
+```
+
+Review the resolved chain, payer, signer, batch ID, root and deadline from the
+simulation. Only then add `--broadcast`. The payer funds exactly `rootSum` and
+the gateway signer publishes it in a second transaction, so a funded but
+unpublished interval exists; the payer may call `cancelUnpublished(batchId)` if
+publication fails. Retain transaction hashes and `BatchFunded` /
+`BatchPublished` event evidence. Never enable shell tracing while private-key
+environment variables are loaded.
 
 ## Build batches from explicit settlement inputs
 

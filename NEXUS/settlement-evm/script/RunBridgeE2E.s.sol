@@ -2,7 +2,6 @@
 pragma solidity 0.8.24;
 
 import "../src/InferenceEscrow.sol";
-import "../src/MockSettlementToken.sol";
 
 interface VmE2E {
     function parseJsonBytes32(string calldata json, string calldata key) external pure returns (bytes32);
@@ -16,8 +15,8 @@ interface VmE2E {
     function stopBroadcast() external;
 }
 
-/// @dev TEST ONLY. Deploys mock token + escrow, then settles a bridge-produced
-/// batch on a disposable Anvil chain and checks every expected recipient balance.
+/// @dev TEST ONLY. Claims a separately funded and published bridge-produced
+/// batch on disposable Anvil, then checks every expected recipient balance.
 contract RunBridgeE2E {
     VmE2E private constant vm = VmE2E(address(uint160(uint256(keccak256("hevm cheat code")))));
 
@@ -76,24 +75,16 @@ contract RunBridgeE2E {
 
     function _runBatch(BatchData memory data, uint256 privateKey) private {
         Payouts memory expected = _calculatePayouts(data.claims);
-        MockSettlementToken token = MockSettlementToken(data.tokenAddress);
+        IERC20Settlement token = IERC20Settlement(data.tokenAddress);
         InferenceEscrow escrow = InferenceEscrow(data.escrowAddress);
         require(address(escrow.token()) == data.tokenAddress, "settlement token mismatch");
         require(escrow.tokenDecimals() == token.decimals(), "settlement token decimals mismatch");
-        _broadcastSettlement(data, privateKey, token, escrow);
+        _broadcastSettlement(data, privateKey, escrow);
         _checkBalances(data, token, escrow, expected);
     }
 
-    function _broadcastSettlement(
-        BatchData memory data,
-        uint256 privateKey,
-        MockSettlementToken token,
-        InferenceEscrow escrow
-    ) private {
+    function _broadcastSettlement(BatchData memory data, uint256 privateKey, InferenceEscrow escrow) private {
         vm.startBroadcast(privateKey);
-        token.approve(address(escrow), data.rootSum);
-        escrow.fundBatch(data.batchId, data.rootSum);
-        escrow.publishBatch(data.batchId, data.root, data.rootSum, uint64(block.timestamp + 1 hours));
         escrow.claimMany(data.batchId, data.claims);
         vm.stopBroadcast();
     }
@@ -118,7 +109,7 @@ contract RunBridgeE2E {
 
     function _checkBalances(
         BatchData memory data,
-        MockSettlementToken token,
+        IERC20Settlement token,
         InferenceEscrow escrow,
         Payouts memory expected
     ) private view {

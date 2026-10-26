@@ -276,6 +276,17 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, json.JSONDecodeError, TypeError, ValueError, InvalidOperation) as exc:
         parser.error(str(exc))
     output = batch.as_contract_batch()
+    # The Merkle leaf binds addresses and chain ID, while decimals are contract
+    # configuration. Carry the policy value so the on-chain publisher can
+    # reject a batch generated under a different unit scale.
+    output["tokenDecimals"] = config["token"]["decimals"]
+    output["depositAmount"] = config["depositAmount"]
+    output["settlementPolicyHash"] = "0x" + hashlib.sha256(nc.canonical_json(config)).hexdigest()
+    output["tokenPolicy"] = {
+        "symbol": config["token"]["symbol"],
+        "usdPerTokenNumerator": config["token"]["usdPerTokenNumerator"],
+        "usdPerTokenDenominator": config["token"]["usdPerTokenDenominator"],
+    }
     output["sourceReceipts"] = source_receipts
     json.dump(output, sys.stdout, indent=2)
     sys.stdout.write("\n")

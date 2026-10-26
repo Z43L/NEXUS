@@ -30,6 +30,8 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent
 H0 = ROOT.parent / "nexus" / "h0"
 ANVIL_TEST_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+ANVIL_SIGNER_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+ANVIL_SIGNER_ADDRESS = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 NODE_ONE = "0x" + "a1" * 20
 NODE_TWO = "0x" + "a2" * 20
 AUTHOR = "0x" + "b1" * 20
@@ -251,7 +253,7 @@ def main() -> int:
                 "NEXUS_SETTLEMENT_OWNER": "0x0000000000000000000000000000000000001003",
                 "NEXUS_SETTLEMENT_TOKEN": deployments["MockSettlementToken"],
                 "NEXUS_SETTLEMENT_TOKEN_DECIMALS": "6",
-                "NEXUS_SETTLEMENT_BATCH_SIGNER": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+                "NEXUS_SETTLEMENT_BATCH_SIGNER": ANVIL_SIGNER_ADDRESS,
                 "NEXUS_SETTLEMENT_TREASURY": "0x0000000000000000000000000000000000001001",
                 "NEXUS_SETTLEMENT_VERIFICATION_POOL": "0x0000000000000000000000000000000000001002",
                 "NEXUS_SETTLEMENT_MAX_CLAIM_WINDOW": str(24 * 60 * 60),
@@ -340,9 +342,109 @@ def main() -> int:
                 raise RuntimeError("receipt bridge did not produce the expected two-claim test batch")
             if batch["settlementContext"] != config["settlementContext"]:
                 raise RuntimeError("bridge output settlement context does not match deployed contracts")
+            if batch.get("tokenDecimals") != config["token"]["decimals"]:
+                raise RuntimeError("bridge output token decimals do not match settlement policy")
             source_ids = {row["routerJobId"] for row in batch["sourceReceipts"].values()}
             if source_ids != {"job_000001", "job_000002"}:
                 raise RuntimeError("bridge did not preserve Router-native receipt references")
+
+            latest_block = rpc(rpc_url, "eth_getBlockByNumber", ["latest", False])
+            deadline = int(latest_block["timestamp"], 16) + 3600
+            policy_hash = "0x" + hashlib.sha256(
+                json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            publish_env = {
+                **env,
+                "NEXUS_SETTLEMENT_EXPECTED_CHAIN_ID": str(CHAIN_ID),
+                "NEXUS_SETTLEMENT_ESCROW": operational_escrow,
+                "NEXUS_SETTLEMENT_TOKEN": deployments["MockSettlementToken"],
+                "NEXUS_SETTLEMENT_TREASURY": "0x0000000000000000000000000000000000001001",
+                "NEXUS_SETTLEMENT_VERIFICATION_POOL": "0x0000000000000000000000000000000000001002",
+                "NEXUS_SETTLEMENT_EXPECTED_POLICY_HASH": policy_hash,
+                "NEXUS_SETTLEMENT_PAYER_PRIVATE_KEY": ANVIL_TEST_KEY,
+                "NEXUS_SETTLEMENT_SIGNER_PRIVATE_KEY": ANVIL_SIGNER_KEY,
+                "NEXUS_SETTLEMENT_CLAIM_DEADLINE": str(deadline),
+                "NEXUS_SETTLEMENT_MIN_GAS_BALANCE": "1000000000000000",
+            }
+            publish_script = "script/PublishSettlementBatch.s.sol:PublishSettlementBatch"
+            bad_signer_env = {
+                **publish_env,
+                "NEXUS_SETTLEMENT_SIGNER_PRIVATE_KEY": "0x" + "00" * 31 + "01",
+            }
+            signer_preflight = subprocess.run(
+                [forge, "script", publish_script, "--rpc-url", rpc_url, "--non-interactive",
+                 "--sig", "run(string)", batch_path.read_text(encoding="utf-8"), "-vvv"],
+                cwd=ROOT, env=bad_signer_env, check=False, capture_output=True, text=True,
+            )
+            if signer_preflight.returncode == 0 or "NEXUS_SETTLEMENT_SIGNER_MISMATCH" not in (
+                signer_preflight.stdout + signer_preflight.stderr
+            ):
+                raise RuntimeError("batch publisher did not reject a mismatched signer key:\n"
+                                   + signer_preflight.stdout + signer_preflight.stderr)
+            bad_policy_env = {**publish_env, "NEXUS_SETTLEMENT_EXPECTED_POLICY_HASH": "0x" + "00" * 32}
+            policy_preflight = subprocess.run(
+                [forge, "script", publish_script, "--rpc-url", rpc_url, "--non-interactive",
+                 "--sig", "run(string)", batch_path.read_text(encoding="utf-8"), "-vvv"],
+                cwd=ROOT, env=bad_policy_env, check=False, capture_output=True, text=True,
+            )
+            if policy_preflight.returncode == 0 or "NEXUS_SETTLEMENT_POLICY_HASH_MISMATCH" not in (
+                policy_preflight.stdout + policy_preflight.stderr
+            ):
+                raise RuntimeError("batch publisher did not reject an unapproved settlement policy hash:\n"
+                                   + policy_preflight.stdout + policy_preflight.stderr)
+            bad_context = {**publish_env, "NEXUS_SETTLEMENT_TOKEN": operational_escrow}
+            context_preflight = subprocess.run(
+                [forge, "script", publish_script, "--rpc-url", rpc_url, "--non-interactive",
+                 "--sig", "run(string)", batch_path.read_text(encoding="utf-8"), "-vvv"],
+                cwd=ROOT, env=bad_context, check=False, capture_output=True, text=True,
+            )
+            if context_preflight.returncode == 0 or "NEXUS_SETTLEMENT_BATCH_TOKEN_MISMATCH" not in (
+                context_preflight.stdout + context_preflight.stderr
+            ):
+                raise RuntimeError("batch publisher did not reject mismatched batch token context:\n"
+                                   + context_preflight.stdout + context_preflight.stderr)
+            over_cap_batch = {**batch, "depositAmount": batch["rootSum"] - 1}
+            cap_preflight = subprocess.run(
+                [forge, "script", publish_script, "--rpc-url", rpc_url, "--non-interactive",
+                 "--sig", "run(string)", json.dumps(over_cap_batch), "-vvv"],
+                cwd=ROOT, env=publish_env, check=False, capture_output=True, text=True,
+            )
+            if cap_preflight.returncode == 0 or "NEXUS_SETTLEMENT_ROOT_EXCEEDS_POLICY_DEPOSIT" not in (
+                cap_preflight.stdout + cap_preflight.stderr
+            ):
+                raise RuntimeError("batch publisher did not reject a root above the policy deposit cap:\n"
+                                   + cap_preflight.stdout + cap_preflight.stderr)
+            simulated_publish = subprocess.run(
+                [forge, "script", publish_script, "--rpc-url", rpc_url, "--non-interactive",
+                 "--sig", "run(string)", batch_path.read_text(encoding="utf-8"), "-vvv"],
+                cwd=ROOT, env=publish_env, check=False, capture_output=True, text=True,
+            )
+            if simulated_publish.returncode:
+                sys.stderr.write(simulated_publish.stdout)
+                sys.stderr.write(simulated_publish.stderr)
+                raise RuntimeError("batch publisher preflight simulation failed")
+            published = subprocess.run(
+                [forge, "script", publish_script, "--rpc-url", rpc_url,
+                 "--broadcast", "--non-interactive", "--sig", "run(string)",
+                 batch_path.read_text(encoding="utf-8"), "-vvv"],
+                cwd=ROOT, env=publish_env, check=False, capture_output=True, text=True,
+            )
+            if published.returncode:
+                sys.stderr.write(published.stdout)
+                sys.stderr.write(published.stderr)
+                raise RuntimeError("batch publisher broadcast failed")
+            publish_record = json.loads((broadcast_root / "PublishSettlementBatch.s.sol" / str(CHAIN_ID)
+                                         / "run-latest.json").read_text(encoding="utf-8"))
+            publish_transactions = publish_record.get("transactions", [])
+            if len(publish_transactions) < 4:
+                raise RuntimeError("publisher broadcast did not record approve, fund, and publish transactions")
+            senders = [str((tx.get("transaction") or {}).get("from", "")).lower()
+                       for tx in publish_transactions]
+            if senders.count("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266") < 3:
+                raise RuntimeError(f"payer did not send the expected approval and funding transactions: {senders}")
+            if senders.count(ANVIL_SIGNER_ADDRESS.lower()) < 1:
+                raise RuntimeError(f"gateway signer did not send the publication transaction: {senders}")
+
             result = subprocess.run(
                 [forge, "script", "script/RunBridgeE2E.s.sol:RunBridgeE2E",
                  "--rpc-url", rpc_url, "--broadcast", "--non-interactive", "--private-key", ANVIL_TEST_KEY,

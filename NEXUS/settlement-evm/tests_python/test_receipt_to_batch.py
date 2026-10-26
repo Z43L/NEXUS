@@ -133,6 +133,12 @@ class ReceiptBridgeTests(unittest.TestCase):
         )
         batch = json.loads(completed.stdout)
         self.assertEqual(batch["rootSum"], 7)
+        self.assertEqual(batch["depositAmount"], self.cfg["depositAmount"])
+        self.assertEqual(batch["tokenDecimals"], self.cfg["token"]["decimals"])
+        self.assertEqual(batch["settlementPolicyHash"],
+                         "0x" + hashlib.sha256(nc.canonical_json(self.cfg)).hexdigest())
+        self.assertEqual(batch["tokenPolicy"]["usdPerTokenDenominator"],
+                         self.cfg["token"]["usdPerTokenDenominator"])
         self.assertEqual(batch["settlementContext"], SETTLEMENT_CONTEXT)
         claim_id = batch["claims"][0]["jobId"]
         self.assertEqual(batch["sourceReceipts"][claim_id]["routerJobId"], "job_000001")
