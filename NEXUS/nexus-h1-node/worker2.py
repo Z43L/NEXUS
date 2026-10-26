@@ -150,7 +150,7 @@ class Worker:
         self.ready_file.unlink(missing_ok=True)
         self.model_id = None
         self.models: list[str] = []
-        self.scaffolding_tokens = 0
+        self.scaffolding: dict[str, int] = {}  # per engine model: fixed prompt overhead
         self.router_pub_pem = ""
 
     @staticmethod
@@ -191,11 +191,11 @@ class Worker:
                         headers=self._atenea_headers())
         return [m.get("id", "") for m in out.get("data", []) if m.get("id")]
 
-    def count_input_tokens(self, messages: list[dict]) -> int | None:
+    def count_input_tokens(self, messages: list[dict], model_id: str) -> int | None:
         for path in ("/v1/chat/completions/input_tokens", "/v1/messages/count_tokens"):
             try:
                 out = http_json(self.atenea + path,
-                                {"model": self.model_id, "messages": messages}, timeout=120,
+                                {"model": model_id, "messages": messages}, timeout=120,
                                 headers=self._atenea_headers())
                 return int(out["input_tokens"])
             except urllib.error.HTTPError as exc:
@@ -203,13 +203,13 @@ class Worker:
                     raise
         return None
 
-    def calibrate_scaffolding(self) -> int:
+    def calibrate_scaffolding(self, model_id: str) -> int:
         probe = [{"role": "user", "content": "nexus calibration ping"}]
-        counted = self.count_input_tokens(probe)
+        counted = self.count_input_tokens(probe, model_id)
         if counted is None:
             return 0
         resp = http_json(self.atenea + "/v1/chat/completions", {
-            "model": self.model_id, "messages": probe,
+            "model": model_id, "messages": probe,
             "temperature": 0.0, "max_tokens": 1, "stream": False,
         }, timeout=1200, headers=self._atenea_headers())
         eng_prompt = int((resp.get("usage") or {}).get("prompt_tokens", counted))
@@ -284,7 +284,7 @@ class Worker:
         started = time.time()
         started_iso = nc.utc_now_iso()
         model_id = nc.resolve_model(job.get("model", ""), self.models)
-        counted_in = self.count_input_tokens(job["messages"])
+        counted_in = self.count_input_tokens(job["messages"], model_id)
         resp = self.run_inference(job, model_id)
         finished = time.time()
         choice = (resp.get("choices") or [{}])[0]
@@ -308,7 +308,7 @@ class Worker:
             "output_tokens": eng_out,
             "engine_prompt_tokens": eng_in,
             "engine_completion_tokens": eng_out,
-            "scaffolding_tokens": self.scaffolding_tokens,
+            "scaffolding_tokens": self.scaffolding.get(model_id, 0),
             "meter_source": meter_source,
             "nram_used": job.get("nram", []),
             "started_at": started_iso,
@@ -332,12 +332,13 @@ class Worker:
             raise SystemExit("engine returned no models at " + self.atenea)
         self.model_id = models[0]
         self.models = models
-        self.scaffolding_tokens = self.calibrate_scaffolding()
+        for model in models:
+            self.scaffolding[model] = self.calibrate_scaffolding(model)
         self.register(models, [])
         self.ready_file.touch()
         threading.Thread(target=self.heartbeat_loop, daemon=True).start()
-        print(f"worker {self.node_id} model={self.model_id} wallet={self.wallet} "
-              f"scaffolding_tokens={self.scaffolding_tokens}", flush=True)
+        print(f"worker {self.node_id} models={models} wallet={self.wallet} "
+              f"scaffolding_tokens={self.scaffolding}", flush=True)
         while True:
             try:
                 job = self.next_job()

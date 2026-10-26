@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import gc
 import os
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -23,6 +24,7 @@ from prefix_cache import PrefixCache,stable_prefix_length
 from native_placement import place_native
 from micro_extensions import load_extension
 from nram_adapters import AdapterSlot
+from model_hub import ModelHub, load_catalog
 from native_protocol import messages_for, response_for, LiveStream
 
 ROOT=Path(__file__).resolve().parent
@@ -77,6 +79,13 @@ class NativeEngine:
     def render(self,messages,tools):
         return self.tokenizer.apply_chat_template(messages,tools=tools or None,tokenize=False,
             add_generation_prompt=True,enable_thinking=False)
+
+    def close(self):
+        """Release the engine's weights; the hub calls this only when no request leases it."""
+        self.executor.shutdown(wait=True)
+        self.model=None
+        gc.collect()
+        if self.device=='mps':torch.mps.empty_cache()
 
     def worker(self):
         if not hasattr(self,'executor'):
@@ -319,7 +328,7 @@ class NativeEngine:
             return report
 
 
-def handler_for(engine):
+def handler_for(hub):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,fmt,*args):print('[nram] '+fmt%args,flush=True)
         def json(self,value,status=200):
@@ -328,8 +337,8 @@ def handler_for(engine):
             self.end_headers();self.wfile.write(data)
         def do_GET(self):
             path=urlsplit(self.path).path
-            if path in {'/health','/onram/status'}:return self.json(engine.health())
-            if path=='/v1/models':return self.json({'object':'list','data':[{'id':engine.name,'object':'model'}]})
+            if path in {'/health','/onram/status'}:return self.json(hub.health())
+            if path=='/v1/models':return self.json({'object':'list','data':[{'id':name,'object':'model'} for name in hub.names()]})
             self.json({'error':'not found'},404)
         def do_POST(self):
             streaming=False;events=None
@@ -337,25 +346,30 @@ def handler_for(engine):
                 size=int(self.headers.get('Content-Length','0'))
                 if not 0<size<=4_000_000:return self.json({'error':'request body too large or empty'},400)
                 body=json.loads(self.rfile.read(size));path=urlsplit(self.path).path
-                if path=='/onram/train':return self.json(engine.train(body))
-                if path=='/v1/messages/count_tokens':
-                    messages,tools=messages_for(path,body)
-                    return self.json({'input_tokens':len(engine.tokenizer(engine.render(public_messages(messages,summary_enabled(body)),tools))['input_ids'])})
-                if path not in {'/v1/chat/completions','/v1/responses','/v1/messages'}:
-                    return self.json({'error':'unsupported endpoint'},404)
-                if not body.get('stream'):return self.json(engine.generate(path,body))
-                events=engine.stream(path,body)
-                first=next(events)
-                self.send_response(200);self.send_header('Content-Type','text/event-stream')
-                self.send_header('Cache-Control','no-cache');self.send_header('Connection','close');self.end_headers()
-                self.close_connection=True;streaming=True
-                from itertools import chain
-                for event,value in chain([first],events):
-                    if value is None:
-                        self.wfile.write(b': atenhea keep-alive\n\n');self.wfile.flush();continue
-                    if event:self.wfile.write(('event: '+event+'\n').encode())
-                    self.wfile.write(('data: '+json.dumps(value,ensure_ascii=False)+'\n\n').encode());self.wfile.flush()
-                if path=='/v1/chat/completions':self.wfile.write(b'data: [DONE]\n\n')
+                # The lease keeps the requested model resident until the response (or stream) ends.
+                with hub.lease(body.get('model')) as engine:
+                    try:
+                        if path=='/onram/train':return self.json(engine.train(body))
+                        if path=='/v1/messages/count_tokens':
+                            messages,tools=messages_for(path,body)
+                            return self.json({'input_tokens':len(engine.tokenizer(engine.render(public_messages(messages,summary_enabled(body)),tools))['input_ids'])})
+                        if path not in {'/v1/chat/completions','/v1/responses','/v1/messages'}:
+                            return self.json({'error':'unsupported endpoint'},404)
+                        if not body.get('stream'):return self.json(engine.generate(path,body))
+                        events=engine.stream(path,body)
+                        first=next(events)
+                        self.send_response(200);self.send_header('Content-Type','text/event-stream')
+                        self.send_header('Cache-Control','no-cache');self.send_header('Connection','close');self.end_headers()
+                        self.close_connection=True;streaming=True
+                        from itertools import chain
+                        for event,value in chain([first],events):
+                            if value is None:
+                                self.wfile.write(b': atenhea keep-alive\n\n');self.wfile.flush();continue
+                            if event:self.wfile.write(('event: '+event+'\n').encode())
+                            self.wfile.write(('data: '+json.dumps(value,ensure_ascii=False)+'\n\n').encode());self.wfile.flush()
+                        if path=='/v1/chat/completions':self.wfile.write(b'data: [DONE]\n\n')
+                    finally:
+                        if events is not None:events.close()
             except (BrokenPipeError,ConnectionResetError):return
             except ValueError as exc:
                 if not streaming:self.json({'error':str(exc)},400)
@@ -364,24 +378,29 @@ def handler_for(engine):
                 import traceback;traceback.print_exc()
                 if not streaming:self.json({'error':str(exc)},500)
                 else:self.wfile.write(('event: error\ndata: '+json.dumps({'type':'error','error':str(exc)})+'\n\n').encode())
-            finally:
-                if events is not None:events.close()
     return Handler
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bundle',type=Path,required=True)
-    parser.add_argument('--port',type=int,default=11436)
+    source=parser.add_mutually_exclusive_group(required=True)
+    source.add_argument('--bundle',type=Path,help='single model; served as --model-name')
+    source.add_argument('--catalog',type=Path,help='JSON {"models":[{"name":...,"bundle":...}]}; first entry is the default')
     parser.add_argument('--model-name',default='athenea-e2b:latest')
+    parser.add_argument('--max-resident',type=int,default=1,
+        help='models kept in memory at once; others load on demand and evict the least recently used')
+    parser.add_argument('--port',type=int,default=11436)
     parser.add_argument('--device',default='auto',choices=['auto','cpu','mps','cuda'])
     parser.add_argument('--ctx-size',type=int,default=0)
     parser.add_argument('--adapter-dir',type=Path,default=None,
         help='directory of verified <sha256>.nram adapters that requests may select with nram_adapter')
     args=parser.parse_args()
+    catalog=load_catalog(args.catalog) if args.catalog else {args.model_name:str(args.bundle)}
     torch.set_num_threads(4)
-    engine=NativeEngine(args.bundle,args.model_name,args.device,args.ctx_size,args.adapter_dir)
-    ThreadingHTTPServer(('127.0.0.1',args.port),handler_for(engine)).serve_forever()
+    hub=ModelHub(catalog,lambda name,bundle:NativeEngine(bundle,name,args.device,args.ctx_size,args.adapter_dir),
+                 max_resident=args.max_resident)
+    hub.preload()
+    ThreadingHTTPServer(('127.0.0.1',args.port),handler_for(hub)).serve_forever()
 
 
 if __name__=='__main__':main()
