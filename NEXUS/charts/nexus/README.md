@@ -8,8 +8,8 @@ Create these Kubernetes Secrets in the target namespace before installation:
 
 | Secret | Required keys |
 | --- | --- |
-| `nexus-router` | `tls.crt`, `tls.key`, `ca.crt`, `client.token`, `enrollment.token` |
-| `nexus-worker` | `ca.crt`, `enrollment.token`, `atenea.api.key` |
+| `nexus-router` | `tls.crt`, `tls.key`, `ca.crt`, `client.token` |
+| `nexus-worker` | `ca.crt`, `atenea.api.key` |
 | `nexus-api` | `ca.crt`, `client.token`, `api_clients.json`, `api_users.json`, `redis.url` |
 | `nexus-web` | `api.token` |
 

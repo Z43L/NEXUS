@@ -70,11 +70,10 @@ mv "$ENV_STAGE.rendered" "$ENV_STAGE"
 chmod 600 "$ENV_STAGE"
 
 openssl rand -hex 32 > "$STAGE_DIR/client.token"
-openssl rand -hex 32 > "$STAGE_DIR/enrollment.token"
 openssl rand -hex 32 > "$STAGE_DIR/api.token"
 openssl rand -hex 32 > "$STAGE_DIR/atenea_api.key"
 openssl rand -hex 32 > "$STAGE_DIR/valkey.password"
-chmod 600 "$STAGE_DIR/client.token" "$STAGE_DIR/enrollment.token" "$STAGE_DIR/api.token" "$STAGE_DIR/atenea_api.key" "$STAGE_DIR/valkey.password"
+chmod 600 "$STAGE_DIR/client.token" "$STAGE_DIR/api.token" "$STAGE_DIR/atenea_api.key" "$STAGE_DIR/valkey.password"
 python3 - "$STAGE_DIR/valkey.password" "$STAGE_DIR/valkey.conf" "$STAGE_DIR/redis.url" "$STAGE_DIR/api_users.json" <<'PY'
 import json
 import os

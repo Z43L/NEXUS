@@ -36,7 +36,6 @@ _router_public_pem = ""
 _db_path: Path = BASE / "nexus_h0.db"
 _network_mode = False
 _client_api_token = ""
-_node_enrollment_token = ""
 _content_retention_days = 30
 MAX_ACTIVE_JOBS = 1000
 MAX_JOB_MESSAGES = 256
@@ -104,6 +103,9 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS node_nonces(
             node_id TEXT NOT NULL, nonce TEXT NOT NULL, timestamp INTEGER NOT NULL,
             PRIMARY KEY(node_id, nonce));
+        CREATE TABLE IF NOT EXISTS node_approvals(
+            node_id TEXT PRIMARY KEY, pubkey_pem TEXT NOT NULL,
+            approved_at TEXT NOT NULL, revoked_at TEXT);
         """)
         # Upgrade databases created by earlier H0 revisions in place.
         columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
@@ -220,7 +222,13 @@ def new_job_id(conn) -> str:
 
 
 def recover_expired_jobs(conn, now_iso: str | None = None) -> int:
-    """Requeue expired worker leases or fail jobs that exhausted retries."""
+    """Requeue expired worker leases and jobs whose node stopped heartbeating.
+
+    A node that loses its link stops heartbeating; once its heartbeat TTL has
+    passed, its in-flight jobs go back to the queue. A late result from the old
+    dispatch is refused by _handle_worker_result (node and status checks), so
+    each job still yields at most one accepted receipt.
+    """
     now_iso = now_iso or nc.utc_now_iso()
     expired = conn.execute(
         "SELECT job_id, attempts FROM jobs WHERE status='dispatched' "
@@ -232,7 +240,39 @@ def recover_expired_jobs(conn, now_iso: str | None = None) -> int:
         else:
             conn.execute("UPDATE jobs SET status='queued', node_id=NULL, error=NULL, lease_until=NULL "
                          "WHERE job_id=?", (row["job_id"],))
-    return len(expired)
+    stale = conn.execute(
+        "SELECT j.job_id FROM jobs j LEFT JOIN nodes n ON n.node_id = j.node_id "
+        "WHERE j.status='dispatched' AND (n.node_id IS NULL OR n.last_heartbeat IS NULL "
+        "OR n.last_heartbeat < ?)", (active_node_cutoff_iso(),)).fetchall()
+    for row in stale:
+        requeue_dispatched_job(conn, row["job_id"], "node heartbeat lost", now_iso)
+    return len(expired) + len(stale)
+
+
+def approve_node(conn, node_id: str, pubkey_pem: str, now_iso: str | None = None) -> None:
+    """Register a worker's public key as allowed to join a remote Router."""
+    now_iso = now_iso or nc.utc_now_iso()
+    conn.execute("INSERT INTO node_approvals(node_id, pubkey_pem, approved_at, revoked_at) "
+                 "VALUES(?,?,?,NULL) ON CONFLICT(node_id) DO UPDATE SET "
+                 "pubkey_pem=excluded.pubkey_pem, approved_at=excluded.approved_at, revoked_at=NULL",
+                 (node_id, pubkey_pem.strip(), now_iso))
+
+
+def revoke_node(conn, node_id: str, now_iso: str | None = None) -> int:
+    """Revoke a worker key: drop its session and requeue its in-flight jobs.
+
+    Returns the number of jobs requeued. Removing the nodes row makes every
+    heartbeat, poll and result from that key fail at the existing gates.
+    """
+    now_iso = now_iso or nc.utc_now_iso()
+    conn.execute("UPDATE node_approvals SET revoked_at=? WHERE node_id=? AND revoked_at IS NULL",
+                 (now_iso, node_id))
+    rows = conn.execute("SELECT job_id FROM jobs WHERE status='dispatched' AND node_id=?",
+                        (node_id,)).fetchall()
+    for row in rows:
+        requeue_dispatched_job(conn, row["job_id"], "node revoked", now_iso)
+    conn.execute("DELETE FROM nodes WHERE node_id=?", (node_id,))
+    return len(rows)
 
 
 def requeue_dispatched_job(conn: sqlite3.Connection, job_id: str, error: str,
@@ -621,14 +661,14 @@ class Handler(BaseHTTPRequestHandler):
             if body.get("node_id") != expected_node_id:
                 return self._json({"error": "node_id does not match public key"}, 400)
             if _network_mode:
+                # Each worker enrols with its own key, approved by the operator
+                # (--approve-node). No shared secret crosses the network.
                 with db() as conn:
-                    existing = conn.execute("SELECT 1 FROM nodes WHERE node_id=?",
-                                             (expected_node_id,)).fetchone()
-                supplied_token = body.get("enrollment_token", "")
-                if (existing is None and (not isinstance(supplied_token, str)
-                        or not hmac.compare_digest(supplied_token.encode("utf-8"),
-                                                   _node_enrollment_token.encode("utf-8")))):
-                    return self._json({"error": "invalid enrollment token"}, 401)
+                    approval = conn.execute(
+                        "SELECT pubkey_pem FROM node_approvals WHERE node_id=? AND revoked_at IS NULL",
+                        (expected_node_id,)).fetchone()
+                if approval is None or approval["pubkey_pem"] != body["pubkey_pem"].strip():
+                    return self._json({"error": "node is not approved or has been revoked"}, 403)
             if not self._consume_node_signature(expected_node_id, body["pubkey_pem"], body):
                 return self._json({"error": "invalid or replayed node signature"}, 401)
             with _lock, db() as conn:
@@ -923,9 +963,27 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             self._handler_slots.release()
 
 
+def admin_node_command(base: Path, approve_pem_file: str | None, revoke_node_id: str | None) -> str:
+    """Operator actions on the Router database; they never start the server."""
+    global _db_path
+    _db_path = base / "nexus_h0.db"
+    init_db()
+    with _lock, db() as conn:
+        if approve_pem_file is not None:
+            pem = Path(approve_pem_file).read_text(encoding="ascii")
+            try:
+                node_id = nc.node_id_from_public_pem(pem)
+            except (ValueError, TypeError, UnicodeError) as exc:
+                raise ValueError("file is not a worker public key PEM") from exc
+            approve_node(conn, node_id, pem)
+            return f"approved node_id={node_id}"
+        requeued = revoke_node(conn, revoke_node_id)
+        return f"revoked node_id={revoke_node_id} requeued_jobs={requeued}"
+
+
 def main():
     global _router_private_key, _router_public_pem, _db_path
-    global _network_mode, _client_api_token, _node_enrollment_token, _content_retention_days
+    global _network_mode, _client_api_token, _content_retention_days
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=18080)
     ap.add_argument("--max-threads", type=int, default=64)
@@ -936,7 +994,10 @@ def main():
     ap.add_argument("--tls-cert", help="TLS server certificate PEM path")
     ap.add_argument("--tls-key", help="TLS private key PEM path")
     ap.add_argument("--client-token-file", help="0600 file containing the chat/models bearer token")
-    ap.add_argument("--enrollment-token-file", help="0600 file authorizing new node keys")
+    ap.add_argument("--approve-node", metavar="PUBKEY_PEM_FILE",
+                    help="admin: approve a worker's node_pub.pem for remote enrolment, then exit")
+    ap.add_argument("--revoke-node", metavar="NODE_ID",
+                    help="admin: revoke a worker's enrolment and requeue its jobs, then exit")
     ap.add_argument("--content-retention-days", type=int, default=30)
     args = ap.parse_args()
     if not 2 <= args.max_threads <= 512:
@@ -945,18 +1006,24 @@ def main():
         ap.error("--content-retention-days must be between 1 and 3650")
     _content_retention_days = args.content_retention_days
 
+    if args.approve_node is not None or args.revoke_node is not None:
+        if args.approve_node is not None and args.revoke_node is not None:
+            ap.error("choose either --approve-node or --revoke-node")
+        try:
+            print(admin_node_command(Path(args.dir), args.approve_node, args.revoke_node), flush=True)
+        except (ValueError, OSError) as exc:
+            ap.error(f"node administration failed: {exc}")
+        return
+
     tls_context = None
     if args.mode == "remote":
-        if not all((args.tls_cert, args.tls_key, args.client_token_file,
-                    args.enrollment_token_file)):
-            ap.error("remote mode requires --tls-cert, --tls-key, --client-token-file, "
-                     "and --enrollment-token-file")
+        if not all((args.tls_cert, args.tls_key, args.client_token_file)):
+            ap.error("remote mode requires --tls-cert, --tls-key and --client-token-file")
         try:
             host = resolve_bind_host(args.host)
             if ipaddress.ip_address(host).version != 4:
                 raise ValueError("remote mode currently supports IPv4 bind addresses only")
             _client_api_token = _read_secret_file(args.client_token_file, "client token")
-            _node_enrollment_token = _read_secret_file(args.enrollment_token_file, "enrollment token")
             if Path(args.tls_key).stat().st_mode & 0o077:
                 raise ValueError("TLS private key file permissions must be 0600")
             tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -967,8 +1034,7 @@ def main():
         _network_mode = True
         bind_host = host
     else:
-        if any((args.tls_cert, args.tls_key, args.client_token_file,
-                args.enrollment_token_file)):
+        if any((args.tls_cert, args.tls_key, args.client_token_file)):
             ap.error("TLS/token options require --mode remote")
         if args.host != "127.0.0.1":
             ap.error("local mode is fixed to 127.0.0.1; use remote mode for a private network address")
