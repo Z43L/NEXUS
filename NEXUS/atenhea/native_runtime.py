@@ -24,7 +24,7 @@ from prefix_cache import PrefixCache,stable_prefix_length
 from native_placement import place_native
 from micro_extensions import load_extension
 from nram_adapters import AdapterSlot
-from model_hub import ModelHub, load_catalog
+from model_hub import ModelBusyError, ModelHub, load_catalog
 from native_protocol import messages_for, response_for, LiveStream
 
 ROOT=Path(__file__).resolve().parent
@@ -346,6 +346,7 @@ def handler_for(hub):
                 size=int(self.headers.get('Content-Length','0'))
                 if not 0<size<=4_000_000:return self.json({'error':'request body too large or empty'},400)
                 body=json.loads(self.rfile.read(size));path=urlsplit(self.path).path
+                if not isinstance(body,dict):raise ValueError('request body must be a JSON object')
                 # The lease keeps the requested model resident until the response (or stream) ends.
                 with hub.lease(body.get('model')) as engine:
                     try:
@@ -371,6 +372,9 @@ def handler_for(hub):
                     finally:
                         if events is not None:events.close()
             except (BrokenPipeError,ConnectionResetError):return
+            except ModelBusyError as exc:
+                # Retryable: the requested model could not be loaded while others are serving.
+                if not streaming:self.json({'error':str(exc)},503)
             except ValueError as exc:
                 if not streaming:self.json({'error':str(exc)},400)
                 else:self.wfile.write(('event: error\ndata: '+json.dumps({'type':'error','error':str(exc)})+'\n\n').encode())

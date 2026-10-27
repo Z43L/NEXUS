@@ -21,6 +21,10 @@ from typing import Callable
 LATEST = ":latest"
 
 
+class ModelBusyError(RuntimeError):
+    """Every resident engine is leased, so the requested model cannot be loaded now."""
+
+
 class ModelHub:
     def __init__(self, catalog: dict[str, str], factory: Callable[[str, str], object],
                  max_resident: int = 1):
@@ -72,7 +76,7 @@ class ModelHub:
         while len(self._engines) >= self.max_resident:
             victim = next((key for key in self._engines if not self._leases.get(key)), None)
             if victim is None:
-                raise ValueError("all resident models are in use; retry shortly")
+                raise ModelBusyError("all resident models are in use; retry shortly")
             self._engines.pop(victim).close()
         engine = self.factory(name, self.catalog[name])
         self._engines[name] = engine

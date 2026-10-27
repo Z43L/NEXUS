@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from model_hub import ModelHub, load_catalog
+from model_hub import ModelBusyError, ModelHub, load_catalog
 
 
 class FakeEngine:
@@ -85,7 +85,7 @@ class ResidencyTests(unittest.TestCase):
     def test_leased_engine_is_never_released(self):
         hub = make_hub(max_resident=1)
         with hub.lease("gemma4-e2b") as gemma:
-            with self.assertRaisesRegex(ValueError, "in use"):
+            with self.assertRaisesRegex(ModelBusyError, "in use"):
                 with hub.lease("qwen-3b"):
                     pass
             self.assertFalse(gemma.closed)

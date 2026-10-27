@@ -379,9 +379,10 @@ class Handler(BaseHTTPRequestHandler):
     def _requires_client_auth(self, method: str, path: str) -> bool:
         if not _network_mode:
             return False
+        # Published .nram bundles are public by design, and workers fetch them with node
+        # signatures rather than the client token, so the /nram reads stay open.
         if method == "GET":
-            return (path in ("/v1/models", "/metrics", "/ledger/summary", "/nram")
-                    or path.startswith("/nram/")
+            return (path in ("/v1/models", "/metrics", "/ledger/summary")
                     or (path.startswith("/jobs/") and path != "/jobs/next"))
         if method == "POST":
             return path in ("/v1/chat/completions", "/jobs", "/nram")
