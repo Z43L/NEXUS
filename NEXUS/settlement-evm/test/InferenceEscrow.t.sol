@@ -56,21 +56,27 @@ contract MockToken is IERC20Settlement {
 
 contract InferenceEscrowTest {
     Vm private constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+    // Explicit clock: every batch is published at START. The dispute window closes at START + 7 days.
+    uint256 private constant START = 1_700_000_000;
     address private constant CLIENT = address(0x1001);
     address private constant SIGNER = address(0x1002);
     address private constant TREASURY = address(0x1003);
     address private constant VALIDATORS = address(0x1004);
     address private constant NODE = address(0x1005);
     address private constant AUTHOR = address(0x1006);
+    address private constant OTHER_NODE = address(0x2005);
+    address private constant DISPUTER = address(0x3001);
     address private constant BURN = 0x000000000000000000000000000000000000dEaD;
     bytes32 private constant BATCH = keccak256("batch-1");
     bytes32 private constant JOB = keccak256("job-1");
     uint256 private constant AMOUNT = 10_000;
+    uint256 private constant BOND = 1_000;
 
     MockToken private token;
     InferenceEscrow private escrow;
 
     function setUp() public {
+        vm.warp(START);
         token = new MockToken();
         escrow = new InferenceEscrow(
             IERC20Settlement(address(token)), address(this), SIGNER, TREASURY, VALIDATORS, 6, 30 days
@@ -81,9 +87,10 @@ contract InferenceEscrowTest {
     }
 
     function testSettlementConservesAndSplitsFunds() public {
-        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, uint64(block.timestamp + 1 days));
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, _deadline());
         bytes32[] memory proof = new bytes32[](0);
         uint256[] memory proofSums = new uint256[](0);
+        vm.warp(START + 7 days);
         _claimSingle(BATCH, JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
 
         require(token.balanceOf(NODE) == 7_500, "node share");
@@ -95,11 +102,12 @@ contract InferenceEscrowTest {
     }
 
     function testLeafProofIsBoundToCurrentChainId() public {
-        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, uint64(block.timestamp + 1 days));
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, _deadline());
         bytes32[] memory proof = new bytes32[](0);
         uint256[] memory proofSums = new uint256[](0);
         InferenceEscrow.JobClaim memory job = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
 
+        vm.warp(START + 7 days);
         vm.chainId(block.chainid + 1);
         (bool ok,) = address(escrow).call(abi.encodeCall(escrow.claim, (BATCH, job)));
         require(!ok, "proof replayed on another chain id");
@@ -117,11 +125,12 @@ contract InferenceEscrowTest {
         vm.prank(CLIENT);
         otherEscrow.fundBatch(BATCH, AMOUNT);
         vm.prank(SIGNER);
-        otherEscrow.publishBatch(BATCH, root, AMOUNT, uint64(block.timestamp + 1 days));
+        otherEscrow.publishBatch(BATCH, root, AMOUNT, _deadline());
 
         bytes32[] memory proof = new bytes32[](0);
         uint256[] memory proofSums = new uint256[](0);
         InferenceEscrow.JobClaim memory job = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+        vm.warp(START + 7 days);
         (bool ok,) = address(otherEscrow).call(abi.encodeCall(otherEscrow.claim, (BATCH, job)));
         require(!ok, "proof replayed on another escrow");
     }
@@ -140,11 +149,12 @@ contract InferenceEscrowTest {
         vm.prank(CLIENT);
         otherEscrow.fundBatch(BATCH, AMOUNT);
         vm.prank(SIGNER);
-        otherEscrow.publishBatch(BATCH, root, AMOUNT, uint64(block.timestamp + 1 days));
+        otherEscrow.publishBatch(BATCH, root, AMOUNT, _deadline());
 
         bytes32[] memory proof = new bytes32[](0);
         uint256[] memory proofSums = new uint256[](0);
         InferenceEscrow.JobClaim memory job = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+        vm.warp(START + 7 days);
         (bool ok,) = address(otherEscrow).call(abi.encodeCall(otherEscrow.claim, (BATCH, job)));
         require(!ok, "proof replayed with another token");
     }
@@ -155,18 +165,20 @@ contract InferenceEscrowTest {
     }
 
     function testNoAuthorRoutesRoyaltyToNode() public {
-        _fundAndPublish(BATCH, JOB, NODE, address(0), AMOUNT, uint64(block.timestamp + 1 days));
+        _fundAndPublish(BATCH, JOB, NODE, address(0), AMOUNT, _deadline());
         bytes32[] memory proof = new bytes32[](0);
         uint256[] memory proofSums = new uint256[](0);
+        vm.warp(START + 7 days);
         _claimSingle(BATCH, JOB, NODE, address(0), AMOUNT, proof, proofSums);
         require(token.balanceOf(NODE) == 8_500, "node receives unused royalty");
         require(token.balanceOf(address(escrow)) == 0, "all amount allocated");
     }
 
     function testSmallAmountDustMatchesH0TreasurySplit() public {
-        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, 3, uint64(block.timestamp + 1 days));
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, 3, _deadline());
         bytes32[] memory proof = new bytes32[](0);
         uint256[] memory proofSums = new uint256[](0);
+        vm.warp(START + 7 days);
         _claimSingle(BATCH, JOB, NODE, AUTHOR, 3, proof, proofSums);
         require(token.balanceOf(NODE) == 2, "node floor mismatch");
         require(token.balanceOf(TREASURY) == 1, "H0 remainder must go to treasury");
@@ -175,10 +187,11 @@ contract InferenceEscrowTest {
 
     function testReceiptCannotBeClaimedAgainInAnotherBatch() public {
         bytes32 secondBatch = keccak256("batch-2");
-        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, uint64(block.timestamp + 1 days));
-        _fundAndPublish(secondBatch, JOB, NODE, AUTHOR, AMOUNT, uint64(block.timestamp + 1 days));
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, _deadline());
+        _fundAndPublish(secondBatch, JOB, NODE, AUTHOR, AMOUNT, _deadline());
         bytes32[] memory proof = new bytes32[](0);
         uint256[] memory proofSums = new uint256[](0);
+        vm.warp(START + 7 days);
         _claimSingle(BATCH, JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
 
         InferenceEscrow.JobClaim memory replay = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
@@ -191,7 +204,7 @@ contract InferenceEscrowTest {
     function testClaimManySettlesTwoJobsFromOneBatch() public {
         bytes32 secondJob = keccak256("job-2");
         bytes32 firstLeaf = _leaf(address(escrow), address(token), BATCH, JOB, NODE, AUTHOR, AMOUNT);
-        bytes32 secondLeaf = _leaf(address(escrow), address(token), BATCH, secondJob, address(0x2005), AUTHOR, AMOUNT);
+        bytes32 secondLeaf = _leaf(address(escrow), address(token), BATCH, secondJob, OTHER_NODE, AUTHOR, AMOUNT);
         bytes32 firstNode = _leafNode(firstLeaf, AMOUNT);
         bytes32 secondNode = _leafNode(secondLeaf, AMOUNT);
         bytes32 root = _parent(firstNode, AMOUNT, secondNode, AMOUNT);
@@ -199,7 +212,7 @@ contract InferenceEscrowTest {
         vm.prank(CLIENT);
         escrow.fundBatch(BATCH, AMOUNT * 2);
         vm.prank(SIGNER);
-        escrow.publishBatch(BATCH, root, AMOUNT * 2, uint64(block.timestamp + 1 days));
+        escrow.publishBatch(BATCH, root, AMOUNT * 2, _deadline());
 
         bytes32[] memory firstProof = new bytes32[](1);
         firstProof[0] = secondNode;
@@ -211,11 +224,12 @@ contract InferenceEscrowTest {
         secondProofSums[0] = AMOUNT;
         InferenceEscrow.JobClaim[] memory jobs = new InferenceEscrow.JobClaim[](2);
         jobs[0] = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, firstProof, firstProofSums);
-        jobs[1] = InferenceEscrow.JobClaim(secondJob, address(0x2005), AUTHOR, AMOUNT, secondProof, secondProofSums);
+        jobs[1] = InferenceEscrow.JobClaim(secondJob, OTHER_NODE, AUTHOR, AMOUNT, secondProof, secondProofSums);
 
+        vm.warp(START + 7 days);
         escrow.claimMany(BATCH, jobs);
         require(token.balanceOf(NODE) == 7_500, "first node share");
-        require(token.balanceOf(address(0x2005)) == 7_500, "second node share");
+        require(token.balanceOf(OTHER_NODE) == 7_500, "second node share");
         require(token.balanceOf(AUTHOR) == 2_000, "author total");
         require(token.balanceOf(VALIDATORS) == 1_000, "verification total");
         require(token.balanceOf(BURN) == 1_000, "burn total");
@@ -224,19 +238,21 @@ contract InferenceEscrowTest {
     }
 
     function testRejectsInvalidProofAndDuplicateClaim() public {
-        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, uint64(block.timestamp + 1 days));
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, _deadline());
         bytes32[] memory proof = new bytes32[](1);
         proof[0] = keccak256("wrong sibling");
         uint256[] memory proofSums = new uint256[](1);
         proofSums[0] = AMOUNT;
         InferenceEscrow.JobClaim memory invalidJob =
             InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+        vm.warp(START + 7 days);
         (bool invalidProof,) = address(escrow).call(abi.encodeCall(escrow.claim, (BATCH, invalidJob)));
         require(!invalidProof, "accepted invalid proof");
 
         proof = new bytes32[](0);
         proofSums = new uint256[](0);
-        InferenceEscrow.JobClaim memory validJob = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+        InferenceEscrow.JobClaim memory validJob =
+            InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
         escrow.claim(BATCH, validJob);
         (bool duplicate,) = address(escrow).call(abi.encodeCall(escrow.claim, (BATCH, validJob)));
         require(!duplicate, "accepted duplicate claim");
@@ -244,8 +260,7 @@ contract InferenceEscrowTest {
 
     function testOnlySignerCanPublish() public {
         vm.prank(address(0xBAD));
-        (bool ok,) = address(escrow)
-            .call(abi.encodeCall(escrow.publishBatch, (BATCH, JOB, AMOUNT, uint64(block.timestamp + 1 days))));
+        (bool ok,) = address(escrow).call(abi.encodeCall(escrow.publishBatch, (BATCH, JOB, AMOUNT, _deadline())));
         require(!ok, "unauthorized publisher accepted");
     }
 
@@ -268,27 +283,27 @@ contract InferenceEscrowTest {
         vm.prank(CLIENT);
         escrow.fundBatch(BATCH, AMOUNT);
         vm.prank(SIGNER);
-        (bool ok,) = address(escrow)
-            .call(abi.encodeCall(escrow.publishBatch, (BATCH, JOB, AMOUNT + 1, uint64(block.timestamp + 1 days))));
+        (bool ok,) = address(escrow).call(abi.encodeCall(escrow.publishBatch, (BATCH, JOB, AMOUNT + 1, _deadline())));
         require(!ok, "root overcommits batch");
     }
 
     function testProofCannotLieAboutSiblingSum() public {
         bytes32 secondJob = keccak256("sum-proof-job-2");
         bytes32 firstLeaf = _leaf(address(escrow), address(token), BATCH, JOB, NODE, AUTHOR, AMOUNT);
-        bytes32 secondLeaf = _leaf(address(escrow), address(token), BATCH, secondJob, address(0x2005), AUTHOR, AMOUNT);
+        bytes32 secondLeaf = _leaf(address(escrow), address(token), BATCH, secondJob, OTHER_NODE, AUTHOR, AMOUNT);
         bytes32 secondNode = _leafNode(secondLeaf, AMOUNT);
         bytes32 root = _parent(_leafNode(firstLeaf, AMOUNT), AMOUNT, secondNode, AMOUNT);
         vm.prank(CLIENT);
         escrow.fundBatch(BATCH, AMOUNT * 2);
         vm.prank(SIGNER);
-        escrow.publishBatch(BATCH, root, AMOUNT * 2, uint64(block.timestamp + 1 days));
+        escrow.publishBatch(BATCH, root, AMOUNT * 2, _deadline());
 
         bytes32[] memory proof = new bytes32[](1);
         proof[0] = secondNode;
         uint256[] memory proofSums = new uint256[](1);
         proofSums[0] = AMOUNT - 1;
         InferenceEscrow.JobClaim memory job = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+        vm.warp(START + 7 days);
         (bool ok,) = address(escrow).call(abi.encodeCall(escrow.claim, (BATCH, job)));
         require(!ok, "accepted false sibling sum");
         require(token.balanceOf(address(escrow)) == AMOUNT * 2, "invalid proof consumed funds");
@@ -299,7 +314,7 @@ contract InferenceEscrowTest {
         escrow.fundBatch(BATCH, AMOUNT);
         vm.prank(SIGNER);
         (bool ok,) = address(escrow)
-            .call(abi.encodeCall(escrow.publishBatch, (BATCH, JOB, AMOUNT, uint64(block.timestamp + 31 days))));
+            .call(abi.encodeCall(escrow.publishBatch, (BATCH, JOB, AMOUNT, uint64(START + 31 days))));
         require(!ok, "unbounded claim deadline");
     }
 
@@ -313,11 +328,12 @@ contract InferenceEscrowTest {
     }
 
     function testRejectsFeeOnPayoutTokenWithoutLosingEscrowLiability() public {
-        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, uint64(block.timestamp + 1 days));
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, _deadline());
         token.setTransferFeeBps(100);
         bytes32[] memory proof = new bytes32[](0);
         uint256[] memory proofSums = new uint256[](0);
         InferenceEscrow.JobClaim memory job = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+        vm.warp(START + 7 days);
         (bool ok,) = address(escrow).call(abi.encodeCall(escrow.claim, (BATCH, job)));
         require(!ok, "accepted fee on payout token");
         require(token.balanceOf(address(escrow)) == AMOUNT, "failed claim consumed escrow");
@@ -338,9 +354,10 @@ contract InferenceEscrowTest {
         bytes32 leaf = _leaf(address(escrow), address(token), batchId, jobId, NODE, AUTHOR, amount);
         bytes32 root = keccak256(abi.encodePacked(leaf, amount));
         vm.prank(SIGNER);
-        escrow.publishBatch(batchId, root, amount, uint64(block.timestamp + 1 days));
+        escrow.publishBatch(batchId, root, amount, _deadline());
         bytes32[] memory proof = new bytes32[](0);
         uint256[] memory proofSums = new uint256[](0);
+        vm.warp(START + 7 days);
         _claimSingle(batchId, jobId, NODE, AUTHOR, amount, proof, proofSums);
 
         uint256 totalPaid = token.balanceOf(NODE) + token.balanceOf(AUTHOR) + token.balanceOf(VALIDATORS)
@@ -351,8 +368,8 @@ contract InferenceEscrowTest {
     function testExpiredBatchRefundsUnclaimedDeposit() public {
         bytes32 batchId = keccak256("refund-batch");
         bytes32 jobId = keccak256("refund-job");
-        _fundAndPublish(batchId, jobId, NODE, AUTHOR, AMOUNT, uint64(block.timestamp + 1 days));
-        vm.warp(block.timestamp + 1 days + 1);
+        _fundAndPublish(batchId, jobId, NODE, AUTHOR, AMOUNT, _deadline());
+        vm.warp(START + 14 days + 1);
         uint256 beforeBalance = token.balanceOf(CLIENT);
         escrow.refundExpired(batchId);
         require(token.balanceOf(CLIENT) == beforeBalance + AMOUNT, "refund amount");
@@ -362,19 +379,20 @@ contract InferenceEscrowTest {
     function testRefundAfterPartialBatchSettlement() public {
         bytes32 secondJob = keccak256("partial-job-2");
         bytes32 firstLeaf = _leaf(address(escrow), address(token), BATCH, JOB, NODE, AUTHOR, AMOUNT);
-        bytes32 secondLeaf = _leaf(address(escrow), address(token), BATCH, secondJob, address(0x2005), AUTHOR, AMOUNT);
+        bytes32 secondLeaf = _leaf(address(escrow), address(token), BATCH, secondJob, OTHER_NODE, AUTHOR, AMOUNT);
         bytes32 secondNode = _leafNode(secondLeaf, AMOUNT);
         bytes32 root = _parent(_leafNode(firstLeaf, AMOUNT), AMOUNT, secondNode, AMOUNT);
 
         vm.prank(CLIENT);
         escrow.fundBatch(BATCH, AMOUNT * 2);
-        uint64 deadline = uint64(block.timestamp + 1 days);
+        uint64 deadline = _deadline();
         vm.prank(SIGNER);
         escrow.publishBatch(BATCH, root, AMOUNT * 2, deadline);
         bytes32[] memory proof = new bytes32[](1);
         proof[0] = secondNode;
         uint256[] memory proofSums = new uint256[](1);
         proofSums[0] = AMOUNT;
+        vm.warp(START + 7 days);
         _claimSingle(BATCH, JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
 
         vm.warp(uint256(deadline) + 1);
@@ -382,6 +400,184 @@ contract InferenceEscrowTest {
         escrow.refundExpired(BATCH);
         require(token.balanceOf(CLIENT) == beforeBalance + AMOUNT, "partial remainder refund");
         require(token.balanceOf(address(escrow)) == 0, "partial batch funds remain");
+    }
+
+    function testClaimBeforeWindowEndIsRejected() public {
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, _deadline());
+        require(escrow.settleAt(BATCH) == START + 7 days, "window is not seven days");
+        bytes32[] memory proof = new bytes32[](0);
+        uint256[] memory proofSums = new uint256[](0);
+        InferenceEscrow.JobClaim memory job = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+
+        vm.warp(START + 7 days - 1);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "dispute window open"));
+        escrow.claim(BATCH, job);
+        require(token.balanceOf(address(escrow)) == AMOUNT, "early claim moved funds");
+        require(token.balanceOf(NODE) == 0, "early claim paid node");
+    }
+
+    function testUndisputedBatchSettlesAtDaySevenWithoutOwnerAction() public {
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, _deadline());
+        bytes32[] memory proof = new bytes32[](0);
+        uint256[] memory proofSums = new uint256[](0);
+        vm.warp(START + 7 days);
+        _claimSingle(BATCH, JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+        require(token.balanceOf(NODE) == 7_500, "day-7 settlement node share");
+        require(token.balanceOf(address(escrow)) == 0, "day-7 settlement remainder");
+    }
+
+    function testDisputeInsideWindowFreezesClaimAndRefund() public {
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, _deadline());
+        bytes32[] memory proof = new bytes32[](0);
+        uint256[] memory proofSums = new uint256[](0);
+        InferenceEscrow.JobClaim memory job = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+        uint256 bond = escrow.DISPUTE_BOND();
+        require(bond == BOND, "unexpected bond");
+
+        vm.warp(START + 3 days);
+        _openDispute(job);
+        require(escrow.openDisputes(BATCH) == 1, "dispute not counted");
+        require(token.balanceOf(address(escrow)) == AMOUNT + bond, "bond not escrowed");
+
+        vm.warp(START + 7 days);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "batch frozen by dispute"));
+        escrow.claim(BATCH, job);
+
+        vm.warp(START + 14 days + 1);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "batch frozen by dispute"));
+        escrow.refundExpired(BATCH);
+        require(token.balanceOf(address(escrow)) == AMOUNT + bond, "frozen batch moved funds");
+    }
+
+    function testDisputeAfterWindowIsRejected() public {
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, _deadline());
+        bytes32[] memory proof = new bytes32[](0);
+        uint256[] memory proofSums = new uint256[](0);
+        InferenceEscrow.JobClaim memory job = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+
+        vm.warp(START + 7 days);
+        token.mint(DISPUTER, BOND);
+        vm.prank(DISPUTER);
+        token.approve(address(escrow), type(uint256).max);
+        vm.prank(DISPUTER);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "dispute window closed"));
+        escrow.openDispute(BATCH, job);
+    }
+
+    function testDisputeRequiresValidLeafProof() public {
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, _deadline());
+        bytes32[] memory proof = new bytes32[](1);
+        proof[0] = keccak256("wrong sibling");
+        uint256[] memory proofSums = new uint256[](1);
+        proofSums[0] = AMOUNT;
+        InferenceEscrow.JobClaim memory bogus = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+
+        token.mint(DISPUTER, BOND);
+        vm.prank(DISPUTER);
+        token.approve(address(escrow), type(uint256).max);
+        vm.prank(DISPUTER);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "invalid proof"));
+        escrow.openDispute(BATCH, bogus);
+    }
+
+    function testOnlyOwnerResolvesDisputes() public {
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, _deadline());
+        bytes32[] memory proof = new bytes32[](0);
+        uint256[] memory proofSums = new uint256[](0);
+        InferenceEscrow.JobClaim memory job = InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proof, proofSums);
+        vm.warp(START + 1 days);
+        _openDispute(job);
+
+        vm.prank(CLIENT);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "only owner"));
+        escrow.resolveDispute(BATCH, JOB, true);
+    }
+
+    function testUpheldDisputeSlashesAccusedNodeOnly() public {
+        (bytes32 firstNode, bytes32 secondNode) = _publishTwoJobs();
+        bytes32 secondJob = keccak256("job-2");
+        (bytes32[] memory proofOne, uint256[] memory sumsOne) = _singleProof(secondNode);
+        (bytes32[] memory proofTwo, uint256[] memory sumsTwo) = _singleProof(firstNode);
+        InferenceEscrow.JobClaim memory disputed =
+            InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proofOne, sumsOne);
+
+        vm.warp(START + 2 days);
+        _openDispute(disputed);
+        escrow.resolveDispute(BATCH, JOB, true);
+        require(escrow.openDisputes(BATCH) == 0, "resolved dispute still open");
+
+        vm.warp(START + 7 days);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "job already claimed"));
+        escrow.claim(BATCH, disputed);
+        _claimSingle(BATCH, secondJob, OTHER_NODE, AUTHOR, AMOUNT, proofTwo, sumsTwo);
+
+        require(token.balanceOf(NODE) == 0, "slashed node was paid");
+        require(token.balanceOf(OTHER_NODE) == 7_500, "correct node not paid");
+        require(token.balanceOf(AUTHOR) == 1_000, "slashed job royalty was paid");
+        require(token.balanceOf(CLIENT) == AMOUNT, "slashed payout not returned to payer");
+        require(token.balanceOf(DISPUTER) == BOND, "upheld dispute bond not returned");
+        require(token.balanceOf(address(escrow)) == 0, "escrow retains funds");
+    }
+
+    function testRejectedDisputeForfeitsBondAndUnfreezes() public {
+        (bytes32 firstNode, bytes32 secondNode) = _publishTwoJobs();
+        bytes32 secondJob = keccak256("job-2");
+        (bytes32[] memory proofOne, uint256[] memory sumsOne) = _singleProof(secondNode);
+        (bytes32[] memory proofTwo, uint256[] memory sumsTwo) = _singleProof(firstNode);
+        InferenceEscrow.JobClaim memory disputed =
+            InferenceEscrow.JobClaim(JOB, NODE, AUTHOR, AMOUNT, proofOne, sumsOne);
+
+        vm.warp(START + 2 days);
+        _openDispute(disputed);
+        escrow.resolveDispute(BATCH, JOB, false);
+
+        vm.warp(START + 7 days);
+        _claimSingle(BATCH, JOB, NODE, AUTHOR, AMOUNT, proofOne, sumsOne);
+        _claimSingle(BATCH, secondJob, OTHER_NODE, AUTHOR, AMOUNT, proofTwo, sumsTwo);
+
+        require(token.balanceOf(NODE) == 7_500, "rejected dispute blocked honest node");
+        require(token.balanceOf(OTHER_NODE) == 7_500, "second node not paid");
+        require(token.balanceOf(TREASURY) == 1_000 + BOND, "rejected bond not forfeited to treasury");
+        require(token.balanceOf(DISPUTER) == 0, "rejected disputer recovered bond");
+        require(token.balanceOf(address(escrow)) == 0, "escrow retains funds");
+    }
+
+    function testUndisputedBatchRefundsOnlyAfterDeadline() public {
+        _fundAndPublish(BATCH, JOB, NODE, AUTHOR, AMOUNT, _deadline());
+        vm.warp(START + 14 days);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "not expired"));
+        escrow.refundExpired(BATCH);
+    }
+
+    function _publishTwoJobs() private returns (bytes32 firstNode, bytes32 secondNode) {
+        bytes32 secondJob = keccak256("job-2");
+        bytes32 firstLeaf = _leaf(address(escrow), address(token), BATCH, JOB, NODE, AUTHOR, AMOUNT);
+        bytes32 secondLeaf = _leaf(address(escrow), address(token), BATCH, secondJob, OTHER_NODE, AUTHOR, AMOUNT);
+        firstNode = _leafNode(firstLeaf, AMOUNT);
+        secondNode = _leafNode(secondLeaf, AMOUNT);
+        vm.prank(CLIENT);
+        escrow.fundBatch(BATCH, AMOUNT * 2);
+        vm.prank(SIGNER);
+        escrow.publishBatch(BATCH, _parent(firstNode, AMOUNT, secondNode, AMOUNT), AMOUNT * 2, _deadline());
+    }
+
+    function _singleProof(bytes32 sibling) private pure returns (bytes32[] memory proof, uint256[] memory sums) {
+        proof = new bytes32[](1);
+        proof[0] = sibling;
+        sums = new uint256[](1);
+        sums[0] = AMOUNT;
+    }
+
+    function _openDispute(InferenceEscrow.JobClaim memory job) private {
+        token.mint(DISPUTER, BOND);
+        vm.prank(DISPUTER);
+        token.approve(address(escrow), type(uint256).max);
+        vm.prank(DISPUTER);
+        escrow.openDispute(BATCH, job);
+    }
+
+    function _deadline() private pure returns (uint64) {
+        return uint64(START + 14 days);
     }
 
     function _fundAndPublish(
