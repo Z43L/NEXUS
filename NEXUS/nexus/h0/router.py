@@ -36,8 +36,12 @@ _router_public_pem = ""
 _db_path: Path = BASE / "nexus_h0.db"
 _network_mode = False
 _client_api_token = ""
+# (token, client_id) pairs from --client-registry-file. The shared chat/models
+# token (_client_api_token) is checked separately and binds no publisher id.
+_client_registry: list[tuple[str, str]] = []
 _node_enrollment_token = ""
 _content_retention_days = 30
+CLIENT_ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"
 MAX_ACTIVE_JOBS = 1000
 MAX_JOB_MESSAGES = 256
 MAX_JOB_CHARS = 300_000
@@ -182,6 +186,24 @@ def _read_secret_file(path: str, label: str) -> str:
     return secret
 
 
+def _load_client_registry(path: str, shared_token: str) -> list[tuple[str, str]]:
+    """Read a 0600 JSON object {"client_id": "token"}: one token per client id."""
+    registry = json.loads(_read_secret_file(path, "client registry"))
+    if not isinstance(registry, dict) or not registry:
+        raise ValueError("client registry must be a non-empty JSON object")
+    entries, seen = [], {shared_token}
+    for client_id, token in registry.items():
+        if not isinstance(client_id, str) or not re.fullmatch(CLIENT_ID_PATTERN, client_id):
+            raise ValueError("client registry contains an invalid client id")
+        if not isinstance(token, str) or len(token) < 32:
+            raise ValueError(f"token for client {client_id!r} must contain at least 32 characters")
+        if token in seen:
+            raise ValueError("client registry tokens must be unique and differ from the shared token")
+        seen.add(token)
+        entries.append((token, client_id))
+    return entries
+
+
 def validate_bind_host(host: str) -> str:
     try:
         address = ipaddress.ip_address(host)
@@ -257,6 +279,8 @@ def requeue_dispatched_job(conn: sqlite3.Connection, job_id: str, error: str,
 
 
 class Handler(BaseHTTPRequestHandler):
+    auth_client_id: str | None = None
+
     def log_message(self, *args):  # keep stdout clean
         pass
 
@@ -369,12 +393,20 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _authorize_client(self) -> bool:
+        """Check the bearer token. On success, self.auth_client_id is the bound client id."""
+        self.auth_client_id = None
         if not _network_mode:
             return True
         scheme, _, supplied = self.headers.get("Authorization", "").partition(" ")
-        return (scheme.lower() == "bearer" and bool(supplied)
-                and hmac.compare_digest(supplied.encode("utf-8"),
-                                        _client_api_token.encode("utf-8")))
+        if scheme.lower() != "bearer" or not supplied:
+            return False
+        found = False
+        # No early exit: the comparison time does not reveal which token matched.
+        candidates = [(_client_api_token, None)] + _client_registry
+        for token, client_id in candidates:
+            if hmac.compare_digest(supplied.encode("utf-8"), token.encode("utf-8")):
+                found, self.auth_client_id = True, client_id
+        return found
 
     def _requires_client_auth(self, method: str, path: str) -> bool:
         if not _network_mode:
@@ -668,9 +700,26 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"error": "not found"}, 404)
 
     def _handle_nram_upload(self):
-        """Publish one NRA-M v2 bundle as raw bytes; the id is its SHA-256."""
-        author = self.headers.get("X-Nexus-Client-ID") or ""
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", author):
+        """Publish one NRA-M v2 bundle as raw bytes; the id is its SHA-256.
+
+        Remote mode: the author is the client id bound to the bearer token. The
+        X-Nexus-Client-ID header may repeat that id or be absent; any other value
+        is refused with 403. Local mode has no authentication (loopback only), so
+        the header names the publisher there.
+        """
+        claimed = self.headers.get("X-Nexus-Client-ID") or ""
+        if _network_mode:
+            bound = self.auth_client_id
+            if bound is None:
+                return self._json({"error": "forbidden",
+                                   "detail": "publishing requires a client token bound to a client id"}, 403)
+            if claimed not in ("", bound):
+                return self._json({"error": "forbidden",
+                                   "detail": "X-Nexus-Client-ID does not match the authenticated client"}, 403)
+            author = bound
+        else:
+            author = claimed
+        if not re.fullmatch(CLIENT_ID_PATTERN, author):
             return self._json({"error": "invalid_request",
                                "detail": "X-Nexus-Client-ID must name the publisher"}, 400)
         try:
@@ -925,7 +974,7 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
 def main():
     global _router_private_key, _router_public_pem, _db_path
-    global _network_mode, _client_api_token, _node_enrollment_token, _content_retention_days
+    global _network_mode, _client_api_token, _client_registry, _node_enrollment_token, _content_retention_days
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=18080)
     ap.add_argument("--max-threads", type=int, default=64)
@@ -937,6 +986,9 @@ def main():
     ap.add_argument("--tls-key", help="TLS private key PEM path")
     ap.add_argument("--client-token-file", help="0600 file containing the chat/models bearer token")
     ap.add_argument("--enrollment-token-file", help="0600 file authorizing new node keys")
+    ap.add_argument("--client-registry-file",
+                    help="remote mode: 0600 JSON {\"client_id\": \"token\"} binding each client token "
+                         "to its publisher id")
     ap.add_argument("--content-retention-days", type=int, default=30)
     args = ap.parse_args()
     if not 2 <= args.max_threads <= 512:
@@ -957,6 +1009,8 @@ def main():
                 raise ValueError("remote mode currently supports IPv4 bind addresses only")
             _client_api_token = _read_secret_file(args.client_token_file, "client token")
             _node_enrollment_token = _read_secret_file(args.enrollment_token_file, "enrollment token")
+            if args.client_registry_file:
+                _client_registry = _load_client_registry(args.client_registry_file, _client_api_token)
             if Path(args.tls_key).stat().st_mode & 0o077:
                 raise ValueError("TLS private key file permissions must be 0600")
             tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -968,7 +1022,7 @@ def main():
         bind_host = host
     else:
         if any((args.tls_cert, args.tls_key, args.client_token_file,
-                args.enrollment_token_file)):
+                args.enrollment_token_file, args.client_registry_file)):
             ap.error("TLS/token options require --mode remote")
         if args.host != "127.0.0.1":
             ap.error("local mode is fixed to 127.0.0.1; use remote mode for a private network address")
