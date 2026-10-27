@@ -106,7 +106,6 @@ class RouterRegistryTests(unittest.TestCase):
         cls.bob = "bob-" + os.urandom(32).hex()
         cls.shared = "shared-" + os.urandom(32).hex()
         write_secret(root / "shared.token", cls.shared)
-        write_secret(root / "enrollment.token", "enroll-" + os.urandom(32).hex())
         write_secret(root / "clients.json", json.dumps({"alice": cls.alice, "bob": cls.bob}))
         cls.context = ssl.create_default_context(cafile=str(ca_path))
         cls.port = free_port()
@@ -116,7 +115,6 @@ class RouterRegistryTests(unittest.TestCase):
              "--host", "127.0.0.1", "--port", str(cls.port), "--dir", str(root / "state"),
              "--tls-cert", str(cert_path), "--tls-key", str(key_path),
              "--client-token-file", str(root / "shared.token"),
-             "--enrollment-token-file", str(root / "enrollment.token"),
              "--client-registry-file", str(root / "clients.json")],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         try:
@@ -229,10 +227,10 @@ class RouterRegistryTests(unittest.TestCase):
     def test_tampered_stored_bundle_is_refused_on_download(self):
         data = build_bundle(name="expert-tamper-router")
         nram_id = hashlib.sha256(data).hexdigest()
-        self.assertEqual(self.publish(data)[0], 201)
-        stored = Path(self.tmp.name) / "nram" / f"{nram_id}.nram"
+        self.assertEqual(self.publish(data, self.alice)[0], 201)
+        stored = Path(self.tmp.name) / "state" / "nram" / f"{nram_id}.nram"
         stored.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
-        status, body = request(f"{self.url}/nram/{nram_id}/blob")
+        status, body = request(f"{self.url}/nram/{nram_id}/blob", context=self.context)
         self.assertEqual(status, 500)
         self.assertIn(b"corrupt", body)
 
