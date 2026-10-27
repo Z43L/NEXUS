@@ -1,13 +1,19 @@
 """H2 local .nram registry: bundle validation and Router publish/list/fetch flow.
 
 Run from this directory: python3 -m unittest test_nram_registry -v
+
+Publishing is tested against a remote-mode Router (TLS, bearer tokens bound to
+client ids), because the author of a bundle must come from the authenticated
+token, never from the X-Nexus-Client-ID header.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -18,6 +24,7 @@ import urllib.request
 from pathlib import Path
 
 import nram_registry as nr
+from test_secure_remote import make_ca, make_server_cert, write_secret
 
 BASE = Path(__file__).resolve().parent
 
@@ -73,10 +80,10 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
-def request(url, data=None, headers=None, method=None):
+def request(url, data=None, headers=None, method=None, context=None):
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10, context=context) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
         with exc:
@@ -87,18 +94,30 @@ class RouterRegistryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
+        root = Path(cls.tmp.name)
+        ca_key, ca_cert, ca_path = make_ca(root, "NEXUS-test-CA")
+        cert_path, key_path = make_server_cert(root, ca_key, ca_cert)
+        # Test-only credentials, generated per run. None of them is a real secret.
+        cls.alice = "alice-" + os.urandom(32).hex()
+        cls.bob = "bob-" + os.urandom(32).hex()
+        cls.shared = "shared-" + os.urandom(32).hex()
+        write_secret(root / "shared.token", cls.shared)
+        write_secret(root / "enrollment.token", "enroll-" + os.urandom(32).hex())
+        write_secret(root / "clients.json", json.dumps({"alice": cls.alice, "bob": cls.bob}))
+        cls.context = ssl.create_default_context(cafile=str(ca_path))
         cls.port = free_port()
-        cls.url = f"http://127.0.0.1:{cls.port}"
-        cls.proc = subprocess.Popen([sys.executable, str(BASE / "router.py"),
-                                     "--port", str(cls.port), "--dir", cls.tmp.name])
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            try:
-                if request(cls.url + "/health")[0] == 200:
-                    break
-            except OSError:
-                time.sleep(0.1)
-        else:
+        cls.url = f"https://127.0.0.1:{cls.port}"
+        cls.proc = subprocess.Popen(
+            [sys.executable, str(BASE / "router.py"), "--mode", "remote",
+             "--host", "127.0.0.1", "--port", str(cls.port), "--dir", str(root / "state"),
+             "--tls-cert", str(cert_path), "--tls-key", str(key_path),
+             "--client-token-file", str(root / "shared.token"),
+             "--enrollment-token-file", str(root / "enrollment.token"),
+             "--client-registry-file", str(root / "clients.json")],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for(lambda: request(cls.url + "/health", context=cls.context)[0] == 200)
+        except RuntimeError:
             cls.proc.kill()
             raise RuntimeError("router did not become healthy")
 
@@ -108,40 +127,73 @@ class RouterRegistryTests(unittest.TestCase):
         cls.proc.wait(timeout=10)
         cls.tmp.cleanup()
 
-    def publish(self, data, author="alice"):
-        return request(self.url + "/nram", data=data, method="POST",
-                       headers={"Content-Type": "application/octet-stream",
-                                "X-Nexus-Client-ID": author})
+    def call(self, path, data=None, headers=None, method=None, token=None):
+        headers = dict(headers or {})
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        return request(self.url + path, data=data, headers=headers, method=method,
+                       context=self.context)
+
+    def publish(self, data, token=None, claimed=None):
+        headers = {"Content-Type": "application/octet-stream"}
+        if claimed is not None:
+            headers["X-Nexus-Client-ID"] = claimed
+        return self.call("/nram", data=data, headers=headers, method="POST", token=token)
 
     def test_publish_list_fetch_and_verify(self):
         data = build_bundle()
-        status, body = self.publish(data)
+        status, body = self.publish(data, self.alice)
         self.assertEqual(status, 201)
         published = json.loads(body)
         nram_id = hashlib.sha256(data).hexdigest()
         self.assertEqual(published["nram_id"], nram_id)
         self.assertEqual(published["author_id"], "alice")
 
-        status, body = request(self.url + "/nram")
+        status, body = self.call("/nram", token=self.alice)
         self.assertIn(nram_id, [item["nram_id"] for item in json.loads(body)["data"]])
 
-        status, body = request(f"{self.url}/nram/{nram_id}")
+        status, body = self.call(f"/nram/{nram_id}", token=self.alice)
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["manifest"]["name"], "expert-a")
 
-        status, blob = request(f"{self.url}/nram/{nram_id}/blob")
+        status, blob = self.call(f"/nram/{nram_id}/blob", token=self.alice)
         self.assertEqual(status, 200)
         self.assertEqual(hashlib.sha256(blob).hexdigest(), nram_id)
         nr.inspect_bundle(blob)
 
+    def test_author_is_the_token_bound_client_not_the_header(self):
+        data = build_bundle(name="expert-owned")
+        nram_id = nr.bundle_id(data)
+        # Token A with header B is refused, and nothing is stored.
+        status, body = self.publish(data, self.alice, claimed="bob")
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)["error"], "forbidden")
+        self.assertEqual(self.call(f"/nram/{nram_id}", token=self.alice)[0], 404)
+
+        # Token B with header A is refused the same way.
+        self.assertEqual(self.publish(data, self.bob, claimed="alice")[0], 403)
+
+        # Without a header, or with the token's own id, the token's client is the author.
+        status, body = self.publish(data, self.alice)
+        self.assertEqual((status, json.loads(body)["author_id"]), (201, "alice"))
+        other = build_bundle(name="expert-owned-b")
+        status, body = self.publish(other, self.bob, claimed="bob")
+        self.assertEqual((status, json.loads(body)["author_id"]), (201, "bob"))
+
+    def test_shared_token_and_anonymous_requests_cannot_publish(self):
+        # The shared chat/models token authenticates but binds no publisher id.
+        self.assertEqual(self.publish(build_bundle(name="expert-shared"), self.shared)[0], 403)
+        self.assertEqual(self.publish(build_bundle(name="expert-anon"))[0], 401)
+        self.assertEqual(self.publish(build_bundle(name="expert-bad"), "wrong-token")[0], 401)
+
     def test_duplicate_and_invalid_uploads_are_rejected(self):
         data = build_bundle(name="expert-dup")
-        self.assertEqual(self.publish(data)[0], 201)
-        self.assertEqual(self.publish(data)[0], 409)
-        self.assertEqual(self.publish(data[:-1])[0], 400)
-        self.assertEqual(self.publish(build_bundle(), author="bad id!")[0], 400)
-        self.assertEqual(request(f"{self.url}/nram/{'0' * 64}")[0], 404)
-        self.assertEqual(request(f"{self.url}/nram/not-an-id")[0], 400)
+        self.assertEqual(self.publish(data, self.alice)[0], 201)
+        self.assertEqual(self.publish(data, self.alice)[0], 409)
+        self.assertEqual(self.publish(data[:-1], self.alice)[0], 400)
+        self.assertEqual(self.publish(build_bundle(), self.alice, claimed="bad id!")[0], 403)
+        self.assertEqual(self.call(f"/nram/{'0' * 64}", token=self.alice)[0], 404)
+        self.assertEqual(self.call("/nram/not-an-id", token=self.alice)[0], 400)
 
     def test_job_may_reference_only_published_bundles(self):
         payload = {"kind": "inference", "model": "athenea-e2b",
@@ -149,24 +201,24 @@ class RouterRegistryTests(unittest.TestCase):
                    "params": {"max_tokens": 8}}
         headers = {"Content-Type": "application/json"}
         unknown = dict(payload, nram=["a" * 64])
-        status, _ = request(self.url + "/jobs", data=json.dumps(unknown).encode(),
-                            headers=headers, method="POST")
+        status, _ = self.call("/jobs", data=json.dumps(unknown).encode(),
+                              headers=headers, method="POST", token=self.alice)
         self.assertEqual(status, 400)
 
-        nram_id = hashlib.sha256(build_bundle(name="expert-job")).hexdigest()
-        self.assertEqual(self.publish(build_bundle(name="expert-job"))[0], 201)
+        nram_id = nr.bundle_id(build_bundle(name="expert-job"))
+        self.assertEqual(self.publish(build_bundle(name="expert-job"), self.alice)[0], 201)
         known = dict(payload, nram=[nram_id])
-        status, _ = request(self.url + "/jobs", data=json.dumps(known).encode(),
-                            headers=headers, method="POST")
+        status, _ = self.call("/jobs", data=json.dumps(known).encode(),
+                              headers=headers, method="POST", token=self.alice)
         self.assertEqual(status, 200)
 
         two = dict(payload, nram=[nram_id, nram_id])
-        status, _ = request(self.url + "/jobs", data=json.dumps(two).encode(),
-                            headers=headers, method="POST")
+        status, _ = self.call("/jobs", data=json.dumps(two).encode(),
+                              headers=headers, method="POST", token=self.alice)
         self.assertEqual(status, 400)
 
     def test_ledger_reports_royalty_map(self):
-        status, body = request(self.url + "/ledger/summary")
+        status, body = self.call("/ledger/summary", token=self.alice)
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["royalties_micro_usd_by_author"], {})
 
