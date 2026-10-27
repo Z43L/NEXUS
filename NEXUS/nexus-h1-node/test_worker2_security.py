@@ -211,5 +211,32 @@ class EngineUrlPolicyTests(unittest.TestCase):
             thread.join(timeout=2)
 
 
+class NramRejectionTests(unittest.TestCase):
+    """An H1 worker has no adapter support: a .nram job must never reach the engine or a receipt."""
+
+    def test_nram_job_is_rejected_before_engine_call_and_never_billed(self):
+        with tempfile.TemporaryDirectory(prefix="nexus-nram-reject-") as tmp:
+            instance = worker2.Worker("http://127.0.0.1:18080", "http://127.0.0.1:11436",
+                                      Path(tmp), "wallet")
+            job = {"job_id": "job_nram", "messages": [{"role": "user", "content": "hi"}],
+                   "nram": ["a" * 64], "dispatch_jwt": "jwt"}
+            posted = []
+            with patch.object(worker2.jwt_auth, "verify_job_jwt", return_value={}), \
+                 patch.object(instance, "post_result", side_effect=lambda job_id, payload: posted.append((job_id, payload))), \
+                 patch.object(instance, "run_inference") as engine, \
+                 patch.object(instance, "count_input_tokens") as counter:
+                instance.process(job)
+            engine.assert_not_called()
+            counter.assert_not_called()
+            self.assertEqual(len(posted), 1)
+            job_id, payload = posted[0]
+            self.assertEqual(job_id, "job_nram")
+            self.assertEqual(payload["status"], "rejected")
+            self.assertEqual(payload["error"], "nram_unsupported_by_engine")
+            self.assertNotIn("receipt", payload)
+            self.assertNotIn("signature", payload)
+            self.assertNotIn("price_micro_usd", payload)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -101,7 +102,7 @@ def read_atenea_api_key(path: str | None) -> str | None:
 
 class Worker:
     def __init__(self, router: str, atenea: str, node_dir: Path, wallet: str,
-                 router_ca: str | None = None, enrollment_token_file: str | None = None,
+                 router_ca: str | None = None,
                  atenea_api_key_file: str | None = None):
         self.router = router.rstrip("/")
         self.atenea = validate_atenea_url(atenea)
@@ -123,18 +124,20 @@ class Worker:
                 or parsed_router.path not in ("", "/") or parsed_router.query or parsed_router.fragment):
             raise ValueError("Router URL must contain only scheme, host and optional port")
         self.router_ssl_context = None
-        self.enrollment_token = ""
+        # Seconds between heartbeats; must stay well below the Router's heartbeat TTL.
+        self.heartbeat_interval = 5.0
+        # How long a finished, signed result keeps retrying through a Router outage.
+        self.result_retry_window_s = 300.0
         if parsed_router.scheme == "https":
-            if not router_ca or not enrollment_token_file:
-                raise ValueError("HTTPS Router requires a CA file and enrollment-token file")
+            if not router_ca:
+                raise ValueError("HTTPS Router requires a CA file")
             self.router_ssl_context = ssl.create_default_context(cafile=router_ca)
-            self.enrollment_token = self._read_enrollment_token(enrollment_token_file)
         elif parsed_router.scheme == "http":
             try:
                 is_loopback = ipaddress.ip_address(parsed_router.hostname or "").is_loopback
             except ValueError:
                 is_loopback = (parsed_router.hostname or "").lower() == "localhost"
-            if not is_loopback or router_ca or enrollment_token_file:
+            if not is_loopback or router_ca:
                 raise ValueError("HTTP Router is allowed only on loopback without remote security options")
         else:
             raise ValueError("Router URL must use HTTPS remotely or HTTP on loopback locally")
@@ -161,19 +164,6 @@ class Worker:
         if self.atenea_api_key is None:
             return {}
         return {"Authorization": f"Bearer {self.atenea_api_key}"}
-
-    @staticmethod
-    def _read_enrollment_token(path: str) -> str:
-        token_path = Path(path)
-        try:
-            if token_path.stat().st_mode & 0o077:
-                raise ValueError("enrollment-token file permissions must be 0600")
-            token = token_path.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise ValueError("cannot read enrollment-token file") from exc
-        if len(token) < 32:
-            raise ValueError("enrollment token must contain at least 32 characters")
-        return token
 
     def router_json(self, path: str, payload: dict | None = None, timeout=30) -> dict:
         method = "GET" if payload is None else "POST"
@@ -236,8 +226,6 @@ class Worker:
             "node_id": self.node_id, "pubkey_pem": self.pub_pem,
             "models": models, "nram": nram, "region": "local",
             "wallet": self.wallet,
-            **({"enrollment_token": self.enrollment_token}
-               if self.enrollment_token else {}),
         }, timeout=15)
         self.router_pub_pem = out.get("router_pubkey_pem", "")
 
@@ -248,14 +236,36 @@ class Worker:
                 self.ready_file.touch()
             except Exception:
                 self.ready_file.unlink(missing_ok=True)
-            time.sleep(5)
+            time.sleep(self.heartbeat_interval)
 
     def next_job(self) -> dict | None:
         out = self.router_json(f"/jobs/next?node_id={self.node_id}", timeout=15)
         return out.get("job")
 
     def post_result(self, job_id: str, payload: dict) -> dict:
-        return self.router_json(f"/jobs/{job_id}/result", payload, timeout=30)
+        """Deliver a result, riding out a short Router outage.
+
+        The receipt is already signed, so resending the same body is safe. A 409
+        means an earlier attempt reached the Router and settled the job, so the
+        result is not sent again and no second receipt can be accepted.
+        """
+        deadline = time.monotonic() + self.result_retry_window_s
+        delay = 0.5
+        while True:
+            try:
+                return self.router_json(f"/jobs/{job_id}/result", payload, timeout=30)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 409:
+                    print(f"[{job_id}] result already settled by the Router", flush=True)
+                    return {"ok": True, "status": "settled"}
+                retryable = exc.code == 429 or 500 <= exc.code <= 599
+                if not retryable or time.monotonic() >= deadline:
+                    raise
+            except (OSError, http.client.HTTPException):
+                if time.monotonic() >= deadline:
+                    raise
+            time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            delay = min(delay * 2, 10.0)
 
     def process(self, job: dict) -> None:
         job_id = job["job_id"]
@@ -372,15 +382,12 @@ def main():
     ap.add_argument("--node-dir", default=str(BASE / "node"))
     ap.add_argument("--wallet", default="")
     ap.add_argument("--router-ca", help="CA PEM used to verify an HTTPS Router")
-    ap.add_argument("--enrollment-token-file",
-                    help="0600 file containing the one-time node enrollment token")
     ap.add_argument("--atenea-api-key-file",
                     help="0600 file containing the worker credential for Atenhea")
     args = ap.parse_args()
     try:
         worker = Worker(args.router, args.atenea, Path(args.node_dir), args.wallet,
                         router_ca=args.router_ca,
-                        enrollment_token_file=args.enrollment_token_file,
                         atenea_api_key_file=args.atenea_api_key_file)
     except (ValueError, OSError, ssl.SSLError) as exc:
         ap.error(f"invalid Router security configuration: {exc}")

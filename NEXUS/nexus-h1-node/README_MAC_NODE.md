@@ -52,8 +52,7 @@ terminales ni logs:
 umask 077
 mkdir -p "$HOME/.nexus-h1"
 openssl rand -hex 32 > "$HOME/.nexus-h1/client.token"
-openssl rand -hex 32 > "$HOME/.nexus-h1/enrollment.token"
-chmod 600 "$HOME/.nexus-h1/client.token" "$HOME/.nexus-h1/enrollment.token"
+chmod 600 "$HOME/.nexus-h1/client.token"
 ```
 
 Provisiona una CA privada y certificado de servidor con `subjectAltName` para
@@ -82,22 +81,35 @@ python3 NEXUS/nexus/h0/router.py --mode remote --host 192.168.1.20 \
   --port 18080 --dir "$HOME/.nexus-h1/state" \
   --tls-cert "$HOME/.nexus-h1/router.crt" \
   --tls-key "$HOME/.nexus-h1/router.key" \
-  --client-token-file "$HOME/.nexus-h1/client.token" \
-  --enrollment-token-file "$HOME/.nexus-h1/enrollment.token"
+  --client-token-file "$HOME/.nexus-h1/client.token"
+```
+
+Enrolamiento por clave: cada worker tiene su propia clave Ed25519 (`node_pub.pem`
+en su directorio de nodo). El Router solo admite claves que el operador aprueba;
+no hay secreto de enrolamiento compartido. Tras el primer arranque del worker,
+aprueba su clave y reinicia el worker:
+
+```sh
+python3 NEXUS/nexus/h0/router.py --dir "$HOME/.nexus-h1/state" \
+  --approve-node /ruta/al/node_pub.pem
+```
+
+Para revocar un nodo: corta su sesión y reencola sus trabajos en vuelo.
+
+```sh
+python3 NEXUS/nexus/h0/router.py --dir "$HOME/.nexus-h1/state" --revoke-node node_xxxxxxxx
 ```
 
 El modo remoto rechaza opciones parciales, ficheros de secreto con permisos
 abiertos y direcciones fuera de loopback/RFC1918. La clave TLS también debe
 tener permisos `0600`.
 
-Comparte la CA pública y una copia segura del token de enrolamiento con el
-operador del nodo por un canal separado. En el Mac del worker, define rutas de
-fichero (no el valor del token) y usa una URL HTTPS:
+Comparte la CA pública con el worker por un canal separado. En el Mac del
+worker, define la ruta de la CA y usa una URL HTTPS:
 
 ```sh
 ROUTER_URL=https://192.168.1.20:18080 \
 ROUTER_CA_FILE=/ruta/segura/ca.crt \
-NODE_ENROLLMENT_TOKEN_FILE=/ruta/segura/enrollment.token \
 bash run_mac_node.sh
 ```
 
@@ -171,7 +183,7 @@ NEXUS_H1_ALLOW_HTTP_SERVICE_NAME=mock-atenea \
 docker compose --profile e2e --env-file .env.h0 -f compose.h0.yml down --volumes --remove-orphans
 ```
 
-El bootstrap crea tokens aleatorios de API, Router y enrolamiento, una CA privada y
+El bootstrap crea tokens aleatorios de API y Router, una CA privada y
 certificado TLS del Router. Los secretos runtime se guardan bajo `.secrets/` con
 modo `0600`; la clave privada CA se escribe en la ruta absoluta indicada por
 `NEXUS_H0_CA_KEY_OUT`, fuera del directorio del proyecto y preferiblemente en
@@ -199,9 +211,9 @@ El helper conserva recibos/metadatos, elimina prompts/respuestas ya expirados
 del snapshot y poda únicamente los backups que creó y superan el plazo. Respalda
 `data/h0-worker/` por separado y cifrado para preservar la identidad del nodo.
 
-El Router usa TLS 1.2+, exige bearer token para chat/modelos y un token de
-enrolamiento para nuevas claves. El worker confía en la CA privada y envía el
-token de enrolamiento durante el registro. El Router no publica un puerto al
+El Router usa TLS 1.2+, exige bearer token para chat/modelos y solo registra
+claves aprobadas por el operador. El worker confía en la CA privada y firma sus
+peticiones con su propia clave. El Router no publica un puerto al
 host: solo la API autenticada y ligada a loopback queda accesible en
 `127.0.0.1:8000` (cambiable con `API_HOST_PORT`). Asegura que
 El bridge recibe una subred libre de Docker y Router TLS verifica el nombre

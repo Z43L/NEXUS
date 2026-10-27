@@ -3,8 +3,7 @@
 # Usage (local):
 #   ROUTER_URL=http://127.0.0.1:18080 bash run_mac_node.sh
 # Usage (remote):
-#   ROUTER_URL=https://192.168.x.y:18090 ROUTER_CA_FILE=ca.crt \
-#     NODE_ENROLLMENT_TOKEN_FILE=enrollment.token bash run_mac_node.sh
+#   ROUTER_URL=https://192.168.x.y:18090 ROUTER_CA_FILE=ca.crt bash run_mac_node.sh
 # Defaults target the loopback H0 router on this same machine;
 # wallet defaults to the H1 ops wallet (identity only: the worker never
 # needs an EVM private key; receipts are signed with its own Ed25519 key).
@@ -29,16 +28,16 @@ echo "router transport configured"
 echo "wallet: $WALLET"
 echo "engine: http://127.0.0.1:11436 (tu motor Atenhea local, ya corriendo)"
 if [[ "$ROUTER_URL" == https://* ]]; then
-  if [[ -z "${ROUTER_CA_FILE:-}" || -z "${NODE_ENROLLMENT_TOKEN_FILE:-}" ]]; then
-    echo "Para HTTPS define ROUTER_CA_FILE y NODE_ENROLLMENT_TOKEN_FILE (rutas de fichero, no secretos en texto)." >&2
+  if [[ -z "${ROUTER_CA_FILE:-}" ]]; then
+    echo "Para HTTPS define ROUTER_CA_FILE (ruta de fichero, no el contenido)." >&2
     exit 1
   fi
   exec "$PY" worker2.py --router "$ROUTER_URL" \
-    --router-ca "$ROUTER_CA_FILE" --enrollment-token-file "$NODE_ENROLLMENT_TOKEN_FILE" \
+    --router-ca "$ROUTER_CA_FILE" \
     --atenea http://127.0.0.1:11436 --wallet "$WALLET"
 fi
-if [[ -n "${ROUTER_CA_FILE:-}" || -n "${NODE_ENROLLMENT_TOKEN_FILE:-}" ]]; then
-  echo "ROUTER_CA_FILE y NODE_ENROLLMENT_TOKEN_FILE solo se usan con ROUTER_URL HTTPS." >&2
+if [[ -n "${ROUTER_CA_FILE:-}" ]]; then
+  echo "ROUTER_CA_FILE solo se usa con ROUTER_URL HTTPS." >&2
   exit 1
 fi
 exec "$PY" worker2.py --router "$ROUTER_URL" \

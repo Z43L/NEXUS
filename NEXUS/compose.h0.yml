@@ -23,8 +23,6 @@ services:
       - /run/secrets/router_key
       - --client-token-file
       - /run/secrets/client_token
-      - --enrollment-token-file
-      - /run/secrets/enrollment_token
     environment:
       ROUTER_URL: https://router:18080
       ROUTER_CA_FILE: /run/secrets/router_ca
@@ -49,8 +47,6 @@ services:
         target: router_ca
       - source: client_token
         target: client_token
-      - source: enrollment_token
-        target: enrollment_token
     healthcheck:
       test: ["CMD", "python", "/app/nexus-h1-node/container_healthcheck.py", "router"]
       interval: 20s
@@ -72,8 +68,6 @@ services:
       - /var/lib/nexus/node
       - --router-ca
       - /run/secrets/router_ca
-      - --enrollment-token-file
-      - /run/secrets/enrollment_token
       - --atenea-api-key-file
       - /run/secrets/atenea_api_key
       - --wallet
@@ -101,8 +95,6 @@ services:
     secrets:
       - source: router_ca
         target: router_ca
-      - source: enrollment_token
-        target: enrollment_token
       - source: atenea_api_key
         target: atenea_api_key
     depends_on:
@@ -294,8 +286,6 @@ secrets:
     file: ./.secrets/ca.crt
   client_token:
     file: ./.secrets/client.token
-  enrollment_token:
-    file: ./.secrets/enrollment.token
   atenea_api_key:
     file: ./.secrets/atenea_api.key
   api_token:
