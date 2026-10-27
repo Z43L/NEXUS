@@ -632,7 +632,9 @@ class Handler(BaseHTTPRequestHandler):
                     receipt = json.loads(r["receipt"])
                     for k in splits:
                         splits[k] += receipt["shares"].get(k, 0)
-                    for nram_id in receipt.get("nram_used") or []:
+                    # Royalties mirror the settlement batch, which only carries
+                    # Router-verified receipts; unverified rows never pay an author.
+                    for nram_id in (receipt.get("nram_used") or []) if r["verified"] else []:
                         author = conn.execute("SELECT author_id FROM nram_assets WHERE nram_id=?",
                                               (nram_id,)).fetchone()
                         if author is not None:

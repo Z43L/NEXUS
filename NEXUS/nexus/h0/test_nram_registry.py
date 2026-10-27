@@ -23,8 +23,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import nram_registry as nr
 from test_secure_remote import make_ca, make_server_cert, write_secret
+import worker_agent
 
 BASE = Path(__file__).resolve().parent
 
@@ -221,6 +225,72 @@ class RouterRegistryTests(unittest.TestCase):
         status, body = self.call("/ledger/summary", token=self.alice)
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["royalties_micro_usd_by_author"], {})
+
+    def test_tampered_stored_bundle_is_refused_on_download(self):
+        data = build_bundle(name="expert-tamper-router")
+        nram_id = hashlib.sha256(data).hexdigest()
+        self.assertEqual(self.publish(data)[0], 201)
+        stored = Path(self.tmp.name) / "nram" / f"{nram_id}.nram"
+        stored.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
+        status, body = request(f"{self.url}/nram/{nram_id}/blob")
+        self.assertEqual(status, 500)
+        self.assertIn(b"corrupt", body)
+
+
+class _BlobServer(BaseHTTPRequestHandler):
+    payload = b""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(self.payload)))
+        self.end_headers()
+        self.wfile.write(self.payload)
+
+    def log_message(self, *args):
+        pass
+
+
+class WorkerDownloadIntegrityTests(unittest.TestCase):
+    """ensure_adapter must refuse bytes that do not hash to the requested id."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.good = build_bundle(name="expert-download")
+        self.nram_id = nr.bundle_id(self.good)
+        self.adapter_dir = Path(self.tmp.name) / "adapters"
+
+    def _serve(self, payload):
+        handler = type("Handler", (_BlobServer,), {"payload": payload})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    def _worker(self, router):
+        return worker_agent.Worker(router, "http://127.0.0.1:1", Path(self.tmp.name) / "node",
+                                   adapter_dir=self.adapter_dir)
+
+    def test_accepts_download_that_matches_requested_id(self):
+        worker = self._worker(self._serve(self.good))
+        worker.ensure_adapter(self.nram_id)
+        self.assertEqual(nr.read_bundle(self.adapter_dir, self.nram_id), self.good)
+
+    def test_rejects_tampered_download_and_stores_nothing(self):
+        tampered = self.good[:-1] + bytes([self.good[-1] ^ 1])
+        worker = self._worker(self._serve(tampered))
+        with self.assertRaisesRegex(nr.NramError, "does not match its id"):
+            worker.ensure_adapter(self.nram_id)
+        self.assertFalse((self.adapter_dir / f"{self.nram_id}.nram").exists())
+
+    def test_rejects_cached_bundle_altered_on_disk(self):
+        worker = self._worker(self._serve(self.good))
+        worker.ensure_adapter(self.nram_id)
+        cached = self.adapter_dir / f"{self.nram_id}.nram"
+        cached.write_bytes(self.good[:-1] + bytes([self.good[-1] ^ 1]))
+        with self.assertRaisesRegex(nr.NramError, "does not match its id"):
+            worker.ensure_adapter(self.nram_id)
 
 
 class WorkerAdapterTests(unittest.TestCase):
