@@ -25,6 +25,20 @@ def count_tokens(text: str) -> int:
     return len(TOKEN_RE.findall(text))
 
 
+def models_from_env() -> list[str]:
+    """MOCK_MODEL_IDS=a,b serves several models; MOCK_MODEL_ID serves one (default athenea-e2b)."""
+    listed = os.environ.get("MOCK_MODEL_IDS")
+    if listed:
+        return [name for name in listed.split(",") if name]
+    return [os.environ.get("MOCK_MODEL_ID", "athenea-e2b")]
+
+
+def scaffold_for(model: str) -> int:
+    """MOCK_SCAFFOLD_MAP='{"model": tokens}' overrides MOCK_SCAFFOLD (default 25) per model."""
+    overrides = json.loads(os.environ.get("MOCK_SCAFFOLD_MAP", "{}"))
+    return int(overrides.get(model, os.environ.get("MOCK_SCAFFOLD", "25")))
+
+
 def messages_text(messages: list[dict]) -> str:
     return "\n".join(str(m.get("content", "")) for m in messages)
 
@@ -48,8 +62,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/v1/models":
             return self._json({"object": "list",
-                               "data": [{"id": os.environ.get("MOCK_MODEL_ID", "athenea-e2b"),
-                                         "object": "model"}]})
+                               "data": [{"id": model_id, "object": "model"}
+                                        for model_id in models_from_env()]})
         return self._json({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -71,10 +85,13 @@ class Handler(BaseHTTPRequestHandler):
             text = " ".join(f"tok{seed}-{i}" for i in range(n_out))
             # Like the real engine, usage.prompt_tokens includes fixed
             # per-request scaffolding the counting endpoint does not see.
-            scaffold = int(os.environ.get("MOCK_SCAFFOLD", "25"))
+            model = body.get("model") or models_from_env()[0]
+            if model not in models_from_env():
+                return self._json({"error": f"unknown model {model}"}, 404)
+            scaffold = scaffold_for(model)
             return self._json({
                 "id": "chatcmpl-mock", "object": "chat.completion",
-                "model": body.get("model", "athenea-e2b"),
+                "model": model,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
                              "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": count_tokens(prompt) + scaffold,

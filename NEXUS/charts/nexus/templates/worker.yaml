@@ -32,7 +32,7 @@ spec:
         - name: prepare-secrets
           image: {{ required "images.routerWorker is required" .Values.images.routerWorker | quote }}
           command: ["python", "-c"]
-          args: ["import os,shutil; os.makedirs('/run/secrets',mode=0o700,exist_ok=True); [(shutil.copyfile('/source/'+a,'/run/secrets/'+b),os.chmod('/run/secrets/'+b,0o600)) for a,b in [('ca.crt','router_ca'),('enrollment.token','enrollment_token'),('atenea.api.key','atenea_api_key')]]"]
+          args: ["import os,shutil; os.makedirs('/run/secrets',mode=0o700,exist_ok=True); [(shutil.copyfile('/source/'+a,'/run/secrets/'+b),os.chmod('/run/secrets/'+b,0o600)) for a,b in [('ca.crt','router_ca'),('atenea.api.key','atenea_api_key')]]"]
           securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
           volumeMounts:
             - { name: source, mountPath: /source, readOnly: true }
@@ -41,7 +41,7 @@ spec:
         - name: worker
           image: {{ .Values.images.routerWorker | quote }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
-          command: ["python", "/app/nexus-h1-node/worker2.py", "--router", "https://router:18080", "--atenea", {{ required "atenea.url is required" .Values.atenea.url | quote }}, "--node-dir", "/var/lib/nexus/node", "--router-ca", "/run/secrets/router_ca", "--enrollment-token-file", "/run/secrets/enrollment_token", "--atenea-api-key-file", "/run/secrets/atenea_api_key", "--wallet", {{ .Values.worker.wallet | quote }}]
+          command: ["python", "/app/nexus-h1-node/worker2.py", "--router", "https://router:18080", "--atenea", {{ required "atenea.url is required" .Values.atenea.url | quote }}, "--node-dir", "/var/lib/nexus/node", "--router-ca", "/run/secrets/router_ca", "--atenea-api-key-file", "/run/secrets/atenea_api_key", "--wallet", {{ .Values.worker.wallet | quote }}]
           env:
             - { name: ROUTER_URL, value: "https://router:18080" }
             - { name: ROUTER_CA_FILE, value: /run/secrets/router_ca }

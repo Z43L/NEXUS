@@ -33,7 +33,7 @@ spec:
         - name: prepare-secrets
           image: {{ required "images.routerWorker is required" .Values.images.routerWorker | quote }}
           command: ["python", "-c"]
-          args: ["import os,shutil; os.makedirs('/run/secrets',mode=0o700,exist_ok=True); [(shutil.copyfile('/source/'+a,'/run/secrets/'+b),os.chmod('/run/secrets/'+b,0o600)) for a,b in [('tls.crt','router_cert'),('tls.key','router_key'),('ca.crt','router_ca'),('client.token','client_token'),('enrollment.token','enrollment_token')]]"]
+          args: ["import os,shutil; os.makedirs('/run/secrets',mode=0o700,exist_ok=True); [(shutil.copyfile('/source/'+a,'/run/secrets/'+b),os.chmod('/run/secrets/'+b,0o600)) for a,b in [('tls.crt','router_cert'),('tls.key','router_key'),('ca.crt','router_ca'),('client.token','client_token')]]"]
           securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
           volumeMounts:
             - { name: source, mountPath: /source, readOnly: true }
@@ -42,7 +42,7 @@ spec:
         - name: router
           image: {{ .Values.images.routerWorker | quote }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
-          command: ["python", "/app/nexus/h0/router.py", "--mode", "remote", "--host", "auto", "--port", "18080", "--dir", "/var/lib/nexus", "--tls-cert", "/run/secrets/router_cert", "--tls-key", "/run/secrets/router_key", "--client-token-file", "/run/secrets/client_token", "--enrollment-token-file", "/run/secrets/enrollment_token"]
+          command: ["python", "/app/nexus/h0/router.py", "--mode", "remote", "--host", "auto", "--port", "18080", "--dir", "/var/lib/nexus", "--tls-cert", "/run/secrets/router_cert", "--tls-key", "/run/secrets/router_key", "--client-token-file", "/run/secrets/client_token"]
           env:
             - { name: ROUTER_URL, value: "https://router:18080" }
             - { name: ROUTER_CA_FILE, value: /run/secrets/router_ca }

@@ -155,6 +155,7 @@ def main() -> int:
         lease_conn.row_factory = sqlite3.Row
         lease_conn.execute("CREATE TABLE jobs(job_id TEXT, status TEXT, lease_until TEXT, "
                            "attempts INTEGER, node_id TEXT, error TEXT, finished_at TEXT)")
+        lease_conn.execute("CREATE TABLE nodes(node_id TEXT PRIMARY KEY, last_heartbeat TEXT)")
         lease_conn.executemany("INSERT INTO jobs VALUES(?,?,?,?,?,?,?)", [
             ("retry", "dispatched", "2000-01-01T00:00:00Z", 1, "n1", None, None),
             ("exhausted", "dispatched", "2000-01-01T00:00:00Z", 3, "n2", None, None),

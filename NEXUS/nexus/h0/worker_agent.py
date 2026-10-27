@@ -41,7 +41,7 @@ class Worker:
         self.priv, self.pub_pem, self.node_id = nc.load_or_create_node_key(node_dir)
         self.model_id = None
         self.models: list[str] = []
-        self.scaffolding_tokens = 0
+        self.scaffolding: dict[str, int] = {}  # per engine model: fixed prompt overhead
         self.router_pub_pem = ""
 
     # -- Atenhea -------------------------------------------------------------
@@ -61,7 +61,7 @@ class Worker:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def count_input_tokens(self, messages: list[dict]) -> int | None:
+    def count_input_tokens(self, messages: list[dict], model_id: str) -> int | None:
         """Token count from the engine's own tokenizer.
 
         Endpoint dialects seen in the wild:
@@ -73,7 +73,7 @@ class Worker:
         for path in ("/v1/chat/completions/input_tokens", "/v1/messages/count_tokens"):
             try:
                 out = http_json(self.atenea + path,
-                                {"model": self.model_id, "messages": messages}, timeout=120)
+                                {"model": model_id, "messages": messages}, timeout=120)
                 return int(out["input_tokens"])
             except urllib.error.HTTPError as exc:
                 if exc.code != 404:
@@ -109,7 +109,7 @@ class Worker:
         nr.store_bundle(self.adapter_dir, adapter_id, data)
 
     # -- Router ----------------------------------------------------------------
-    def calibrate_scaffolding(self) -> int:
+    def calibrate_scaffolding(self, model_id: str) -> int:
         """Measure the engine's fixed per-request prompt overhead, in tokens.
 
         Atenhea's engine renders extra scaffolding into every generation
@@ -122,11 +122,11 @@ class Worker:
         billed for it (spec metering amendment, FUSION.md).
         """
         probe = [{"role": "user", "content": "nexus calibration ping"}]
-        counted = self.count_input_tokens(probe)
+        counted = self.count_input_tokens(probe, model_id)
         if counted is None:
             return 0
         resp = http_json(self.atenea + "/v1/chat/completions", {
-            "model": self.model_id, "messages": probe,
+            "model": model_id, "messages": probe,
             "temperature": 0.0, "max_tokens": 1, "stream": False,
         }, timeout=1200)
         eng_prompt = int((resp.get("usage") or {}).get("prompt_tokens", counted))
@@ -191,7 +191,7 @@ class Worker:
         started = time.time()
         started_iso = nc.utc_now_iso()
         model_id = nc.resolve_model(job.get("model", ""), self.models)
-        counted_in = self.count_input_tokens(job["messages"])
+        counted_in = self.count_input_tokens(job["messages"], model_id)
         resp = self.run_inference(job, model_id)
         finished = time.time()
         choice = (resp.get("choices") or [{}])[0]
@@ -220,7 +220,7 @@ class Worker:
             "output_tokens": eng_out,
             "engine_prompt_tokens": eng_in,
             "engine_completion_tokens": eng_out,
-            "scaffolding_tokens": self.scaffolding_tokens,
+            "scaffolding_tokens": self.scaffolding.get(model_id, 0),
             "meter_source": meter_source,
             "nram_used": job.get("nram", []),
             "started_at": started_iso,
@@ -244,10 +244,11 @@ class Worker:
             raise SystemExit("Atenhea engine returned no models at " + self.atenea)
         self.model_id = models[0]
         self.models = models
-        self.scaffolding_tokens = self.calibrate_scaffolding()
+        for model in models:
+            self.scaffolding[model] = self.calibrate_scaffolding(model)
         self.register(models, [])
-        print(f"worker {self.node_id} model={self.model_id} atenea={self.atenea} "
-              f"scaffolding_tokens={self.scaffolding_tokens}", flush=True)
+        print(f"worker {self.node_id} models={models} atenea={self.atenea} "
+              f"scaffolding_tokens={self.scaffolding}", flush=True)
         idle = 0
         while True:
             try:

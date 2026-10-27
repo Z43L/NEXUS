@@ -227,9 +227,8 @@ def test_secure_remote() -> None:
         wrong_ca_key, wrong_ca_cert, wrong_ca_path = make_ca(tmp, "NEXUS-wrong-CA")
         cert_path, key_path = make_server_cert(tmp, ca_key, ca_cert)
         api_token = "api-" + os.urandom(32).hex()
-        enrollment_token = "enroll-" + os.urandom(32).hex()
-        api_path, enrollment_path = tmp / "api.token", tmp / "enrollment.token"
-        write_secret(api_path, api_token); write_secret(enrollment_path, enrollment_token)
+        api_path = tmp / "api.token"
+        write_secret(api_path, api_token)
 
         # Incomplete secure setup must fail closed before binding a socket.
         incomplete = subprocess.run(
@@ -241,8 +240,7 @@ def test_secure_remote() -> None:
         base_cmd = [sys.executable, str(BASE / "router.py"), "--mode", "remote",
                     "--port", "1", "--dir", str(tmp / "rejected"),
                     "--tls-cert", str(cert_path), "--tls-key", str(key_path),
-                    "--client-token-file", str(api_path),
-                    "--enrollment-token-file", str(enrollment_path)]
+                    "--client-token-file", str(api_path)]
         public_bind = subprocess.run(base_cmd + ["--host", "0.0.0.0"],
                                      capture_output=True, text=True, timeout=10)
         assert public_bind.returncode != 0 and "private or loopback" in public_bind.stderr
@@ -268,7 +266,7 @@ def test_secure_remote() -> None:
             [sys.executable, str(BASE / "router.py"), "--mode", "remote",
              "--host", "127.0.0.1", "--port", str(port), "--dir", str(tmp / "state"),
              "--tls-cert", str(cert_path), "--tls-key", str(key_path),
-             "--client-token-file", str(api_path), "--enrollment-token-file", str(enrollment_path)],
+             "--client-token-file", str(api_path)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         url = f"https://127.0.0.1:{port}"
         context = ssl.create_default_context(cafile=str(ca_path))
@@ -289,31 +287,28 @@ def test_secure_remote() -> None:
             assert get(url + "/v1/models", context, "wrong-token")[0] == 401
             assert get(url + "/v1/models", context, api_token)[0] == 200
 
-            # A new key cannot enroll without the token, even if its request
-            # signature is valid. The token is a separate possession check.
+            # A key the operator has not approved cannot register, even with a
+            # validly signed request. Enrolment is the registered key itself.
             enrollment_priv, enrollment_pub, enrollment_node = nc.load_or_create_node_key(
                 tmp / "unapproved-node")
             register_path = "/nodes/register"
-            for supplied in (None, "incorrect-enrollment-token-value-000000"):
-                body = {"node_id": enrollment_node, "pubkey_pem": enrollment_pub,
-                        "models": ["blocked-model"], "nram": [], "region": "test"}
-                if supplied is not None:
-                    body["enrollment_token"] = supplied
-                headers = {"Content-Type": "application/json", "X-Nexus-Node-ID": enrollment_node,
-                           **nc.sign_node_request(enrollment_priv, "POST", register_path, body)}
-                request = urllib.request.Request(url + register_path, data=json.dumps(body).encode(),
-                                                 headers=headers, method="POST")
-                try:
-                    urllib.request.urlopen(request, timeout=2, context=context)
-                except urllib.error.HTTPError as exc:
-                    assert exc.code == 401
-                else:
-                    raise AssertionError("node enrolled without a valid enrollment token")
+            body = {"node_id": enrollment_node, "pubkey_pem": enrollment_pub,
+                    "models": ["blocked-model"], "nram": [], "region": "test"}
+            headers = {"Content-Type": "application/json", "X-Nexus-Node-ID": enrollment_node,
+                       **nc.sign_node_request(enrollment_priv, "POST", register_path, body)}
+            request = urllib.request.Request(url + register_path, data=json.dumps(body).encode(),
+                                             headers=headers, method="POST")
+            try:
+                urllib.request.urlopen(request, timeout=2, context=context)
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 403
+            else:
+                raise AssertionError("unapproved node registered")
 
             # A worker with an unrelated CA cannot register; a correctly
             # provisioned H1 worker validates the server and enrolls securely.
             bad_worker = worker2.Worker(url, "http://127.0.0.1:11436", tmp / "bad-node", "",
-                                        str(wrong_ca_path), str(enrollment_path))
+                                        str(wrong_ca_path))
             try:
                 bad_worker.register(["test-model"], [])
             except Exception as exc:
@@ -322,9 +317,14 @@ def test_secure_remote() -> None:
                 raise AssertionError("worker accepted Router certificate from untrusted CA")
 
             worker = worker2.Worker(url, "http://127.0.0.1:11436", tmp / "node", "",
-                                    str(ca_path), str(enrollment_path))
+                                    str(ca_path))
             assert worker.router_ssl_context.check_hostname
             assert worker.router_ssl_context.verify_mode == ssl.CERT_REQUIRED
+            approved = subprocess.run(
+                [sys.executable, str(BASE / "router.py"), "--dir", str(tmp / "state"),
+                 "--approve-node", str(tmp / "node" / "node_pub.pem")],
+                capture_output=True, text=True, timeout=10)
+            assert approved.returncode == 0 and f"approved node_id={worker.node_id}" in approved.stdout, approved.stderr
             worker.register(["test-model"], [])
             assert get(url + "/v1/models", context, api_token)[1]["data"][0]["id"] == "test-model"
 
@@ -368,6 +368,21 @@ def test_secure_remote() -> None:
 
             assert get(url + "/metrics", context)[0] == 401
             assert get(url + "/ledger/summary", context)[0] == 401
+
+            # Revocation removes the key's session at once: polling and
+            # re-enrolment both fail, and the enrolment cannot be reused.
+            revoked = subprocess.run(
+                [sys.executable, str(BASE / "router.py"), "--dir", str(tmp / "state"),
+                 "--revoke-node", worker.node_id],
+                capture_output=True, text=True, timeout=10)
+            assert revoked.returncode == 0 and "revoked node_id=" in revoked.stdout, revoked.stderr
+            for attempt in (lambda: worker.next_job(), lambda: worker.register(["test-model"], [])):
+                try:
+                    attempt()
+                except urllib.error.HTTPError as exc:
+                    assert exc.code == 403, exc.code
+                else:
+                    raise AssertionError("revoked node kept its access")
         finally:
             router_proc.terminate()
             try:

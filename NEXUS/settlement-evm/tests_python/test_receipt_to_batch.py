@@ -77,21 +77,27 @@ class ReceiptBridgeTests(unittest.TestCase):
                 CREATE TABLE jobs(job_id TEXT PRIMARY KEY, status TEXT, node_id TEXT, nram TEXT);
                 CREATE TABLE receipts(job_id TEXT PRIMARY KEY, node_id TEXT, receipt TEXT,
                     signature TEXT, verified INTEGER, discrepancy_pct REAL);
+                CREATE TABLE nram_assets(nram_id TEXT PRIMARY KEY, author_id TEXT NOT NULL);
             """)
             conn.execute("INSERT INTO nodes VALUES(?, ?)", (self.node_id, self.public_pem))
 
-    def _receipt(self, job_id, nram_used):
+    def _register_nram(self, nram_id, author_id):
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute("INSERT OR REPLACE INTO nram_assets VALUES(?, ?)", (nram_id, author_id))
+
+    def _receipt(self, job_id, nram_used, input_tokens=100, output_tokens=20):
+        price = nc.price_micro_usd(input_tokens, output_tokens)
         receipt = {
             "job_id": job_id,
             "node_id": self.node_id,
-            "input_tokens": 100,
-            "output_tokens": 20,
-            "engine_prompt_tokens": 100,
-            "engine_completion_tokens": 20,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "engine_prompt_tokens": input_tokens,
+            "engine_completion_tokens": output_tokens,
             "scaffolding_tokens": 0,
-            "price_micro_usd": nc.price_micro_usd(100, 20),
+            "price_micro_usd": price,
             "nram_used": nram_used,
-            "shares": nc.split_payment(nc.price_micro_usd(100, 20), bool(nram_used)),
+            "shares": nc.split_payment(price, bool(nram_used)),
         }
         return receipt
 
@@ -163,31 +169,87 @@ class ReceiptBridgeTests(unittest.TestCase):
         self.assertNotEqual(first_evm_id, other_evm_id)
         self.assertEqual(first_evm_id, _settlement_job_id(self.receipt, first_signature))
 
-    def test_maps_single_explicit_author_and_no_author_to_zero(self):
-        author_id = "nram_author_abc"
-        receipt = self._receipt("0x" + "03" * 32, [author_id])
+    def test_maps_registered_nram_publisher_to_wallet_and_no_author_to_zero(self):
+        nram_id = "ab" * 32
+        self._register_nram(nram_id, "alice")
+        receipt = self._receipt("0x" + "03" * 32, [nram_id])
         self._insert(receipt)
         cfg = config(nodeWallets={self.node_id: NODE_ADDRESS},
                      nodePublicKeyFingerprints={self.node_id: fingerprint(self.public_pem)},
-                     authorWallets={author_id: AUTHOR_ADDRESS})
+                     authorWallets={"alice": AUTHOR_ADDRESS})
         mapped = read_verified_jobs(self.db_path, cfg)
         evm_id = _settlement_job_id(receipt, nc.sign_receipt(self.private_key, receipt))
-        self.assertEqual(next(x for x in mapped if x["jobId"] == evm_id)["author"], AUTHOR_ADDRESS)
-        no_author_cfg = config(nodeWallets={self.node_id: NODE_ADDRESS},
-                               nodePublicKeyFingerprints={self.node_id: fingerprint(self.public_pem)},
-                               authorWallets={author_id: AUTHOR_ADDRESS})
-        no_author = read_verified_jobs(self.db_path, no_author_cfg)
+        job = next(x for x in mapped if x["jobId"] == evm_id)
+        self.assertEqual(job["author"], AUTHOR_ADDRESS)
+        self.assertEqual(job["authorId"], "alice")
         receipt_evm_id = _settlement_job_id(self.receipt, nc.sign_receipt(self.private_key, self.receipt))
-        self.assertEqual(next(x for x in no_author if x["jobId"] == receipt_evm_id)["author"], ZERO_ADDRESS)
+        no_author = next(x for x in mapped if x["jobId"] == receipt_evm_id)
+        self.assertEqual(no_author["author"], ZERO_ADDRESS)
+        self.assertIsNone(no_author["authorId"])
 
-    def test_rejects_missing_node_mapping_or_author_mapping(self):
-        with self.assertRaisesRegex(ValueError, "no explicit wallet mapping for node_id"):
-            read_verified_jobs(self.db_path, config(
-                nodePublicKeyFingerprints={self.node_id: fingerprint(self.public_pem)}))
-        receipt = self._receipt("0x" + "04" * 32, ["author-x"])
+    def test_job_served_with_nram_pays_ten_percent_to_author_wallet(self):
+        nram_id = "cd" * 32
+        self._register_nram(nram_id, "alice")
+        receipt = self._receipt("0x" + "06" * 32, [nram_id], input_tokens=1_000_000, output_tokens=0)
         self._insert(receipt)
-        with self.assertRaisesRegex(ValueError, "no explicit wallet mapping for author"):
+        cfg = config(depositAmount=60_000,
+                     nodeWallets={self.node_id: NODE_ADDRESS},
+                     nodePublicKeyFingerprints={self.node_id: fingerprint(self.public_pem)},
+                     authorWallets={"alice": AUTHOR_ADDRESS})
+        config_path = Path(self.temp.name) / "royalty-policy.json"
+        config_path.write_text(json.dumps(cfg), encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "receipt_to_batch.py"),
+             "--db", str(self.db_path), "--config", str(config_path)],
+            check=True, capture_output=True, text=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        batch = json.loads(completed.stdout)
+        evm_id = _settlement_job_id(receipt, nc.sign_receipt(self.private_key, receipt))
+        claim = next(c for c in batch["claims"] if c["jobId"] == evm_id)
+        self.assertEqual(claim["author"], AUTHOR_ADDRESS)
+        self.assertEqual(claim["amount"], 50_000)
+        # Same floor rule as InferenceEscrow._bps(amount, AUTHOR_BPS): 10% of the job.
+        royalty = batch["authorRoyalties"]["alice"]
+        self.assertEqual(royalty, {"wallet": AUTHOR_ADDRESS, "baseUnits": 5_000, "microUsd": 5_000})
+        self.assertEqual(royalty["microUsd"], receipt["shares"]["nram_author"])
+        self.assertEqual(royalty["baseUnits"], claim["amount"] * 1_000 // 10_000)
+        verified = verify_claim(SETTLEMENT_CONTEXT, BATCH_ID,
+                                __import__("batch_builder").JobProof(
+                                    job_id=claim["jobId"], node=claim["node"], author=claim["author"],
+                                    amount=claim["amount"], proof=tuple(claim["proof"]),
+                                    proof_sums=tuple(claim["proofSums"])),
+                                batch["root"], batch["rootSum"])
+        self.assertTrue(verified)
+
+    def test_fails_closed_for_unregistered_nram_or_unmapped_publisher(self):
+        receipt = self._receipt("0x" + "04" * 32, ["ef" * 32])
+        self._insert(receipt)
+        with self.assertRaisesRegex(ValueError, "not in the Router registry"):
             read_verified_jobs(self.db_path, self.cfg)
+        self._register_nram("ef" * 32, "bob")
+        cfg = config(nodeWallets={self.node_id: NODE_ADDRESS},
+                     nodePublicKeyFingerprints={self.node_id: fingerprint(self.public_pem)},
+                     authorWallets={"alice": AUTHOR_ADDRESS})
+        with self.assertRaisesRegex(ValueError, "no explicit wallet mapping for author bob"):
+            read_verified_jobs(self.db_path, cfg)
+
+    def test_wallet_policy_is_keyed_by_publisher_not_bundle_id(self):
+        nram_id = "12" * 32
+        self._register_nram(nram_id, "alice")
+        self._insert(self._receipt("0x" + "07" * 32, [nram_id]))
+        cfg = config(nodeWallets={self.node_id: NODE_ADDRESS},
+                     nodePublicKeyFingerprints={self.node_id: fingerprint(self.public_pem)},
+                     authorWallets={nram_id: AUTHOR_ADDRESS})
+        with self.assertRaisesRegex(ValueError, "no explicit wallet mapping for author alice"):
+            read_verified_jobs(self.db_path, cfg)
+
+    def test_unverified_receipts_never_pay_royalties(self):
+        receipt = self._receipt("0x" + "08" * 32, ["34" * 32])
+        self._insert(receipt, verified=0)
+        jobs = read_verified_jobs(self.db_path, self.cfg)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["routerJobId"], "job_000001")
 
     def test_rejects_ambiguous_multiple_authors(self):
         receipt = self._receipt("0x" + "05" * 32, ["author-a", "author-b"])

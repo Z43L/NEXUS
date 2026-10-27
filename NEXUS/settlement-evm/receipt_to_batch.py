@@ -32,6 +32,11 @@ if str(H0_DIR) not in sys.path:
     sys.path.insert(0, str(H0_DIR))
 import nexus_common as nc  # noqa: E402
 
+# Mirrors InferenceEscrow.sol: the author share is floor(amount * AUTHOR_BPS / BPS)
+# and is paid on-chain only when the claim carries a non-zero author address.
+BPS = 10_000
+AUTHOR_BPS = 1_000
+
 
 def _integer(value, label: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -84,7 +89,7 @@ def _load_config(document: object) -> dict:
             raise ValueError(f"nodePublicKeyFingerprints[{identity}] must be a 32-byte SHA-256 hex digest")
     for identity, wallet in document["authorWallets"].items():
         if not isinstance(identity, str) or not identity:
-            raise ValueError("authorWallets keys must be non-empty exact NRAM identifiers")
+            raise ValueError("authorWallets keys must be exact NRAM publisher (author_id) values")
         _address(wallet, f"authorWallets[{identity}]")
     _integer(document["depositAmount"], "depositAmount")
     normalized = dict(document)
@@ -206,6 +211,12 @@ def read_verified_jobs(db_path: str | Path, config: Mapping) -> list[dict]:
             "FROM receipts r LEFT JOIN nodes n ON n.node_id=r.node_id "
             "LEFT JOIN jobs j ON j.job_id=r.job_id ORDER BY r.job_id"
         ).fetchall()
+        # Authoritative NRAM bundle -> publisher map (the same table the Router
+        # ledger uses). Publisher identity comes from the authenticated token.
+        nram_publishers = {
+            row["nram_id"]: row["author_id"]
+            for row in conn.execute("SELECT nram_id, author_id FROM nram_assets")
+        }
     except sqlite3.Error as exc:
         raise ValueError(f"cannot read H0 Router database: {exc}") from exc
     finally:
@@ -244,11 +255,17 @@ def read_verified_jobs(db_path: str | Path, config: Mapping) -> list[dict]:
         if len(nram_used) > 1:
             raise ValueError(f"{job_id}: multiple NRAM identifiers; author mapping is ambiguous")
         if nram_used:
-            author_id = nram_used[0]
+            nram_id = nram_used[0]
+            # Resolve bundle -> publisher through the Router registry, then
+            # publisher -> wallet through the policy. Never through free text.
+            author_id = nram_publishers.get(nram_id)
+            if author_id is None:
+                raise ValueError(f"{job_id}: NRAM {nram_id} is not in the Router registry")
             if author_id not in author_wallets:
                 raise ValueError(f"{job_id}: no explicit wallet mapping for author {author_id}")
             author = author_wallets[author_id]
         else:
+            author_id = None
             author = "0x" + "00" * 20
         jobs.append({
             "jobId": _settlement_job_id(receipt, row["signature"]),
@@ -256,11 +273,25 @@ def read_verified_jobs(db_path: str | Path, config: Mapping) -> list[dict]:
             "nodeId": node_id,
             "node": node_wallets[node_id],
             "author": author,
+            "authorId": author_id,
+            "authorShareMicroUsd": receipt["shares"]["nram_author"] if author_id else 0,
             "amount": _amount_in_base_units(receipt["price_micro_usd"], config["token"]),
         })
     if not jobs:
         raise ValueError("Router database contains no explicitly verified H0 receipts")
     return jobs
+
+
+def _author_royalties(jobs: list[dict]) -> dict:
+    totals: dict[str, dict] = {}
+    for job in jobs:
+        if job["authorId"] is None:
+            continue
+        entry = totals.setdefault(job["authorId"], {
+            "wallet": job["author"], "baseUnits": 0, "microUsd": 0})
+        entry["baseUnits"] += job["amount"] * AUTHOR_BPS // BPS
+        entry["microUsd"] += job["authorShareMicroUsd"]
+    return dict(sorted(totals.items()))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -278,6 +309,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         batch = build_batch(config["settlementContext"], config["batchId"], jobs,
                             config["depositAmount"])
+        royalties = _author_royalties(jobs)
     except (OSError, json.JSONDecodeError, TypeError, ValueError, InvalidOperation) as exc:
         parser.error(str(exc))
     output = batch.as_contract_batch()
@@ -296,6 +328,9 @@ def main(argv: list[str] | None = None) -> int:
         "usdPerTokenDenominator": config["token"]["usdPerTokenDenominator"],
     }
     output["sourceReceipts"] = source_receipts
+    # Per-publisher royalty as the escrow pays it (base units) and as the Router
+    # ledger reports it (micro-USD). With the default 1:1 policy they are equal.
+    output["authorRoyalties"] = royalties
     json.dump(output, sys.stdout, indent=2)
     sys.stdout.write("\n")
     return 0
