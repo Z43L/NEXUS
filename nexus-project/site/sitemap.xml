@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">
+  <url><loc>https://nexus.example/</loc>
+    <xhtml:link rel="alternate" hreflang="es" href="https://nexus.example/"/>
+    <xhtml:link rel="alternate" hreflang="en" href="https://nexus.example/en/"/></url>
+  <url><loc>https://nexus.example/en/</loc>
+    <xhtml:link rel="alternate" hreflang="es" href="https://nexus.example/"/>
+    <xhtml:link rel="alternate" hreflang="en" href="https://nexus.example/en/"/></url>
+  <url><loc>https://nexus.example/privacy.html</loc>
+    <xhtml:link rel="alternate" hreflang="es" href="https://nexus.example/privacy.html"/>
+    <xhtml:link rel="alternate" hreflang="en" href="https://nexus.example/en/privacy.html"/></url>
+  <url><loc>https://nexus.example/en/privacy.html</loc>
+    <xhtml:link rel="alternate" hreflang="es" href="https://nexus.example/privacy.html"/>
+    <xhtml:link rel="alternate" hreflang="en" href="https://nexus.example/en/privacy.html"/></url>
+  <url><loc>https://nexus.example/terms.html</loc>
+    <xhtml:link rel="alternate" hreflang="es" href="https://nexus.example/terms.html"/>
+    <xhtml:link rel="alternate" hreflang="en" href="https://nexus.example/en/terms.html"/></url>
+  <url><loc>https://nexus.example/en/terms.html</loc>
+    <xhtml:link rel="alternate" hreflang="es" href="https://nexus.example/terms.html"/>
+    <xhtml:link rel="alternate" hreflang="en" href="https://nexus.example/en/terms.html"/></url>
+</urlset>

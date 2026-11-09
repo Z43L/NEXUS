@@ -1,0 +1,37 @@
+# Local testnet: coordinator + 4 nodes + gateway.   Run from nexus-project/code:
+#   export NEXUS_STAGE_TOKEN=$(openssl rand -hex 24)   # shared secret: gateway -> nodes on /stage
+#   docker compose -f deploy/docker-compose.yml up --build
+# Validated with Docker (Colima) on 2026-11-09, see deploy/docker_smoke.sh. Testnet only: plain HTTP, master key in a shared volume.
+x-node: &node
+  build: {context: .., dockerfile: deploy/Dockerfile}
+  image: nexus-runtime
+  depends_on: [coordinator]
+  volumes: ["model:/data"]
+  environment:
+    NEXUS_STAGE_TOKEN: ${NEXUS_STAGE_TOKEN:?export NEXUS_STAGE_TOKEN=$(openssl rand -hex 24) first}
+services:
+  publisher:        # one-shot: writes model dir, encrypted store, manifest and master key into /data
+    build: {context: .., dockerfile: deploy/Dockerfile}
+    image: nexus-runtime
+    command: ["publish", "--out-model-dir", "/data/model", "--store", "/data/store", "--slots", "2"]
+    volumes: ["model:/data"]
+  coordinator:
+    <<: *node
+    depends_on: {publisher: {condition: service_completed_successfully}}
+    command: ["coordinator", "--host", "0.0.0.0", "--port", "8700", "--slots", "2",
+              "--ledger", "/data/ledger.sqlite", "--manifest", "/data/model/manifest.json",
+              "--master-key-file", "/data/model/master.key", "--expect-nodes", "4",
+              "--close-delay", "3", "--close-seed", "compose-beacon"]
+    ports: ["8700:8700"]
+  node1: {<<: *node, command: ["node", "--coordinator", "http://coordinator:8700", "--operator", "op1", "--host", "0.0.0.0", "--advertise", "http://node1:8701", "--port", "8701", "--store", "/data/store"]}
+  node2: {<<: *node, command: ["node", "--coordinator", "http://coordinator:8700", "--operator", "op2", "--host", "0.0.0.0", "--advertise", "http://node2:8701", "--port", "8701", "--store", "/data/store", "--slowdown", "2"]}
+  node3: {<<: *node, command: ["node", "--coordinator", "http://coordinator:8700", "--operator", "op3", "--host", "0.0.0.0", "--advertise", "http://node3:8701", "--port", "8701", "--store", "/data/store"]}
+  node4: {<<: *node, command: ["node", "--coordinator", "http://coordinator:8700", "--operator", "op4", "--host", "0.0.0.0", "--advertise", "http://node4:8701", "--port", "8701", "--store", "/data/store", "--slowdown", "1.5"]}
+  gateway:
+    <<: *node
+    depends_on: [coordinator, node1, node2, node3, node4]
+    # first start prints a bootstrap key (see `docker compose logs gateway`); more: run gateway --create-key NAME
+    command: ["gateway", "--coordinator", "http://coordinator:8700", "--model-dir", "/data/model",
+              "--host", "0.0.0.0", "--port", "8800", "--api-keys", "/data/api_keys.json", "--bootstrap-key", "compose"]
+    ports: ["8800:8800"]
+volumes: {model: {}}

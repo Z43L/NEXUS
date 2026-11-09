@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEXUS: AI split across nodes, paid by verified work</title>
+<meta name="description" content="OpenAI-compatible API over a model split into slots: no operator holds the whole model and each node is paid for verified work. Closed alpha on testnet.">
+<meta name="robots" content="index, follow">
+<meta name="theme-color" content="#101214">
+<link rel="canonical" href="https://nexus.example/en/">
+<link rel="alternate" hreflang="es" href="https://nexus.example/">
+<link rel="alternate" hreflang="en" href="https://nexus.example/en/">
+<link rel="alternate" hreflang="x-default" href="https://nexus.example/">
+<link rel="icon" href="../favicon.svg" type="image/svg+xml">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="NEXUS">
+<meta property="og:title" content="NEXUS: AI split across nodes, paid by verified work">
+<meta property="og:description" content="OpenAI-compatible API over a model split into slots: no operator holds the whole model and each node is paid for verified work. Closed alpha on testnet.">
+<meta property="og:url" content="https://nexus.example/en/">
+<meta property="og:locale" content="en_US">
+<meta property="og:image" content="https://nexus.example/og.svg">
+<meta property="og:image:alt" content="NEXUS: no operator holds the whole model">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="NEXUS: AI split across nodes, paid by verified work">
+<meta name="twitter:description" content="OpenAI-compatible API over a model split into slots: no operator holds the whole model and each node is paid for verified work. Closed alpha on testnet.">
+<meta name="twitter:image" content="https://nexus.example/og.svg">
+<link rel="stylesheet" href="../assets/nexus.css">
+<script src="../assets/nexus.js"></script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@graph": [{"@type": "SoftwareApplication", "name": "NEXUS", "applicationCategory": "DeveloperApplication", "operatingSystem": "Linux, macOS", "description": "Closed-alpha AI inference network (testnet, no token): an open model split into slots across independent nodes, with an OpenAI-compatible API and signed receipts.", "url": "https://nexus.example/en/", "inLanguage": "en", "offers": {"@type": "Offer", "availability": "https://schema.org/PreOrder", "description": "Closed-alpha waitlist; pricing to be defined."}}, {"@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is NEXUS decentralized?", "acceptedAnswer": {"@type": "Answer", "text": "With caveats. The model is split across independent operators and none holds the whole model, but in the alpha the coordinator, gateway and registry are run by the NEXUS team. We do not say \"trustless\": you trust the coordinator and that no large coalition of operators forms."}}, {"@type": "Question", "name": "Can the model be copied?", "acceptedAnswer": {"@type": "Answer", "text": "A large enough coalition of operators could reconstruct it, and anyone who can query the API can try to distill it from the answers. NEXUS lowers and raises the cost of that risk (1/S per operator, unpredictable slots); it does not remove it."}}, {"@type": "Question", "name": "Are my prompts private?", "acceptedAnswer": {"@type": "Answer", "text": "Do not assume so. The node running a slice sees that slice of the model in the clear and processes the activations of your request. Do not send sensitive or personal data in the alpha. Stronger secrecy (TEE, per-layer splitting) is under research and not part of v0.1."}}, {"@type": "Question", "name": "Is there a token or cryptocurrency?", "acceptedAnswer": {"@type": "Answer", "text": "No. v0.1 has no token and settlement is tested on a testnet with no real value. If a token were ever studied, its regulatory risks (for example, being treated as a security) would have to be analysed first."}}]}]}</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="wrap bar">
+<a class="brand" href="index.html" aria-label="NEXUS, home"><svg viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="14" fill="currentColor" opacity=".12"/><g><rect x="10" y="38" width="10" height="16" rx="2" fill="var(--s2)"/><rect x="23" y="26" width="10" height="28" rx="2" fill="var(--s1)"/><rect x="36" y="14" width="10" height="40" rx="2" fill="var(--s3)"/><rect x="49" y="22" width="6" height="32" rx="2" fill="var(--s4)"/></g></svg><span>NEXUS</span></a>
+<nav class="nav" aria-label="Main"><a class="l" href="index.html#como">How it works</a><a class="l" href="index.html#para-quien">Who it is for</a><a class="l" href="index.html#seguridad">Security</a><a class="l" href="index.html#estado">Status</a><a class="l" href="index.html#faq">FAQ</a><a class="l" href="index.html#lista">Waitlist</a></nav>
+<div class="tools">
+<a class="pill" href="../index.html" hreflang="es" lang="es" aria-label="Leer en español">ES</a>
+<button class="pill" id="theme" type="button" data-auto="Auto" data-light="Light" data-dark="Dark" data-aria="Color theme">Auto</button>
+</div>
+<details class="menu"><summary>Menu</summary><nav aria-label="Main"><a href="index.html#como">How it works</a><a href="index.html#para-quien">Who it is for</a><a href="index.html#seguridad">Security</a><a href="index.html#estado">Status</a><a href="index.html#faq">FAQ</a><a href="index.html#lista">Waitlist</a></nav></details>
+</div></header>
+
+<main id="main">
+<div class="hero"><div class="wrap">
+<span class="eyebrow">Closed alpha · testnet · v0.1</span>
+<h1>No operator holds the whole model. <em>Compute is paid by verified work.</em></h1>
+<p class="lead">NEXUS splits an open model into slices and spreads them across independent nodes. You use it as an OpenAI-compatible API and every answer comes with a signed receipt. <strong>A large enough coalition could still rebuild the model:</strong> we spell out exactly where the limit is.</p>
+<div class="actions"><a class="btn" href="#lista">Join the waitlist</a><a class="btn ghost" href="#seguridad">See the security model</a></div>
+<ul class="status-row" aria-label="Current status"><li>Closed alpha</li><li>Testnet</li><li>No token</li><li>No real-money settlement</li></ul>
+<div class="strip" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+<p class="strip-cap">Illustration: a model split into 8 slots. Each operator is pinned to just one.</p>
+</div></div>
+
+<section id="como" aria-labelledby="h-como"><div class="wrap">
+<div class="sec-head"><span class="eyebrow">How it works</span><h2 id="h-como">From the whole model to one slice per operator</h2><p>Four steps, from publishing to payment. The design comes from our own simulator; this is not yet a network under real load.</p></div>
+<div class="how">
+<ol class="steps"><li><strong>Split and publish.</strong>The author cuts the model into S slots (layer ranges), encrypts the chunks, applies k-of-n erasure coding (e.g. 10 of 16, 1.6x overhead) and signs a manifest with a Merkle root. Storage nodes only ever see ciphertext.</li><li><strong>One operator, one slot.</strong>When registration closes, a random beacon assigns slots in capacity blocks. Each operator is pinned to one, cannot choose which, and none holds more than 1/S of the model. The key is released only to the assigned node.</li><li><strong>The request crosses the slots.</strong>The OpenAI-compatible gateway takes your call; the coordinator routes it through all S slots and, inside each, splits work in proportion to each node's speed.</li><li><strong>Receipt and pay for work.</strong>Each node signs a receipt for the work done. The contribution ledger computes each share and the author earns a royalty in settlement batches. v0.1 is a testnet: no real money moves.</li></ol>
+<figure class="diagram" style="margin:0"><svg viewBox="0 0 840 380" role="img" aria-labelledby="dg-t dg-d" xmlns="http://www.w3.org/2000/svg"><title id="dg-t">Request crossing four slots</title><desc id="dg-d">A request enters from the left, passes through one node in each of four slots, and leaves as a response with a receipt. Each slot holds several nodes of different speeds.</desc><rect class="dg-slot" x="90" y="50" width="150" height="280" rx="14"/><text class="dg-label" x="165" y="34" text-anchor="middle">Slot 1</text><text class="dg-sub" x="165" y="358" text-anchor="middle">1/S</text><circle class="dg-n n1" cx="120" cy="105" r="10.8"/><circle class="dg-n n1" cx="203" cy="90" r="13.5"/><circle class="dg-n n1" cx="127" cy="260" r="9.5"/><circle class="dg-n n1" cx="211" cy="225" r="12.2"/><circle class="dg-n n1" cx="170" cy="298" r="8.1"/><circle class="dg-n n1" cx="113" cy="175" r="8.1"/><circle class="dg-n dg-act a1 n1" cx="165" cy="170" r="17"/><rect class="dg-slot" x="270" y="50" width="150" height="280" rx="14"/><text class="dg-label" x="345" y="34" text-anchor="middle">Slot 2</text><text class="dg-sub" x="345" y="358" text-anchor="middle">1/S</text><circle class="dg-n n2" cx="305" cy="95" r="12.2"/><circle class="dg-n n2" cx="390" cy="130" r="9.5"/><circle class="dg-n n2" cx="297" cy="200" r="13.5"/><circle class="dg-n n2" cx="387" cy="285" r="8.1"/><circle class="dg-n n2" cx="335" cy="160" r="8.1"/><circle class="dg-n n2" cx="350" cy="295" r="10.8"/><circle class="dg-n dg-act a2 n2" cx="345" cy="250" r="17"/><rect class="dg-slot" x="450" y="50" width="150" height="280" rx="14"/><text class="dg-label" x="525" y="34" text-anchor="middle">Slot 3</text><text class="dg-sub" x="525" y="358" text-anchor="middle">1/S</text><circle class="dg-n n3" cx="483" cy="260" r="10.8"/><circle class="dg-n n3" cx="565" cy="95" r="9.5"/><circle class="dg-n n3" cx="571" cy="240" r="13.5"/><circle class="dg-n n3" cx="480" cy="165" r="8.1"/><circle class="dg-n n3" cx="525" cy="290" r="9.5"/><circle class="dg-n n3" cx="520" cy="120" r="12.2"/><circle class="dg-n dg-act a3 n3" cx="525" cy="150" r="17"/><rect class="dg-slot" x="630" y="50" width="150" height="280" rx="14"/><text class="dg-label" x="705" y="34" text-anchor="middle">Slot 4</text><text class="dg-sub" x="705" y="358" text-anchor="middle">1/S</text><circle class="dg-n n4" cx="660" cy="100" r="9.5"/><circle class="dg-n n4" cx="745" cy="120" r="12.2"/><circle class="dg-n n4" cx="657" cy="190" r="10.8"/><circle class="dg-n n4" cx="750" cy="275" r="9.5"/><circle class="dg-n n4" cx="670" cy="290" r="13.5"/><circle class="dg-n n4" cx="715" cy="180" r="8.1"/><circle class="dg-n dg-act a4 n4" cx="705" cy="230" r="17"/><path class="dg-path" d="M64 200 L165 170 L345 250 L525 150 L705 230 L792 200"/><circle class="dg-io" cx="40" cy="200" r="26"/><text class="dg-io-t" x="40" y="207" text-anchor="middle">req</text><circle class="dg-io" cx="816" cy="200" r="22"/><text class="dg-io-t" x="816" y="207" text-anchor="middle" style="font-size:18px">res</text></svg><figcaption>Illustrative: 4 slots for clarity (the design studies 8 or 16). Node size shows speed; highlighted nodes receive this job.</figcaption></figure>
+</div></div></section>
+
+<section id="para-quien" class="alt" aria-labelledby="h-aud"><div class="wrap">
+<div class="sec-head"><span class="eyebrow">Who it is for</span><h2 id="h-aud">Three ways to take part</h2></div>
+<div class="audience dev" id="devs">
+<div><span class="tag">Developers</span><h3>Change the URL, keep your code</h3><p>If you use the OpenAI SDK, point <code>base_url</code> at the NEXUS gateway.</p><ul><li>Open models, with a signed receipt per job.</li><li>Performance: slot splitting adds network hops. Simulator estimate: roughly 1.6 to 7 tok/s per stream depending on slot count (see below); think batch jobs rather than interactive chat.</li><li>Address and key shown are placeholders until the beta opens.</li></ul></div>
+<div><pre><code><span class="cm"># pip install openai  (any OpenAI-compatible client)</span>
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.nexus.example/v1",   <span class="cm"># placeholder: does not exist yet</span>
+    api_key="NEXUS_API_KEY",                   <span class="cm"># testnet key</span>
+)
+
+r = client.chat.completions.create(
+    model="MODEL_ID",   <span class="cm"># see GET /v1/models</span>
+    messages=[{"role": "user", "content": "Resume este texto en tres puntos."}],
+)
+print(r.choices[0].message.content)</code></pre><pre><code>curl https://api.nexus.example/v1/chat/completions \
+  -H "Authorization: Bearer $NEXUS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "MODEL_ID",
+       "messages": [{"role": "user", "content": "Hola"}]}'</code></pre></div>
+</div>
+<div class="grid g2" style="margin-top:24px">
+<article class="card" id="operadores"><span class="tag">Node operators</span><h3>Contribute your GPU to a slot</h3><p>You are paid for verified work, not for keeping the machine on.</p><ul><li>You are pinned to a single slot, however many nodes you run.</li><li>Joining a ~2.2 GB slot takes about 60 s at the median (simulator estimate).</li><li>Your node sees its slice of the model in the clear in memory; unavoidable without a TEE.</li><li>No income or yield promises. Minimum hardware requirements: [TO BE VERIFIED].</li></ul></article>
+<article class="card" id="autores"><span class="tag">Model authors</span><h3>Publish and earn royalties</h3><p>A CLI splits, encrypts, erasure-codes and signs your model's manifest.</p><ul><li>You set your royalty in the manifest; it is paid out in the settlement batch (testnet).</li><li>No operator receives the full weights, but this does not protect against coalitions or distillation.</li><li>You must be allowed to redistribute the model: base-model licenses (Gemma, Llama, etc.) are respected.</li></ul></article>
+</div></div></section>
+
+<section id="seguridad" aria-labelledby="h-sec"><div class="wrap">
+<div class="sec-head"><span class="eyebrow">Security</span><h2 id="h-sec">Security model, no smoke</h2><p>This is what NEXUS protects and what it does not. If your case needs the second list, NEXUS v0.1 is not for you yet.</p></div>
+<div class="sec2">
+<article class="card yes"><h3>What it protects</h3><ul><li>No operator holds more than 1/S of the model: each is pinned to a single slot.</li><li>The attacker cannot choose a slot: stratified random assignment after registration closes (0.96 efficiency in the simulator).</li><li>Weights at rest are encrypted and erasure-coded; storage nodes only see ciphertext.</li><li>Signed receipts per job and pay proportional to verified work.</li><li>A regional outage or a large operator leaving degrades capacity instead of taking the service down (simulator).</li></ul></article>
+<article class="card no"><h3>What it does NOT protect</h3><ul><li>Coalitions: with ~300 nodes per slot, 2% of operators reconstruct the model with P≈0.44 and 5% with P≈0.99 (simulator).</li><li>Distillation: anyone who can query the model can train a copy from its answers.</li><li>The compute node sees its slot in the clear in memory; without TEE or MPC this is unavoidable.</li><li>Your prompts: nodes process your request's activations. Do not send sensitive data.</li><li>Sybil: stake alone does not protect; without per-node fingerprinting or a fee, collecting a 16-slot model would cost ~$770 (illustrative parameters).</li><li>Stronger-secrecy options (TEE, per-layer splitting, per-node fingerprinting) are under study, not in v0.1.</li></ul></article>
+</div>
+<div class="tablewrap"><table><caption>Probability that a coalition assembles the whole model (simulator, S=16 slots, ~300 nodes per slot, 70B int4, 5,000 simulated nodes). Orders of magnitude, not measurements.</caption>
+<thead><tr><th scope="col">Slices per layer (T)</th><th scope="col">Coalition of 2% of operators</th><th scope="col">5%</th><th scope="col">10%</th><th scope="col">Extra cost per token (best case)</th></tr></thead>
+<tbody><tr><th scope="row">1 (v0.1)</th><td>0.44</td><td>0.99</td><td>1.00</td><td>0</td></tr><tr><th scope="row">2</th><td>0.01</td><td>0.82</td><td>1.00</td><td>≈ 0.1 s</td></tr><tr><th scope="row">4</th><td>&lt; 0.01</td><td>0.01</td><td>0.86</td><td>≈ 0.3 s</td></tr><tr><th scope="row">8</th><td>&lt; 0.01</td><td>&lt; 0.01</td><td>0.007</td><td>≈ 0.6 s</td></tr></tbody></table></div>
+<p class="muted" style="margin-top:16px;max-width:46em">With T=1, which is what v0.1 will have, a small coalition is enough. Slicing each layer across mutually distrustful nodes reduces that risk but needs nodes in nearly the same data center (RTT ≈ 0.5 ms; at 2 ms the cost rises to ≈ 1–2 s per token) and is not part of v0.1. Without slicing, 16 slots run at ≈ 2.8 tok/s per stream. More slots speed up recovery but each slot adds a network hop. Coalition resistance does not come from the split alone: it needs an identity cost, TEEs or per-layer slicing.</p>
+</div></section>
+
+<section id="estado" class="alt" aria-labelledby="h-est"><div class="wrap">
+<div class="sec-head"><span class="eyebrow">Status</span><h2 id="h-est">Status and roadmap</h2><p>No dates: we do not want to promise what we cannot yet deliver.</p></div>
+<div class="road"><div class="phase now"><span class="tag">Now</span><h3>Closed alpha (v0.1)</h3><ul><li>Testnet, no token, no real money.</li><li>OpenAI-compatible gateway, node agent, publishing CLI, coordinator, receipts and contribution ledger.</li><li>Multi-process demo with a small model split into stages.</li></ul></div><div class="phase"><span class="tag">Next</span><h3>Beta</h3><ul><li>Tests with independent operators.</li><li>Pricing and operator requirements to be defined.</li><li>Model catalog with licenses.</li></ul></div><div class="phase"><span class="tag">Later</span><h3>Under study</h3><ul><li>Distributed fine-tuning (very network-demanding).</li><li>Stronger-secrecy options: TEE, per-layer splitting.</li><li>Real-value settlement and, only as an option, a token: with prior regulatory analysis.</li></ul></div></div>
+</div></section>
+
+<section id="precios" aria-labelledby="h-pr"><div class="wrap">
+<div class="sec-head"><span class="eyebrow">Pricing</span><h2 id="h-pr">Pricing preview</h2><p>There are no prices yet. We will not invent figures before measuring real costs in the beta.</p></div>
+<div class="grid g3"><article class="card"><span class="tag">Developers</span><h3>Pay per use</h3><p>Planned: usage-based API pricing. There are no prices yet and no comparison with other providers; they will be set from measured costs during the beta. No published rate.</p><p><strong>To be defined in the beta.</strong></p></article><article class="card"><span class="tag">Operators</span><h3>Pay for verified work</h3><p>Proportional to your share of work verified by receipts. Not a guaranteed income.</p><p><strong>To be defined in the beta.</strong></p></article><article class="card"><span class="tag">Model authors</span><h3>Configurable royalty</h3><p>The author sets the royalty in the model manifest. No recommended percentages yet.</p><p><strong>To be defined in the beta.</strong></p></article></div>
+</div></section>
+
+<section id="faq" class="alt" aria-labelledby="h-faq"><div class="wrap">
+<div class="sec-head"><span class="eyebrow">FAQ</span><h2 id="h-faq">Frequently asked questions</h2></div>
+<div style="max-width:52em"><details class="faq"><summary>Is NEXUS decentralized?</summary><p>With caveats. The model is split across independent operators and none holds the whole model, but in the alpha the coordinator, gateway and registry are run by the NEXUS team. We do not say "trustless": you trust the coordinator and that no large coalition of operators forms.</p></details><details class="faq"><summary>Can the model be copied?</summary><p>A large enough coalition of operators could reconstruct it, and anyone who can query the API can try to distill it from the answers. NEXUS lowers and raises the cost of that risk (1/S per operator, unpredictable slots); it does not remove it.</p></details><details class="faq"><summary>Are my prompts private?</summary><p>Do not assume so. The node running a slice sees that slice of the model in the clear and processes the activations of your request. Do not send sensitive or personal data in the alpha. Stronger secrecy (TEE, per-layer splitting) is under research and not part of v0.1.</p></details><details class="faq"><summary>Is there a token or cryptocurrency?</summary><p>No. v0.1 has no token and settlement is tested on a testnet with no real value. If a token were ever studied, its regulatory risks (for example, being treated as a security) would have to be analysed first.</p></details><details class="faq"><summary>When will it launch and how much will it cost?</summary><p>No dates or prices are published. It is a closed alpha; pricing will be defined in the beta. Join the waitlist and we will tell you the next step.</p></details><details class="faq"><summary>Which models will be available?</summary><p>Open models. Every model in the catalog ships with its license and we respect it (for example Gemma or Llama). The initial catalog is [TO BE VERIFIED].</p></details><details class="faq"><summary>How much can an operator earn?</summary><p>We do not know and we give no figures. Pay is proportional to verified work (signed receipts), not a guaranteed income, and the alpha has no real-money settlement.</p></details><details class="faq"><summary>Is it really OpenAI-compatible?</summary><p>The goal is the same API shape: /v1/chat/completions and /v1/models. The exact scope (streaming, tools, etc.) is in development and [TO BE VERIFIED] in the beta documentation.</p></details></div>
+</div></section>
+
+<section id="lista" aria-labelledby="h-lista"><div class="wrap">
+<div class="sec-head"><span class="eyebrow">Waitlist</span><h2 id="h-lista">Request closed-alpha access</h2><p>This page is a demo: until the team configures a destination, the form validates input but sends nothing.</p></div>
+<form class="wait" id="waitlist" novalidate data-endpoint="" data-err-email="Enter a valid email, for example name@domain.com." data-err-role="Choose how you plan to take part." data-err-consent="We need your consent to store your email." data-msg-demo="Demo: the form is not connected to any server yet, so nothing was sent or stored. The team must configure data-endpoint (see README)." data-msg-ok="Received. We will let you know when access opens." data-msg-err="We could not send it. Please try again later.">
+<div><label for="email">Email address</label><input id="email" name="email" type="email" autocomplete="email" required aria-describedby="err-email" placeholder="tu@correo.com"><p class="err" id="err-email" role="alert"></p></div>
+<div><label for="role">I am mainly a…</label><select id="role" name="role" required aria-describedby="err-role"><option value="">Choose an option</option><option value="dev">Developer</option><option value="operator">Node operator</option><option value="author">Model author</option><option value="other">Other</option></select><p class="err" id="err-role" role="alert"></p></div>
+<div class="hp" aria-hidden="true"><label>Website<input name="website" tabindex="-1" autocomplete="off"></label></div>
+<div><label class="check"><input type="checkbox" name="consent" id="consent" required aria-describedby="err-consent"><span>I agree my email is used only to notify me about access, per the <a href="privacy.html">privacy policy</a> (draft).</span></label><p class="err" id="err-consent" role="alert"></p></div>
+<div><button class="btn" type="submit">Join waitlist</button></div>
+<p class="form-msg" id="form-msg" role="status" aria-live="polite" hidden></p>
+</form></div></section>
+</main>
+<footer><div class="wrap"><div class="cols">
+<div class="legalnote"><strong>NEXUS</strong>: closed alpha on testnet, no token and no real-money settlement. Nothing on this site is an investment offer or an income promise.<p style="margin-top:.8em">"NEXUS" is a working name and may clash with existing trademarks [TO BE VERIFIED].</p></div>
+<div><ul><li><a href="privacy.html">Privacy (draft)</a></li><li><a href="terms.html">Terms (draft)</a></li><li><a href="index.html#estado">Status</a></li></ul></div>
+</div></div></footer>
+</body></html>
