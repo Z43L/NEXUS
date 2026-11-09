@@ -1,0 +1,8 @@
+# local model weights and virtualenv (never commit)
+models/
+.venv/
+__pycache__/
+*.pyc
+*.key
+api_keys.json
+ledger.sqlite

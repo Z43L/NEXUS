@@ -1,0 +1,4 @@
+scenario,p_ref_blended_usd_per_mtok,p_std_usd_per_mtok,revenue_per_request_usd,platform_take_per_request_usd,infra_var_per_request_usd,arpa_gmv_dev_month,arpa_net_dev_month,contrib_dev_month,ltv_dev_net,cac_dev,payback_months_dev,enclave_cost_month,enclave_fee_month,gmv_needed_per_fte_month_for_take
+conservador,0.155,0.1395,0.0001,0.0,0.0,1.2664,0.19,0.1157,1.6522,250.0,2161.5815,3800.0,6840.0,36666.6667
+base,0.155,0.1395,0.0001,0.0,0.0,3.166,0.4749,0.2891,5.7828,120.0,415.0236,3800.0,8360.0,40000.0
+optimista,0.155,0.1395,0.0001,0.0,0.0,7.915,1.1873,0.7229,20.6529,80.0,110.673,3800.0,9880.0,43333.3333

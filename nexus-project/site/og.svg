@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-label="NEXUS">
+<rect width="1200" height="630" fill="#101214"/>
+<g stroke="#2d3237" stroke-width="1">
+<path d="M0 90H1200M0 180H1200M0 270H1200M0 360H1200M0 450H1200M0 540H1200"/><path d="M100 0V630M200 0V630M300 0V630M400 0V630M500 0V630M600 0V630M700 0V630M800 0V630M900 0V630M1000 0V630M1100 0V630"/></g>
+<text x="80" y="150" font-family="ui-monospace,Menlo,monospace" font-size="40" font-weight="800" letter-spacing="10" fill="#ff9a66">NEXUS</text>
+<text x="80" y="290" font-family="Georgia,serif" font-size="68" font-weight="700" fill="#ece8de">Ningún operador tiene</text>
+<text x="80" y="370" font-family="Georgia,serif" font-size="68" font-weight="700" fill="#ece8de">el modelo completo.</text>
+<text x="80" y="450" font-family="ui-monospace,Menlo,monospace" font-size="28" fill="#a6adb4">API compatible con OpenAI · alpha cerrada · testnet</text>
+<g><rect x="80" y="520" width="120" height="28" rx="5" fill="#2dd4bf"/><rect x="210" y="520" width="120" height="28" rx="5" fill="#ff9a66"/><rect x="340" y="520" width="120" height="28" rx="5" fill="#a99bff"/><rect x="470" y="520" width="120" height="28" rx="5" fill="#f2c14e"/></g>
+</svg>
